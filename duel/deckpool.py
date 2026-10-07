@@ -46,7 +46,6 @@ CREATE TABLE IF NOT EXISTS decks (
     windbot_deck TEXT NOT NULL,
     generated_script TEXT NOT NULL DEFAULT '',
     picked_style TEXT NOT NULL DEFAULT '',
-    playbook TEXT NOT NULL DEFAULT '',
     in_random INTEGER NOT NULL DEFAULT 1,
     created_at REAL NOT NULL
 );
@@ -67,7 +66,7 @@ CREATE TABLE IF NOT EXISTS settings (
 _DECK_COLUMNS = (
     "deck_id, group_id, display_name, contributor_id, contributor_name, ydk_path, "
     "source_format, main_count, extra_count, side_count, windbot_deck, generated_script, "
-    "picked_style, playbook, in_random, created_at, brain_scope"
+    "picked_style, in_random, created_at"
 )
 
 # 内置卡组统一挂在这个保留群号下，对每个群都可见
@@ -98,23 +97,13 @@ class StoredDeck:
     windbot_deck: str
     generated_script: str
     picked_style: str = ""
-    """实测挑出来的出牌脚本名（见 ``tools/pick_style.py``）。
+    """给这副牌挑定的出牌脚本名（自带的十份执行器就是靠它与卡表对上）。
 
-    与 :attr:`generated_script` 分开存：一个是我们用**现成执行器**量出来的（会出牌 + 胜率），
-    一个是模型现写的（只有"能编译、会出牌"的下限保证），可信度不一样。
+    与 :attr:`generated_script` 分开存：一个是我们用**现成执行器**量出来的，一个是别人
+    现写并编译进去的，可信度不一样；两个都空就按卡表相似度挑、挑不到用通用脚本。
     """
-    playbook: str = ""
-    """这副牌的打法数据（``duel/playbook.py`` 的格式，由模型写、通用执行器执行）。"""
     in_random: bool = True
     created_at: float = 0.0
-    brain_scope: str = ""
-    """这副牌**单独**的问 AI 档位（空串＝跟随全局配置，见 ``duel.brain_scope``）。
-
-    为什么要按牌存：实测"脚本本来就能打"的牌（升辉月跑自带的 ``Lucky``）开着问 AI
-    反而少打动作（16 局：特召 4.4 → 3.6 → 3.4、还多出空过局），而"脚本一步都走不出来"的牌
-    全靠 AI 才动得起来。一个全局开关满足不了两种牌，所以档位记在卡组上，群里的
-    ``/出牌模式`` 改的就是它。取值见 ``plugin.py`` 的 ``BRAIN_MODES``。
-    """
 
     @property
     def is_builtin(self) -> bool:
@@ -288,16 +277,9 @@ class DeckPool:
         self._connection.commit()
         return cursor.rowcount > 0
 
-    def set_brain_scope(self, deck_id: int, scope: Optional[str]) -> bool:
-        """记下/清除某副牌**单独**的问 AI 档位（``None`` 或空串＝跟随全局），返回是否改到了。"""
-
-        cursor = self._connection.execute(
-            "UPDATE decks SET brain_scope = ? WHERE deck_id = ?",
-            (str(scope or ""), int(deck_id)),
-        )
-        self._connection.commit()
-        return cursor.rowcount > 0
-
+    # ⚠ 这里原来有 `set_brain_scope`（按卡组写"问 AI 档位"）。AI 打牌（逐步问 AI / 出牌模式）
+    # 已按 2026-10-07 用户口径删除，没有调用方了，方法删掉；表里的 `brain_scope` 列与
+    # `StoredDeck.brain_scope` 字段**照旧保留**（不动表结构、不做迁移，老库读得出来）。
     def seed_builtin_decks(self, entries: List[Tuple[str, str, Path]]) -> Tuple[int, int]:
         """把 WindBot 自带卡组登记进池子（幂等）。
 
@@ -403,20 +385,13 @@ class DeckPool:
             self._connection.execute(
                 "ALTER TABLE decks ADD COLUMN picked_style TEXT NOT NULL DEFAULT ''"
             )
-        if "playbook" not in columns:
-            # 卡组打法数据（duel/playbook.py 的格式），由通用执行器读取执行
-            self._connection.execute(
-                "ALTER TABLE decks ADD COLUMN playbook TEXT NOT NULL DEFAULT ''"
-            )
         if "in_random" not in columns:
             self._connection.execute(
                 "ALTER TABLE decks ADD COLUMN in_random INTEGER NOT NULL DEFAULT 1"
             )
-        if "brain_scope" not in columns:
-            # 按牌的问 AI 档位（空＝跟随全局）。补这一列前，所有牌都走全局配置
-            self._connection.execute(
-                "ALTER TABLE decks ADD COLUMN brain_scope TEXT NOT NULL DEFAULT ''"
-            )
+        # ⚠ 老库里可能还留着 `playbook` / `brain_scope` 两列（AI 打牌与打法数据已按
+        # 2026-10-07 用户口径删除，这两个功能没了）。列留着不影响读：读取时是显式列名，
+        # 多的列没人碰；新库干脆不建这两列。
 
     def _migrate_fixed_deck(self) -> None:
         """把老库里的「按群固定卡组」搬成全局固定值。
@@ -456,13 +431,9 @@ class DeckPool:
         )
         self._connection.commit()
 
-    def set_playbook(self, deck_id: int, text: Optional[str]) -> None:
-        """记录/清除某副卡组的打法数据（``duel/playbook.py`` 格式的原文）。"""
-
-        self._connection.execute(
-            "UPDATE decks SET playbook = ? WHERE deck_id = ?", (text or "", int(deck_id))
-        )
-        self._connection.commit()
+    # ⚠ 这里原来有 `set_playbook`（按卡组写"打法数据"，给计划感知执行器读）。
+    # 打法数据 / AI 打牌链路已按 2026-10-07 用户口径删除，没有调用方了，方法删掉；
+    # 表里的 `playbook` 列与 `StoredDeck.playbook` 字段**照旧保留**（不动表结构、不做迁移）。
 
     def pick_for_duel(self, group_id: str, *, rng: Optional[random.Random] = None) -> Optional[StoredDeck]:
         """开局选一副卡组：设了固定卡组就用它（全局生效），否则从本群随机池里抽。"""
@@ -596,8 +567,6 @@ class DeckPool:
             windbot_deck=str(row[10]),
             generated_script=str(row[11] or ""),
             picked_style=str(row[12] or ""),
-            playbook=str(row[13] or ""),
-            in_random=bool(row[14]),
-            created_at=float(row[15]),  # type: ignore[arg-type]
-            brain_scope=str(row[16] or ""),
+            in_random=bool(row[13]),
+            created_at=float(row[14]),  # type: ignore[arg-type]
         )

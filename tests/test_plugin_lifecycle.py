@@ -20,7 +20,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncio
 import dataclasses
 import importlib.util
-import json
 import sqlite3
 import sys
 import tempfile
@@ -430,10 +429,12 @@ def test_plugin_imports_without_plugin_root_on_sys_path() -> None:
         "module = importlib.util.module_from_spec(spec)\n"
         "sys.modules[spec.name] = module\n"
         "spec.loader.exec_module(module)\n"
-        "# 再把「问 AI / 打法数据 / 计划」这些**实际会用到**的模块也按同一个包名导进来：\n"
+        "# 再把「对局」这条链路上实际会用到的模块也按同一个包名导进来：\n"
         "# 它们里面有延迟导入，光 import 插件本身是抓不到的（实测就是这样漏过一次）\n"
+        "# （原来这里还导 train.ai_brain / train.plan / train.llm / duel.playbook：\n"
+        "# AI 打牌 / 计划 / 打法数据已按 2026-10-07 用户口径删除，那几个包也没了。）\n"
         "import importlib\n"
-        "for sub in ('train.ai_brain', 'train.plan', 'train.llm', 'duel.session', 'duel.playbook', 'duel.netguard'):\n"
+        "for sub in ('duel.session', 'duel.netguard', 'duel.gate', 'duel.recorder', 'duel.field_image'):\n"
         "    importlib.import_module(name + '.' + sub)\n"
         "print('ok')\n"
     )
@@ -446,67 +447,11 @@ def test_plugin_imports_without_plugin_root_on_sys_path() -> None:
     )
 
 
-def test_plugin_commands_are_accepted_by_their_tools() -> None:
-    """插件拼给工具的命令行，必须能被**工具自己的 argparse** 接受。
-
-    护栏（实测踩过两次）：``/优化卡组`` 的命令少了必填的 ``--opponents``，argparse 直接退出、
-    输出里只有一段 usage、连一行 ``[错误]`` 都没有，于是群里被说成"这一轮没有候选通过判定"；
-    又因为本地手跑时我总带着 ``--opponents``，一直复现不到。这类"两边接口对不上"的错，
-    只有拿工具自己的解析器过一遍才抓得住。
-    """
-
-    if not _sdk_available():
-        print("      （跳过：未找到 maibot_sdk）")
-        return
-
-    module = load_plugin_module()
-    plugin_cls = module.MaiPlayYgo
-
-    def make_deck(deck_id: int, name: str, style: str) -> object:
-        """按卡组池的字段造一副（字段多，抽个小助手）。"""
-
-        return module.StoredDeck(
-            deck_id=deck_id, group_id="111", display_name=name, contributor_id="",
-            contributor_name="", ydk_path=Path(f"{deck_id}.ydk"), source_format="",
-            main_count=40, extra_count=0, side_count=0, windbot_deck=style,
-            generated_script="", in_random=True, created_at=0.0,
-        )
-
-    def parse_with(tool_name: str, command: List[str]):
-        """用 ``tools/<tool_name>`` 自己的解析器解析插件拼出的命令行。"""
-
-        spec = importlib.util.spec_from_file_location(
-            f"tool_{tool_name}", str(_PLUGIN_ROOT / "tools" / tool_name)
-        )
-        assert spec is not None and spec.loader is not None
-        tool = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(tool)
-        saved = sys.argv
-        # 命令行的前两项是 python 解释器与脚本路径，解析器关心的是后面那些
-        sys.argv = [tool_name, *[str(item) for item in command[2:]]]
-        try:
-            return tool.parse_args()
-        finally:
-            sys.argv = saved
-
-    subject = make_deck(9, "甲牌", "Maliss")
-    opponents = [make_deck(10, "乙牌", "Albaz"), make_deck(11, "丙牌", "Test")]
-
-    with tempfile.TemporaryDirectory() as directory:
-        instance, _context = make_plugin(Path(directory))
-        optimize = parse_with("optimize_deck.py", plugin_cls._optimize_command(instance, subject, 20, opponents))
-        assert optimize.deck_id == 9, optimize
-        assert optimize.opponents == "10,11", optimize.opponents
-        assert optimize.rounds == 20 and optimize.candidates == 2, optimize
-
-        # 训练那条命令也要过一遍（它带 --coach / --llm-model，最容易被工具换了参数名而失效）
-        training = parse_with(
-            "train_arena.py", plugin_cls._training_command(instance, "check", subject, opponents[0], 5)
-        )
-        assert training.arena == "check", training
-        assert training.rounds == 5, training
-        assert training.pairs, training
-
+# ⚠ 这里原来有一条 `test_plugin_commands_are_accepted_by_their_tools`：拿 `tools/optimize_deck.py`
+# 与 `tools/train_arena.py` 自己的 argparse 去解析 `/优化卡组`、`/训练` 拼出来的命令行
+# （护栏：``--opponents`` 漏传时 argparse 直接退出、报错被说成"没有候选通过判定"）。
+# 2026-10-07 用户口径把训练调优整条链路删掉后，插件已经没有"拼命令行给 tools/ 子进程"的地方，
+# 这条用例没有被测对象了，整条删掉。
 
 async def test_on_load_creates_deck_pool() -> None:
     """on_load 必须能跑通，并把卡组池建出来。"""
@@ -937,185 +882,28 @@ async def test_unload_is_fast_and_kills_rooms() -> None:
         assert elapsed < 1.0, f"卸载用了 {elapsed:.2f} 秒，超出宿主给卸载的预算"
 
 
-def test_training_helpers() -> None:
-    """「/训练」的两个纯函数：轮数解析与结果整理（不真跑对局）。
-
-    护栏：轮数写错不能静默按默认值跑（会白占 CPU），结果整理要能从擂台输出里读出胜率、
-    并在有「整局空过」时如实提示参考价值有限。
-    """
-
-    module = load_plugin_module()
-    plugin_cls = module.MaiPlayYgo
-
-    assert plugin_cls._parse_training_rounds("") == module.DEFAULT_TRAINING_ROUNDS
-    assert plugin_cls._parse_training_rounds("5") == 5
-    assert plugin_cls._parse_training_rounds("abc") is None
-    assert plugin_cls._parse_training_rounds("0") is None
-    assert plugin_cls._parse_training_rounds("9999") is None
-
-    def make_deck(deck_id: int, name: str, style: str) -> object:
-        """按卡组池的字段造一副（字段多了，抽个小助手）。"""
-
-        return module.StoredDeck(
-            deck_id=deck_id, group_id="111", display_name=name, contributor_id="",
-            contributor_name="", ydk_path=Path(f"{deck_id}.ydk"), source_format="",
-            main_count=40, extra_count=0, side_count=0, windbot_deck=style,
-            generated_script="", in_random=True, created_at=0.0,
-        )
-
-    left = make_deck(1, "甲牌", "Test")
-    right = make_deck(2, "乙牌", "Albaz")
-    output = """
-===== 擂台 train-x：40 局 =====
-脚本                          胜     总       胜率
-Test                        24    40    60.0%
-Albaz                       16    40    40.0%
-
-动作数 < 3 的「整局空过」记录（这些局的胜负没有参考价值）：
-  Test: 2 局
-"""
-    summary = plugin_cls._training_summary(left, right, 20, output)
-    assert "训练完成" in summary and "甲牌" in summary and "乙牌" in summary, summary
-    assert "24/40" in summary and "16/40" in summary, summary
-    assert "更占上风" in summary, summary
-    assert "空过" in summary, "有整局空过时要提醒参考价值有限"
-
-    empty = plugin_cls._training_summary(left, right, 20, "什么都没输出")
-    assert "没能从训练输出里读到胜率" in empty, empty
+# ⚠ 这里原来有三条用例：`test_training_helpers`（`/训练` 的轮数解析与结果整理）、
+# `test_optimize_summary_reports_child_errors_verbatim`（`/优化卡组` 的子进程序言报错不能被
+# 说成"没有候选通过"）、`test_optimize_milestone_picks_only_key_lines`（优化进度里程碑）。
+# 卡组训练与调优已按 2026-10-07 用户口径整块删除（指令与私有方法都没了），被测对象不存在，
+# 三条用例一并删掉。
 
 
-def test_optimize_summary_reports_child_errors_verbatim() -> None:
-    """「/优化卡组」的结果整理：子进程报错要说报错，别伪装成"没有候选通过"。
-
-    护栏（实测踩过）：优化进程因为卡表体检不过秒退时，输出只有一行 ``[错误] ...``，
-    而原来的整理逻辑不管三七二十一就报"这一轮没有候选通过判定，原卡组没动"——群里
-    完全看不出该改什么，排查了半天才发现是子进程根本没跑起来。
-    """
-
-    module = load_plugin_module()
-    summarize = module.MaiPlayYgo._optimize_summary
-
-    failed = """
-优化对象：「码丽丝(OCG)」（MalissOCG）
-对手池：烙印
-[错误] 这副牌本身就有问题，先解决它：这些卡没有卡片脚本（会变成白板）：[14558128]
-"""
-    summary = summarize(failed)
-    assert "14558128" in summary, summary
-    assert "没能跑完" in summary, summary
-    assert "没有候选通过判定" not in summary, "报错不能被说成候选不合格：" + summary
-
-    # 真的跑完了、只是没有候选通过时，仍然保持原来的说法
-    ran = """
-    [基线] 已打 10/20 局，当前 5/10 = 50%
-基线（原卡表）：20/40 = 50.0%
-  候选 1：换出 1 → 换入 2 → 20/40
-这一轮没有候选通过判定，不动原卡组。
-（要判定 5% 的差别，每组约需 385 局；可以加 --rounds 再跑一轮）
-"""
-    summary = summarize(ran)
-    assert "基线" in summary and "没有候选通过判定" in summary, summary
-    assert "每组约需" in summary, summary
-    # 报的必须是**结果**那行，不是前面那条进度行（进度行也含"[基线]"）
-    assert "20/40" in summary, summary
-    assert "已打 10/20" not in summary, summary
-
-    # 采纳了候选时，直接报"已新建卡组"那一行
-    accepted = """
-基线（原卡表）：18/40 = 45.0%
-  候选 1：换出 1 → 换入 2 → 30/40
-采纳：候选 1（65.0% 的区间下界高于基线）
-已新建卡组「甲牌·改5」（编号 9）。
-"""
-    summary = summarize(accepted)
-    assert "已新建卡组" in summary and "候选 1" in summary, summary
-
-    # 体检的警告要带给群里：那几张卡在游戏里是白板，打不出来不是打法问题
-    warned = """
-[警告] 主体卡组里有 1 种卡查不到脚本（在游戏里是白板，白占卡位）：[11738490]
-基线（原卡表）：18/40 = 45.0%
-这一轮没有候选通过判定，不动原卡组。
-"""
-    summary = summarize(warned)
-    assert "11738490" in summary and "白板" in summary, summary
-    assert "没有候选通过判定" in summary, "警告不该把正常结果顶掉：" + summary
-
-
-def test_optimize_milestone_picks_only_key_lines() -> None:
-    """优化跑几十分钟，只有关键行该被翻成群消息（否则要么刷屏、要么一声不吭像卡死）。"""
-
-    module = load_plugin_module()
-    milestone = module.MaiPlayYgo._optimize_milestone
-
-    assert "45.0%" in milestone("基线（原卡表）：9/20 = 45.0%")
-    assert "候选 1" in milestone("  候选 1：换出 1 → 换入 2 → 8/20")
-    assert "错误" in milestone("[错误] 这副牌本身就有问题，先解决它：某某")
-    # 进度行、卡表统计这些不刷屏
-    assert milestone("    [候选1] 已打 10/20 局，当前 3/10 = 30%") == ""
-    assert milestone("卡表 40 张；同系列可换入 32 张") == ""
-    assert milestone("") == ""
-
-
-async def test_room_brain_starts_and_stops() -> None:
-    """开了 ai_brain 时房间要起一个答复任务、把前缀交给 WindBot，收摊时清干净。
-
-    护栏：这条通道是"房间侧"的（擂台有自己的那条），漏接任何一环的表现都是
-    "看着开了 AI、其实没人答"——执行器只能干等超时，把每回合时限吃光（实测动作数掉到 1~6）。
-    """
-
-    if not _sdk_available():
-        print("      （跳过：未找到 maibot_sdk）")
-        return
-
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        data_dir = root / "data"
-        data_dir.mkdir()
-        (data_dir / "brain_model.toml").write_text(
-            'base_url = "https://api.deepseek.com"\napi_key = "sk-test"\nmodel = "deepseek-chat"\n',
-            encoding="utf-8",
-        )
-        instance, _context = make_plugin(
-            data_dir, {"plugin": {"enabled": True, "config_version": "1.7.0"}, "duel": {"ai_brain": True}}
-        )
-        # 卡库换成替身，避免真去查库
-        instance._card_db = None
-        try:
-            prefix, task = instance._start_room_brain("s1")
-            assert prefix is not None and task is not None, "开了 ai_brain 就该起通道"
-            assert str(prefix).startswith(str(data_dir)), prefix
-            assert "s1" in instance._brain_tasks, instance._brain_tasks
-            # 故意留一问一答，收摊时要被清掉
-            Path(str(prefix) + ".q").write_text("id=1\nkind=activate\n", encoding="utf-8")
-            Path(str(prefix) + ".a").write_text("id=1\nanswer=no\n", encoding="utf-8")
-            instance._stop_room_brain("s1")
-            assert "s1" not in instance._brain_tasks
-            assert not Path(str(prefix) + ".q").exists(), "收摊要清掉问答文件"
-            assert not Path(str(prefix) + ".a").exists()
-            assert task.cancelled() or task.cancelling(), "答复任务要被取消"
-        finally:
-            # 每条是 ``(前缀, 任务, 答复服务, 决策日志)``（见 _start_room_brain）
-            for entry in list(instance._brain_tasks.values()):
-                entry[1].cancel()
-            instance._brain_tasks.clear()
-
-        # 没开开关时什么都不做
-        quiet, _context2 = make_plugin(
-            data_dir, {"plugin": {"enabled": True, "config_version": "1.7.0"}, "duel": {"ai_brain": False}}
-        )
-        assert quiet._start_room_brain("s2") == (None, None)
-        assert quiet._brain_tasks == {}
-
+# ⚠ 这里原来有一条 `test_room_brain_starts_and_stops`：开了 ai_brain 时房间要起"逐步问 AI"的
+# 答复任务、把问答前缀交给 WindBot，收摊时清掉问答文件并取消任务。AI 打牌整条链路
+# （`_start_room_brain` / `_stop_room_brain` / `_brain_tasks` / brain_model.toml）已按
+# 2026-10-07 用户口径删除，这条用例一并删掉。
 
 # （`test_script_generation_is_serialised` 也在这条口径下去掉了：它测的是"连投几副时生成要排队"，
 # 而投稿已经不再触发任何生成——见上面那条注释。）
 
-async def test_ai_brain_keeps_the_deck_script() -> None:
-    """开了「逐步问 AI」**不能**把卡组自己的出牌脚本换掉。
+async def test_generated_script_wins_over_deck_style() -> None:
+    """卡组库里的 `generated_script` 要优先于按卡表重猜出来的风格。
 
-    问答钩子挂在 WindBot 基类上（任何脚本都答得到问题），所以这里没有换脚本的理由；
-    早先它会强制换成通用执行器 PlanAware，而实测那个代价很大：同一副牌同一对手，
-    专属脚本 13% 胜 / 16.0 动作，通用脚本 0% / 8.7 动作——等于为了开 AI 白扔掉卡组的脚本。
+    （这条用例原来叫 `test_ai_brain_keeps_the_deck_script`，测的是"开逐步问 AI 不该把卡组自己的
+    出牌脚本换成 PlanAware"。AI 打牌已按 2026-10-07 用户口径删除、`PLAN_AWARE_STYLE` 也没了，
+    留下的是**保下来**的这条优先级：`_with_current_style` 里 `picked_style` / `generated_script`
+    先于「按卡表相似度挑脚本」——那是 agent 手工写的执行器，不能被自动匹配顶掉。）
     """
 
     if not _sdk_available():
@@ -1124,12 +912,7 @@ async def test_ai_brain_keeps_the_deck_script() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        module = load_plugin_module()
-        instance, _context = make_plugin(
-            root / "data",
-            {"plugin": {"enabled": True, "config_version": "1.7.0"}, "duel": {"ai_brain": True}},
-        )
-        assert instance.config.duel.ai_brain is True
+        instance, _context = make_plugin(root / "data")
         from duel.deckpool import StoredDeck
 
         deck = StoredDeck(
@@ -1149,7 +932,6 @@ async def test_ai_brain_keeps_the_deck_script() -> None:
         deck = dataclasses.replace(deck, group_id="123456")  # 投稿卡组（非内置）
         resolved = instance._with_current_style(deck)
         assert resolved.windbot_deck == "Gen88", resolved.windbot_deck
-        assert resolved.windbot_deck != module.PLAN_AWARE_STYLE, "开 AI 不该换掉专属脚本"
 
 
 async def test_field_command_reads_live_session() -> None:
@@ -1311,216 +1093,17 @@ class _StubSession:
         self.stopped = True
 
 
-class _StubSeat:
-    """记录器替身里的一格局面（只用到生命值）。"""
-
-    def __init__(self, lp: int) -> None:
-        self.lp = lp
-
-
-class _StubRecorder:
-    """记录器替身：给出"我方"的对局玩家号、双方实时生命值、以及双方用过的卡。"""
-
-    def __init__(self, *, seat: int, lp_self: int, lp_other: int) -> None:
-        self.self_seat = seat
-        self.card_usage = {100267039: 2}
-        # 对手那份台账（2026-10-07 起 recorder 按座位分开记，落库要读它）
-        self.opponent_card_usage = {89631139: 1}
-        self.field_state = type(
-            "FieldState",
-            (),
-            {"players": {seat: _StubSeat(lp_self), 1 - seat: _StubSeat(lp_other)}},
-        )()
+# ⚠ 这里原来还有两个替身 `_StubSeat` / `_StubRecorder`（模拟记录器：我方座位、双方实时生命值、
+# 双方用卡台账）。它们只服务于"打完把胜负回填决策日志"与"真实对局落库"这两条用例——
+# 那两条链路（`_finish_room_brain` / `_record_room_duel` + train/store.py）已按
+# 2026-10-07 用户口径删除，替身也一并删掉。`_StubSession` 还在用（下面测收尾播报那条）。
 
 
-def test_room_brain_backfills_duel_outcome() -> None:
-    """房间那侧打完要把胜负回填进决策日志，方向不能反（谁输谁赢按"我"算）。
-
-    护栏来源：日志原先只记"问了什么、答了什么"，``outcome`` 列 4,442 行全空——
-    于是"AI 的干预帮没帮上忙"事后判不出来。房间这条路的生命值取**实时局面**那份
-    （记录器的 ``lp_final`` 依赖 MSG_LPUPDATE，本机内核不发它，一直是 0）。
-    """
-
-    from duel.knowledge import DecisionLog
-    from duel.session import OUTCOME_FINISHED
-
-    with tempfile.TemporaryDirectory() as directory:
-        data_dir = Path(directory)
-        instance, _context = make_plugin(data_dir)
-        database = data_dir / "knowledge" / "knowledge.db"
-        log = DecisionLog(database, arena="room:stream-1", deck_key="89", duel_key="duel-1")
-        try:
-            log.add(kind="activate", card_id=11, answer="no", cost_ms=100)
-            instance._brain_tasks["stream-1"] = (Path(directory) / "x.txt", None, None, log)
-            session = _StubSession(
-                outcome=OUTCOME_FINISHED,
-                summary=[],
-                result={"winner_is_self": False, "turns": 3},
-            )
-            session.recorder = lambda: _StubRecorder(seat=1, lp_self=0, lp_other=8000)  # type: ignore[method-assign]
-            instance._finish_room_brain("stream-1", session, session.result_dict(), OUTCOME_FINISHED)
-        finally:
-            log.close()
-            instance._brain_tasks.pop("stream-1", None)
-
-        connection = sqlite3.connect(database)
-        try:
-            outcome = connection.execute("SELECT outcome FROM decisions").fetchone()[0]
-        finally:
-            connection.close()
-        assert outcome == "result=loss;turns=3;lp=0:8000", outcome
-
-
-async def test_brain_mode_command_sets_per_deck_scope() -> None:
-    """``/出牌模式`` 按卡组切换问 AI 档位，房间按它决定开不开问答通道。
-
-    护栏来源（实测）：升辉月跑自带的 Lucky 时开着问 AI 反而少打动作（16 局特召 4.4 → 3.6、
-    还多出空过局），而"脚本一步都走不出来"的牌全靠 AI 才动得起来——
-    一个全局开关满足不了两种牌，所以档位记在卡组上（``decks.brain_scope``）。
-    """
-
-    if not _sdk_available():
-        print("      （跳过：未找到 maibot_sdk）")
-        return
-
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        windbot_dir = _make_fake_windbot(root)
-        data_dir = root / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        (data_dir / "brain_model.toml").write_text(
-            'base_url = "https://api.deepseek.com"\napi_key = "sk-test"\nmodel = "deepseek-chat"\n',
-            encoding="utf-8",
-        )
-        instance, context = make_plugin(
-            data_dir,
-            {
-                "plugin": {"enabled": True, "config_version": "1.9.0"},
-                "paths": {"windbot_dir": str(windbot_dir)},
-                "duel": {"ai_brain": True},
-            },
-        )
-        instance._card_db = None
-        await instance.on_load()
-        deck = instance._deck_pool.list_decks("")[0]
-
-        try:
-            # 不带档位：报出当前档位（默认跟随全局）
-            await instance.cmd_brain_mode(text=f"/出牌模式 {deck.deck_id}", stream_id="s1", group_id="111")
-            assert "跟随全局" in context.send.messages[-1], context.send.messages[-1]
-
-            # 不认识的值：明确拒绝，不改库
-            await instance.cmd_brain_mode(
-                text=f"/出牌模式 {deck.deck_id} 随便乱写", stream_id="s1", group_id="111"
-            )
-            assert "不认识" in context.send.messages[-1], context.send.messages[-1]
-            assert instance._deck_pool.list_decks("")[0].brain_scope == ""
-
-            # 设成"不问"：库里记下，房间就不开问答通道
-            await instance.cmd_brain_mode(
-                text=f"/出牌模式 {deck.deck_id} 不问", stream_id="s1", group_id="111"
-            )
-            assert "不问 AI（只用脚本）" in context.send.messages[-1], context.send.messages[-1]
-            stored = instance._deck_pool.list_decks("")[0]
-            assert stored.brain_scope == "off", stored.brain_scope
-            assert instance._brain_scope_for(stored) == "off", "房间要按这副牌的档位决定"
-            assert instance._start_room_brain("s1", stored) == (None, None), "设了不问就不该起通道"
-
-            # 设成"只问高压"：房间要把它当 scope 传给模型
-            await instance.cmd_brain_mode(
-                text=f"/出牌模式 {deck.deck_id} 只看高压", stream_id="s1", group_id="111"
-            )
-            stored = instance._deck_pool.list_decks("")[0]
-            assert stored.brain_scope == "high_stakes", stored.brain_scope
-            assert instance._brain_scope_for(stored) == "high_stakes", "档位要传给模型"
-
-            # 跟随全局：清掉这副牌的档位
-            await instance.cmd_brain_mode(
-                text=f"/出牌模式 {deck.deck_id} 跟随全局", stream_id="s1", group_id="111"
-            )
-            assert instance._deck_pool.list_decks("")[0].brain_scope == "", "跟随全局要清空"
-            assert instance._brain_scope_for(instance._deck_pool.list_decks("")[0]) == "all"
-
-            # 卡组详情里也要看得到档位
-            await instance.cmd_deck_detail(text=f"/卡组详情 {deck.deck_id}", stream_id="s1", group_id="111")
-            assert "问 AI：跟随全局" in context.send.messages[-1], context.send.messages[-1]
-        finally:
-            instance._deck_pool.close()
-
-
-async def test_finished_room_duel_goes_into_the_store() -> None:
-    """打完的真实对局要进结果库（``arena="room"``），字段口径与擂台相同。
-
-    护栏来源：以前只有擂台局进库，真实对局只剩决策日志里的问答——于是"改了有没有变好"
-    只能在模拟里看。这里钉住三件事：真的写了一行、动作数按擂台那套口径算、双方阵营没写反。
-    """
-
-    if not _sdk_available():
-        print("      （跳过：未找到 maibot_sdk）")
-        return
-
-    from duel.session import OUTCOME_FINISHED
-
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        instance, _context = make_plugin(root / "data")
-        db_path = root / "arena.db"
-        session = _StubSession(
-            outcome=OUTCOME_FINISHED,
-            summary=[],
-            result={
-                "winner_is_self": False,
-                "turns": 4,
-                "duration_seconds": 111,
-                "reason": "基本分变成0",
-                "deck_style": "Lucky",
-                "players": {
-                    "1": {"name": "憨憨", "normal_summons": 2, "sp_summons": 3, "effects": 9, "attacks": 1},
-                    "0": {"name": "打憨憨", "normal_summons": 1, "sp_summons": 5, "effects": 12, "attacks": 2},
-                },
-            },
-        )
-        session.recorder = lambda: _StubRecorder(seat=1, lp_self=0, lp_other=8000)  # type: ignore[method-assign]
-        instance._record_room_duel(
-            session, session.result_dict(), OUTCOME_FINISHED, store_path=db_path
-        )
-
-        connection = sqlite3.connect(db_path)
-        try:
-            row = connection.execute(
-                "SELECT arena, left_name, right_name, winner, turns, actions_left, actions_right,"
-                " sp_summons_left, sp_summons_right, lp_left, lp_right, left_style, right_style,"
-                " card_usage, card_usage_opponent"
-                " FROM duels"
-            ).fetchone()
-        finally:
-            connection.close()
-        assert row is not None, "打完的局要写进库"
-        (arena, left, right, winner, turns, act_l, act_r, sp_l, sp_r, lp_l, lp_r, style_l, style_r,
-         usage_self, usage_other) = row
-        assert arena == "room", arena
-        assert (left, right) == ("憨憨", "打憨憨"), (left, right)
-        assert winner == "打憨憨", "winner_is_self=False 时赢的是对面"
-        assert turns == 4
-        # 动作数 = 召唤 + 特召 + 效果 + 攻击（与擂台同一个口径）
-        assert act_l == 2 + 3 + 9 + 1, act_l
-        assert act_r == 1 + 5 + 12 + 2, act_r
-        assert (sp_l, sp_r) == (3, 5)
-        assert (lp_l, lp_r) == (0, 8000)
-        assert (style_l, style_r) == ("Lucky", "真人"), (style_l, style_r)
-        # 用卡台账按座位分开落库（2026-10-07）：我方那份只有我们的卡，对手那份单独一列
-        assert json.loads(usage_self) == {"100267039": 2}, usage_self
-        assert json.loads(usage_other) == {"89631139": 1}, usage_other
-
-        # 中途收摊（没打完）不该记成对局
-        instance._record_room_duel(
-            session, session.result_dict(), "aborted", store_path=db_path
-        )
-        connection = sqlite3.connect(db_path)
-        try:
-            assert connection.execute("SELECT COUNT(*) FROM duels").fetchone()[0] == 1, "只有打完的局进库"
-        finally:
-            connection.close()
+# ⚠ 这里原来有三条用例：`test_room_brain_backfills_duel_outcome`（打完把胜负回填决策日志）、
+# `test_brain_mode_command_sets_per_deck_scope`（`/出牌模式` 按卡组切问 AI 档位）、
+# `test_finished_room_duel_goes_into_the_store`（真实对局写进结果库，arena="room"）。
+# 决策日志 / 知识库 / 问 AI 档位 / 对局落库随 AI 打牌与训练调优整条链路一起删了
+#（2026-10-07 用户口径），三条用例连同它们的记录器替身一并删掉。
 
 
 def test_open_message_hides_the_deck_but_keeps_pool_hint() -> None:
@@ -1592,100 +1175,9 @@ async def test_open_message_calls_the_bot_by_its_name() -> None:
             await instance.on_unload()
 
 
-async def test_invite_text_judges_when_to_speak() -> None:
-    """主动约战："关着 / 正在打 / 没开过房"三种情况都不发；开着且有群才发一句话。"""
-
-    if not _sdk_available():
-        print("      （跳过：未找到 maibot_sdk）")
-        return
-
-    with tempfile.TemporaryDirectory() as directory:
-        instance, _context = make_plugin(Path(directory))
-        module = load_plugin_module()
-        await instance.on_load()
-        try:
-            instance._deck_pool.set_setting(module.SETTING_BOT_NAME, "憨憨")
-
-            # 默认是关的：什么都不发
-            assert instance.config.duel.invite_enabled is False
-            assert instance._compose_invite_text() is None
-
-            instance.config.duel.invite_enabled = True
-            # 还没在哪个群开过房 → 不发
-            instance._invite_stream_id = ""
-            assert instance._compose_invite_text() is None
-
-            instance._invite_stream_id = "stream-1"
-            text = instance._compose_invite_text()
-            assert text is not None and "憨憨" in text and "说一声就开房" in text, text
-
-            # 已有房间在跑 → 不打扰
-            instance._rooms["stream-1"] = object()
-            assert instance._compose_invite_text() is None
-            instance._rooms.clear()
-
-            # 台词可以自定义
-            instance.config.duel.invite_text = "有人来一把吗"
-            assert instance._compose_invite_text() == "有人来一把吗"
-        finally:
-            await instance.on_unload()
-
-
-async def test_replay_reports_facts_even_when_model_fails() -> None:
-    """`/复盘` 必须把机读事实发出来，模型只负责解释——它挂了也要照发（不编、不吞）。
-
-    这回答的是用户反复问的那句"这把为什么打得菜"：问了多少次、拦下多少、时间花在哪，
-    这些数字来自决策日志，不能被模型的文风改写。
-    """
-
-    if not _sdk_available():
-        print("      （跳过：未找到 maibot_sdk）")
-        return
-
-    from duel.knowledge import DecisionLog, duel_outcome_text
-
-    with tempfile.TemporaryDirectory() as directory:
-        data_dir = Path(directory)
-        instance, context = make_plugin(data_dir)
-        instance._card_db = None
-        # 造一份知识库（决策日志也写在这里），并造一局：3 问里拦下 2 次、输掉
-        database = data_dir / "knowledge" / "knowledge.db"
-        log = DecisionLog(database, arena="room:stream-1", deck_key="89", duel_key="duel-1")
-        try:
-            log.add(kind="activate", card_id=11, answer="no", cost_ms=1200)
-            log.add(kind="activate", card_id=12, answer="no", cost_ms=900)
-            log.add(kind="activate", card_id=13, answer="yes", cost_ms=21000)
-            log.finish_duel(duel_outcome_text(result="loss", turns=3, lp_self=0, lp_other=8000))
-        finally:
-            log.close()
-        instance._knowledge_cache = None
-
-        try:
-            await instance.cmd_replay(stream_id="stream-1", group_id="111")
-            assert len(context.send.messages) == 1, context.send.messages
-            text = context.send.messages[0]
-            assert "我方输了" in text, text
-            assert "问 AI 3 次" in text and "被拦下 2 次" in text, text
-            assert "67%" in text, text
-            assert "21.0 秒" in text, text
-            assert context.llm.prompts, "要把事实交给模型写点评"
-            assert "被拦下 2 次" in context.llm.prompts[0], "点评要看得到数字"
-
-            # 模型不可用时：事实照样发，只是没有点评
-            context.llm.fail = True
-            context.send.messages.clear()
-            await instance.cmd_replay(stream_id="stream-1", group_id="111")
-            assert len(context.send.messages) == 1, context.send.messages
-            assert "被拦下 2 次" in context.send.messages[0]
-
-            # 没打过牌的房间：如实说"还没有可复盘的局"
-            context.send.messages.clear()
-            await instance.cmd_replay(stream_id="stream-9", group_id="111")
-            assert "还没有可复盘的局" in context.send.messages[0], context.send.messages
-        finally:
-            knowledge = instance._knowledge_cache
-            if knowledge is not None:
-                knowledge.close()
+# ⚠ 这里原来有一条 `test_invite_text_judges_when_to_speak`：空闲主动约战的"该不该发、发什么"
+# （关着 / 正在打 / 没开过房三种情况都不发）。`invite_*` 配置、`_invite_stream_id` 与
+# `_compose_invite_text` 已按 2026-10-07 用户口径删除，这条用例一并删掉。
 
 
 async def test_finished_duel_summary_goes_through_the_model() -> None:

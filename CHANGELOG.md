@@ -1,16 +1,37 @@
 # 更新日志
 
-> 合并之前「游戏王对局管家」的历史（0.21.1 ~ 0.21.112）在
-> [docs/changelog-yugioh-duel-arena.md](docs/changelog-yugioh-duel-arena.md)；
-> 本文件从「麦麦玩游戏王」1.0.0 重新起版。
+> 本文件从「麦麦玩游戏王」1.0.0 起版（合并前的「游戏王对局管家」历史已不随仓库保留）。
 
 ## 1.0.0
+
+### 收敛到核心功能（2026-10-07 用户口径）
+
+只保留：**开房对打 / 导入卡组 / 随机池 / 查房出图 / 查卡与发卡图**。删掉的东西：
+
+* **卡组训练与调优**：`/训练`、`/优化卡组`、`/挑脚本`、`/写打法` 四条指令，以及 `train/`
+  整个包（擂台、卡组进化搜索、计划层、AI 打牌）与 28 个只服务它们的命令行工具
+  （`train_arena.py`、`evaluate_style.py`、`pick_style.py`、`optimize_deck.py`、`brain_eval.py`、
+  `plan_accept.py`、`build_card_facts.py`、`build_deck_plans.py`…）。相关测试一并删除。
+* **AI 帮助打牌**：逐步问 AI（`ai_brain`）、AI 教练（`ai_plan_coach`）、知识库检索
+  （`brain_knowledge` / `brain_scope`）、导入卡组后写展开流程（`ai_deck_plan`）、
+  卡组打法数据（`duel/playbook.py`）与 `/出牌模式`；`duel/knowledge.py`、`duel/playbook.py`
+  两个模块删除。麦麦现在**只按 WindBot 出牌脚本打**，一局里不再调模型做决策。
+* **卡组码自动识别**：`ygo_deck_analyze` 工具删除 —— 群里的卡组码**只能用 `/加卡组` 指令导入**
+  （解析链路 `duel/deckcode.py` 不变）。
+* **常驻房与空闲约战**：`persist_room*`、`invite_*` 六个配置项与对应循环删除。
+  **房间只在两种情况下开**：群里叫麦麦打牌（模型调 `ygo_duel_start`），或发 `/开房`。
+* **对局落库与复盘**：`/复盘` 指令、`duel/duelrecord.py`、`train/store.py` 删除
+  （复盘依赖 AI 决策日志，随 AI 打牌一起走）。
+* 配置面只剩群主要用的十项（`[duel]`）+ 两项（`[wiki]`）；`[paths]` 默认指向自带的 `clients/`。
+* `duel/cards.py` 里没人用的 `CardInfo` / `collect_card_info()`、卡组池里没人读的
+  `playbook` / `brain_scope` 两列一并清掉（老库多出来的列不影响读）。
+* 测试从 285 条收敛到 **172 条全绿**；`plugin.py` 3558 → 2280 行、`wiki.py` 701 → 424 行。
 
 ### 合并：一个插件 = 对局管家 + 百科检索
 
 * 「游戏王对局管家」（yugioh.duel-arena）与「游戏王百科检索」（yugioh.wiki）合并为
   **麦麦玩游戏王（mai-play-ygo）**，对外只有一个插件：一个入口类、一份配置、一套测试。
-* 百科检索的三个工具并入（`wiki.py` 的 `YugiohWikiTools`，混入主插件类；宿主用 `dir(instance)`
+* 百科检索的工具并入（`wiki.py` 的 `YugiohWikiTools`，混入主插件类；宿主用 `dir(instance)`
   采集组件，所以混入类的方法一样能被注册）：
   * `ygo_card_search`：查卡（中/日/英文名、类型、属性、种族、星数、攻守、卡文、FAQ 数）；
   * `ygo_deck_analyze`：解析卡组码（YDK / YDKE / **萌卡分享链接**三种格式自动识别）；

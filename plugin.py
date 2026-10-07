@@ -7,8 +7,9 @@
 把服务器地址与房间密码发到群里 → 群友用 MDPro3 / YGOMobile 连进来和机器人打一局 →
 打完后把结果与过程复述发回群里，并写进 Maisaka 上下文让机器人后续聊天时知道刚才发生了什么。
 
-**百科侧**（`wiki.py` 的 `YugiohWikiTools` 混入）：三个 LLM 工具——查卡、解析卡组码、
-发卡图；解析卡组码优先用本机 `cards.cdb`（离线、快），卡图优先用本机客户端的图。
+**百科侧**（`wiki.py` 的 `YugiohWikiTools` 混入）：两个 LLM 工具——查卡、发卡图；
+卡图优先用本机客户端的图。（原来还有第三个"自动识别群里的卡组码"的工具，
+2026-10-07 用户口径精简掉了：卡组码只走本插件的 `/加卡组` 指令导入。）
 
 **两个虚拟客户端是一体的**：对局内核 `ygopro.exe` 与出牌大脑 `WindBot.exe`
 都放在插件自己的 `clients/` 目录里（默认配置直接指向它们），拷到哪台机器都能跑。
@@ -32,7 +33,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
@@ -40,16 +41,15 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 import asyncio
 import dataclasses
 import logging
-import random
-import re
-import sys
-import time
 
 from .duel.builtin_decks import builtin_decks
 from .duel.cards import CardDatabase, CardDatabaseError
-from .duel.knowledge import DecisionLog, DuelTrace, Knowledge, duel_outcome_text
+# ⚠ 这里原来还有 `from .duel.knowledge import ...`（AI 打牌的知识库/决策日志）。
+# 2026-10-07 用户口径：AI 打牌整条链路去掉，`duel/knowledge.py` 也删了，所以这行没了。
 from .duel.deckcode import Deck, DeckCodeError, deck_summary, describe_issues, parse_deck_code
-from .duel.deckpool import BUILTIN_GROUP, DeckPool, DeckPoolError, StoredDeck
+# ⚠ 这里原来还导入 `BUILTIN_GROUP`（"按内置卡组解析某副牌"的伪群号）：
+# 它的消费者是已删的 `/优化卡组` `/挑脚本` `/写打法` `/出牌模式`，所以一并去掉。
+from .duel.deckpool import DeckPool, DeckPoolError, StoredDeck
 from .duel.field_image import (
     BOARD_HEIGHT,
     BOARD_WIDTH,
@@ -94,17 +94,11 @@ SETTING_BOT_NAME = "in_game_bot_name"
 # 写错不会有任何报错，WindBot 会静默换成随机卡组——所以这里用已验证存在的名字。
 DEFAULT_WINDBOT_DECK = "Blue-Eyes"
 
-# 常驻房（duel.persist_room）：插件启动就把「ygopro + WindBot」拉起来并保持。
-# 用一个不会和真实群/聊天流撞车的假 stream_id / group_id 走现有的房间与落库链路
-#（落在 `arena="room"`，和"群里那局"同一张表，但名字一眼能认出来）。
-PERSIST_STREAM = "__persist_room__"
-PERSIST_GROUP = "__persist_room__"
-# 一局打完（或起崩）之后隔多久再开下一副。给收尾留一点时间，别把端口抢在同一秒。
-PERSIST_RETRY_SECONDS = 5.0
-
-# 计划感知执行器：通用打法 + 会读"作战计划 / 卡组打法数据 / 逐步问 AI"三份文件的那一个。
-# 开了"逐步问 AI"就必须用它——别的脚本不读问答文件。
-PLAN_AWARE_STYLE = "PlanAware"
+# ⚠ 这里原来有三样与"AI 自动打牌/常驻房"有关的东西，2026-10-07 用户口径精简掉了：
+# 常驻房（`persist_room` / `persist_room_port` 配置 + `PERSIST_STREAM` / `PERSIST_GROUP`
+# / `PERSIST_RETRY_SECONDS` 三个常量）、计划感知执行器名 `PLAN_AWARE_STYLE`
+# （配合 AI 教练/展开流程用的 `PlanAware`）。
+# 现在只有"群里有人要打才开房"这一条路径（见 `/开房` 与 `ygo_duel_start`）。
 
 # 对局总结（`duel.summarize_with_ai`）让模型润色时给的输出额度。
 # 值给得大是有实测原因的：宿主那只用于该任务的模型会先"想"一大段，额度给小了
@@ -134,47 +128,15 @@ DEFAULT_SUMMARY_PROMPT = (
     "胜负以上面这句为准，不要自己推断。"
 )
 
-# 按卡组的问 AI 档位：键是写进卡组库的值，值是（给群里看的名字, 给模型的 scope）。
-# 空串＝跟随全局配置（`duel.brain_scope`）——老库补列后默认就是空，行为不变。
-BRAIN_MODES: Dict[str, Tuple[str, str]] = {
-    "": ("跟随全局", ""),
-    "off": ("不问 AI（只用脚本）", "off"),
-    "high_stakes": ("只问高压（交坑/打谁/这局走哪条线）", "high_stakes"),
-    "interrupt_only": ("只应对不掌舵（连每一步做什么也交回脚本）", "interrupt_only"),
-    "all": ("每一问都问", "all"),
-}
-"""按卡组的问 AI 档位（``/出牌模式`` 改的就是它）。
+# ⚠ 这里原来有两块「问 AI 档位」的数据表：`BRAIN_MODES`（档位名 → 群里的说法/给模型的 scope）
+# 与 `BRAIN_MODE_ALIASES`（中文别名）。它们只服务于 `/出牌模式` 与逐步问 AI 的决策通道，
+# 2026-10-07 用户口径把 AI 打牌整条链路去掉后就没有消费者了，连同两张表一起删掉。
 
-**为什么要有**：实测"脚本本来就能打"的牌（升辉月跑自带的 ``Lucky``）开着问 AI 反而少打动作
-（16 局：特召 4.4 → 3.6、还多出空过局），而"脚本一步都走不出来"的牌全靠 AI 才动得起来。
-一个全局开关满足不了两种牌，所以档位记在卡组上；空串＝跟随全局（默认，行为与以前一致）。
-"""
-
-BRAIN_MODE_ALIASES: Dict[str, str] = {
-    "不问": "off",
-    "关": "off",
-    "关闭": "off",
-    "只用脚本": "off",
-    "问": "all",
-    "开": "all",
-    "每问都问": "all",
-    "全问": "all",
-    "高压": "high_stakes",
-    "只看高压": "high_stakes",
-    "只应对": "interrupt_only",
-    "只应对不掌舵": "interrupt_only",
-    "跟随": "",
-    "跟随全局": "",
-    "默认": "",
-    "全局": "",
-}
-
-# 插件根目录：/训练 要按绝对路径拉起 tools/train_arena.py（它是独立进程）
+# 插件根目录（配置里的相对路径按它解析）
 _PLUGIN_ROOT = Path(__file__).resolve().parent
 
-# 「/训练」的轮数：每轮 2 局镜像（两边各坐一次先攻），所以 20 轮 = 40 局
-DEFAULT_TRAINING_ROUNDS = 20
-MAX_TRAINING_ROUNDS = 100
+# ⚠ 这里原来还有 `DEFAULT_TRAINING_ROUNDS` / `MAX_TRAINING_ROUNDS`（`/训练` 的轮数上下限）：
+# 训练/调优整条链路已按 2026-10-07 用户口径删除，这两个常量随之去掉。
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -381,18 +343,9 @@ class DuelConfig(PluginConfigBase):
     )
     listen_host: str = Field(default="0.0.0.0", description="闸门监听地址，默认监听所有网卡")
     listen_port: int = Field(default=0, description="闸门监听端口，0 表示随机分配一个空闲端口")
-    persist_room: bool = Field(
-        default=False,
-        description=(
-            "常驻房（**默认关闭**）：开启后插件一启动就拉起一副「ygopro + WindBot」并一直保持"
-            "（一局打完自动再开一副、崩了自动重启），端口固定。"
-            "关着的时候就是原来的行为：群里有人要打才开房。"
-        ),
-    )
-    persist_room_port: int = Field(
-        default=7801,
-        description="常驻房固定端口（固定＝重启后地址不变，方便直接连；0 表示随机分配）",
-    )
+    # ⚠ 这里原来有两项：`persist_room`（插件一启动就拉一副 ygopro + WindBot 并一直保持）
+    # 与 `persist_room_port`（常驻房的固定端口）。2026-10-07 用户口径精简掉了常驻房：
+    # 现在只有"群里有人说要打才开房"这一条路径（见 `/开房` 与 `ygo_duel_start`）。
     join_timeout_seconds: int = Field(default=300, description="等群友进房间的秒数，超时自动收摊")
     max_duration_seconds: int = Field(default=3600, description="单局最长秒数，超时自动收摊")
     max_concurrent_rooms: int = Field(default=1, description="同时允许存在的房间数上限")
@@ -460,89 +413,13 @@ class DuelConfig(PluginConfigBase):
             "只在「对局已经开始且还没结束」时掷骰子，等人进房间时不会嘴炮"
         ),
     )
-    invite_enabled: bool = Field(
-        default=False,
-        description=(
-            "是否让机器人在空闲时**主动冒泡约战**：间隔到了就在最近一次开过房的群里问一句"
-            "「要不要打一局」。默认关闭；开着才会按下面的间隔随机发问"
-        ),
-    )
-    invite_min_minutes: int = Field(default=30, description="主动约战的最短间隔（分钟）")
-    invite_max_minutes: int = Field(
-        default=90, description="主动约战的最长间隔（分钟）；与最短值之间取随机数"
-    )
-    invite_text: str = Field(
-        default="",
-        description="主动约战的台词；留空用内置台词（「〈名字〉在，有人想打一局吗？说一声就开房」）",
-    )
-    ai_plan_coach: str = Field(
-        default="off",
-        description=(
-            "让模型每回合给麦麦定一次战术：off（默认，用各卡组自带的出牌脚本）/ "
-            "rule（规则教练）/ llm（模型教练）。"
-            "开启后这一局改用「计划感知执行器」——它在通用脚本上加了一层战术偏置；"
-            "实验阶段默认关闭：先在擂台测出它不弱于自带脚本，再考虑打开"
-        ),
-    )
-    ai_brain: bool = Field(
-        default=True,
-        description=(
-            "让模型参与出牌决策（AI 打牌）：除了回答「要不要发动/连锁」「打谁」，"
-            "还会在主要阶段**从全部合法动作里挑这一步做什么**（召唤/特召/发动/盖放/进战斗/结束）——"
-            "脚本写不出的新卡组（新系列、投稿卡组）就是靠这个动起来的"
-            "（脚本层只能否决它自己想做的事，碰上它不认识的卡组会一步都走不出来）。"
-            "问答通道挂在 WindBot 基类上，**任何卡组都能用**，不会因此换掉卡组自己的出牌脚本。"
-            "模型走插件自带的 <数据目录>/brain_model.toml（密钥不进插件仓库，也不动宿主模型配置）。"
-            "**代价**：每次决策一次模型调用（实测 deepseek-chat 约 0.6~0.9 秒），一局会因此慢几倍；"
-            "每回合的等待总预算默认 25 秒（用完这一回合照脚本打）、每回合最多主动问 6 次。"
-            "拿不到模型时不会开这条通道（免得不作答还拖慢每一局）"
-        ),
-    )
-    brain_knowledge: bool = Field(
-        default=True,
-        description=(
-            "问 AI 时是否**按当前局面检索知识库**（卡牌事实 / 我这副牌的线路 / 对手轴系的威胁）。"
-            "知识库是本机 SQLite（<数据目录>/knowledge/knowledge.db，由 tools/build_card_facts.py "
-            "与 tools/build_deck_plans.py 生成），检索是毫秒级、不花钱，所以默认开。"
-            "关掉它就退回「只用攻略要点 + 打法数据」那套静态素材——擂台上的 A/B 就是这两档"
-        ),
-    )
-    brain_scope: str = Field(
-        default="all",
-        description=(
-            "问 AI 的范围：`all` = 每一问都问（历史行为）；`high_stakes` = 只问高压决策——"
-            "**我的回合**（执行器写的 `my_phase=1`）不把「本家卡要不要发动」拿去问模型，交回出牌脚本，"
-            "对手的回合照问（那才是「该不该交这个坑」），「这一步做什么」「打谁」不受影响；"
-            "`interrupt_only` = 连「这一步做什么」也交回脚本，只留对手回合的应对与「打谁」。"
-            "实测（80 局/腿）：不问 23.1 动作/局、每问都问 20.7、只问高压 21.0——"
-            "只问高压确实拦下了 47% 的发动提问，但动作数没回来，所以嫌疑落在「这一步做什么」那个菜单上，"
-            "`interrupt_only` 就是用来把两者分开的。"
-            "翻默认值之前要按项目纪律跑 ≥80 局/腿（tools/brain_eval.py --brain-scope …）"
-        ),
-    )
-    ai_deck_plan: bool = Field(
-        default=True,
-        description=(
-            "导入卡组后**让模型按卡表写一份展开流程**（起手→步骤→终场→自肃→被断后），"
-            "存进知识库；问 AI 的「这一步做什么」会把整份流程喂给模型。"
-            "这就是「让新卡组一导入就会展开」的那一步：市场上没有覆盖所有系列的 combo 库，"
-            "所以做成**按需生成 + 缓存**（一副牌只生成一次，几十秒，之后一直读缓存）。"
-            "写失败不影响开局，最多少一份资料；卡号写错会被校验拦住并让它重写"
-        ),
-    )
-    # 这里原来有两项：`script_max_tokens` / `script_model`（生成专属脚本的额度与模型）。
-    # 脚本生成整条链路去掉了，但「对局总结交给模型润色」那一处**还要那只模型与足额 token**：
-    # 现在直接写在 `_summarize_with_ai` 里（额度 = `SUMMARY_MAX_TOKENS`，模型留空 = 宿主给该任务配的），
-    # 不再占一个配置项。
-    train_model: str = Field(
-        default="",
-        description=(
-            "【训练/评估用哪个模型】填宿主 model_config.toml 里的模型别名。"
-            "训练默认不下计划（--coach none，跑的是卡组自带的出牌思路）；"
-            "只有填了这个才让模型参与出牌决策（--coach llm --llm-model <别名>），"
-            "所以训练速度与结果都由你选的模型决定。留空 = 纯脚本对打，不调模型"
-        ),
-    )
+    # ⚠ 这里原来有一整片"AI 打牌 / 自动调优"的配置：`invite_enabled`（空闲主动约战）+
+    # `invite_min_minutes` / `invite_max_minutes` / `invite_text`、`ai_plan_coach`（AI 教练）、
+    # `ai_brain`（逐步问 AI）、`brain_knowledge`（临场检索知识库）、`brain_scope`（问 AI 范围）、
+    # `ai_deck_plan`（导入卡组后写展开流程）、`train_model`（训练用哪个模型）。
+    # **2026-10-07 用户口径：只留核心（开房打牌 / 导卡组 / 随机池 / 查房 / 查卡发图）**，全删了。
+    # （更早还删过 `script_max_tokens` / `script_model`：对局总结的额度与模型现在写死在
+    # `_write_summary` 里——额度 `SUMMARY_MAX_TOKENS`，模型留空＝用宿主给该任务配的那只。）
 
 
 # ---------------------------------------------------------------------------
@@ -619,7 +496,7 @@ class ActiveRoom:
 
 
 class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
-    """麦麦玩游戏王：对局管家（开房/播报/查房/AI 教练）+ 百科检索（查卡/卡组码/卡图）。
+    """麦麦玩游戏王：对局管家（开房/播报/查房）+ 百科检索（查卡/发卡图）。
 
     继承顺序有意为之：`YugiohWikiTools` 在前（它的 `@Tool` 方法与本体一起被
     `dir(instance)` 采集到），`MaiBotPlugin` 在后（提供 `ctx` / `config` / 生命周期）。
@@ -633,24 +510,11 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         super().__init__()
         self._deck_pool: Optional[DeckPool] = None
         self._card_db: Optional[CardDatabase] = None
-        self._knowledge_cache: Optional[Knowledge] = None
-        """知识库缓存（懒加载；库不存在时保持 None）——见 :meth:`_knowledge`。"""
         self._rooms: Dict[str, ActiveRoom] = {}
-        self._background_tasks: set = set()
-        """插件自己起的后台任务（目前只有"导入卡组后写展开流程"这一种）。
-
-        统一收在集合里是为了 shutdown 时能撤干净：任务里可能正在跑一支子进程。
-        """
-        self._training_task: Optional[asyncio.Task] = None
-        """正在跑的「/训练」批（一次只允许一批：它要吃满 CPU）。"""
-        self._optimize_task: Optional[asyncio.Task] = None
-        """正在跑的「/优化卡组」批（同样吃满 CPU，与 /训练 互斥）。"""
-        self._pick_task: Optional[asyncio.Task] = None
-        """正在跑的「/挑脚本」批（要真的打对局，所以同样与训练/优化互斥）。"""
-        self._playbook_task: Optional[asyncio.Task] = None
-        """正在跑的「/写打法」批（只调模型，不占对局资源）。"""
-        self._brain_tasks: Dict[str, Any] = {}
-        """房间的"问 AI"答复任务：``{stream_id: (问答前缀, 任务, 服务端)}``，收摊时撤掉。"""
+        # ⚠ 这里原来有一批"重活"与 AI 打牌的句柄：`_knowledge_cache`（知识库缓存）、
+        # `_background_tasks`（导入卡组后写展开流程的后台任务）、`_training_task` / `_optimize_task`
+        # / `_pick_task` / `_playbook_task`（训练·优化·挑脚本·写打法四条批任务的互斥锁）、
+        # `_brain_tasks`（房间的问 AI 答复任务）。2026-10-07 用户口径只留核心功能，全部删掉。
         self._logger: Optional[logging.Logger] = None
 
     # ------------------------------------------------------------------ 生命周期
@@ -665,14 +529,9 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         )
         self._card_db = CardDatabase(self._resolve_cards_cdb())
         self._seed_builtin_decks()
-        # 主动约战：记住"最近一次开过房的群"，并起一个常驻循环（间隔与开关在循环里读，
-        # 这样配置热更新后不用重启插件就能生效）
-        self._invite_stream_id = ""
-        self._invite_task: Optional[asyncio.Task] = asyncio.create_task(self._invite_loop())
-        # 常驻房：见 `_persist_room_loop`。开关与端口都在循环里读配置，热更新即可生效。
-        self._persist_room_task: Optional[asyncio.Task] = asyncio.create_task(
-            self._persist_room_loop()
-        )
+        # ⚠ 这里原来还会起两个常驻循环：`_invite_loop`（空闲主动约战）与 `_persist_room_loop`
+        # （常驻房，插件一启动就拉一副 ygopro + WindBot 一直等着）。2026-10-07 用户口径把
+        # 约战与常驻房都去掉了，现在只在群里有人要打时才开房。
         self._logger.info("游戏王对局管家已加载，数据目录 %s", self.ctx.paths.data_dir)
         # 把生效中的关键配置打进日志：内网穿透时"闸门端口是否真的固定了"全靠这一行确认
         self._log_effective_config()
@@ -734,24 +593,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         对局正常结束那条路仍然走 :meth:`DuelSession.stop` 的优雅收尾。
         """
 
-        for task in list(self._background_tasks):
-            task.cancel()
-        self._background_tasks.clear()
-
-        if self._training_task is not None and not self._training_task.done():
-            # 训练是独立进程，取消这个 task 不会杀掉子进程；显式 kill 一遍，别留下孤儿
-            self._training_task.cancel()
-            self._training_task = None
-        if self._optimize_task is not None and not self._optimize_task.done():
-            self._optimize_task.cancel()
-            self._optimize_task = None
-        if self._invite_task is not None and not self._invite_task.done():
-            self._invite_task.cancel()
-            self._invite_task = None
-        if self._persist_room_task is not None and not self._persist_room_task.done():
-            self._persist_room_task.cancel()
-            self._persist_room_task = None
-
+        # ⚠ 这里原来还要收尾一批后台东西：`_background_tasks`（写展开流程的任务）、
+        # `_training_task` / `_optimize_task`（训练·优化子进程）、`_invite_task`（约战循环）、
+        # `_persist_room_task`（常驻房循环）。这些功能已按 2026-10-07 用户口径删除，
+        # 现在只剩"停掉进行中的房间 + 关库"。
         for stream_id in list(self._rooms):
             room = self._rooms.pop(stream_id, None)
             if room is None:
@@ -882,12 +727,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                         deck.ydk_path,
                         exe,
                     )
-            # 逐步问 AI（可选）：起一个"答复"任务，并把问答前缀交给这一局的 WindBot
-            # （把这副牌一起传进去：提示词里要带上它的打法数据）
-            brain_prefix, brain_task = self._start_room_brain(stream_id, deck)
+            # ⚠ 这里原来是"逐步问 AI"的起手：`_start_room_brain` 起一个答复任务，
+            # 再把问答前缀文件（brain_file）写进会话配置交给 WindBot。AI 打牌整条链路已按
+            # 2026-10-07 用户口径删除，现在开局直接用配置里的出牌脚本。
             config = self._build_session_config(stream_id)
-            if brain_prefix is not None:
-                config = dataclasses.replace(config, brain_file=brain_prefix)
             session = DuelSession(
                 config,
                 group_id=group_id,
@@ -906,8 +749,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 )
 
             task = asyncio.create_task(self._run_room(session, stream_id, group_id))
-            # 记住这个群：主动约战只在"开过房、拿得到聊天流"的群里说话
-            self._invite_stream_id = stream_id
+            # ⚠ 这里原来会记住"最近一次开过房的群"（`_invite_stream_id`），供主动约战与常驻房
+            # 把消息发到真实聊天流；这两项已按 2026-10-07 用户口径删除，所以这行没了。
             # 卡组名一并记进房间：`/查房` 跨群列房间时要能说清每个房间是哪副牌
             # （没找到投稿卡组时用的是机器人自带卡组，与上面的日志同一口径）
             deck_label = deck.display_name if deck is not None else DEFAULT_WINDBOT_DECK
@@ -950,8 +793,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         （原来还有一条入口：模型看到群里贴卡组码就调 `ygo_deck_submit` 自动收录——已按
         2026-10-07 用户口径去掉，现在**只有指令能投稿**。）
 
-        ``stream_id`` 只用来给"展开流程写好了"的后续播报定位会话；指令调用里它可能与
-        ``group_id`` 是同一个值，也可能为空（那就在调用处退到 ``group_id``）。
+        ``stream_id`` 原来只用来给"展开流程写好了"的后续播报定位会话；那条链路已删除，
+        参数保留只是不打乱现有调用方的签名。
         """
 
         if self._deck_pool is None:
@@ -1026,11 +869,9 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             "这副牌会先用 WindBot 的通用脚本打；想让它更强可以按 executors/README.md "
             "让 agent 写一个专属出牌脚本（需要多轮迭代）。"
         )
-        # 展开流程（combo 线）：只是让模型按卡表写一份人话资料存进知识库，问 AI 时会喂给它；
-        # 与"写出牌脚本"无关（那个已经不再由插件做了）。失败也不影响开局，最多少一份资料。
-        if self.config.duel.ai_deck_plan and self.config.duel.ai_brain:
-            self._make_deck_plan_handler(stream_id or group_id, group_id)(stored)
-            lines.append("顺便给它写一份展开流程（问 AI 时会喂给模型），好了我告诉你。")
+        # ⚠ 这里原来还有一个"导入卡组后让模型写一份展开流程存进知识库"的分支
+        # （`ai_deck_plan` + `ai_brain` 都开着时才走）。2026-10-07 用户口径把
+        # 展开流程 / 知识库 / 逐步问 AI 整条链路去掉了，投稿回执到这里就结束。
         return "\n".join(lines)
 
     # ⚠ 这里原来有一个 `ygo_deck_submit` 工具（让模型在群里看到卡组码就自动收进卡组池）。
@@ -1149,212 +990,12 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
     # **2026-10-07 用户口径：插件不再自动写脚本**——新卡组一律用通用脚本，想更强就用 AI agent
     # 按 executors/README.md 写（多轮迭代），所以这条指令整块删掉了。
 
-    @Command(
-        "ygo_cmd_optimize",
-        description="自动优化一副卡组：换牌 → 自动对战 → 只保留统计上更强的版本",
-        pattern=r"^/(?:优化卡组|卡组优化)\s+\S+",
-    )
-    async def cmd_optimize(
-        self, text: str = "", stream_id: str = "", group_id: str = "", **kwargs: Any
-    ) -> Tuple[bool, str, int]:
-        """跑一轮卡组进化搜索（换牌 → 对战 → 按区间判定）。"""
-
-        del kwargs
-        if self._deck_pool is None:
-            await self.ctx.send.text("卡组池还没准备好。", stream_id)
-            return True, "卡组池不可用", 1
-        for task, label in ((self._training_task, "训练"), (self._optimize_task, "优化")):
-            if task is not None and not task.done():
-                await self.ctx.send.text(f"已经有{label}在跑了，等它结束再来。", stream_id)
-                return True, "已有重活在跑", 1
-        parts = text.strip().split()
-        # **只取第一个参数**当卡组引用：解析器是按"整行指令"取参数的，把整行喂进去的话，
-        # 后面跟着的局数会被当成卡组名的一部分（"码丽丝 25"）⇒ 永远找不到（实测踩了两次）
-        reference = f"{parts[0]} {parts[1]}" if len(parts) > 1 else parts[0]
-        deck = self._deck_by_argument(group_id, reference)
-        if deck is None:
-            # 私聊里没有"本群卡组池"，上面必然找不到。退一步按**内置卡组**解析：
-            # 私聊里说"优化某副牌"时，想优化的几乎总是内置卡组或编号卡组（实测用户就在私聊里用）
-            deck = self._deck_by_argument(BUILTIN_GROUP, reference)
-        if deck is None:
-            await self.ctx.send.text(
-                "用法：/优化卡组 <编号或名字> [每个对手的局数]\n"
-                "会用同群的其它卡组当对手，自动试换牌并只保留统计上更强的版本（新建一副，不动原牌）。",
-                stream_id,
-            )
-            return True, "缺卡组参数", 1
-        rounds = 25
-        if len(parts) > 2 and parts[2].isdigit() and 1 <= int(parts[2]) <= 200:
-            rounds = int(parts[2])
-        opponents = [
-            item
-            for item in self._deck_pool.list_decks(group_id or deck.group_id)
-            if item.deck_id != deck.deck_id
-        ][:2]
-        if not opponents:
-            await self.ctx.send.text(
-                f"卡组池里除了「{deck.display_name}」没有别的卡组了，优化需要至少一副对手牌。\n"
-                "先让群友投一副（发卡组码 + /加卡组），或者用 /卡组列表 看看池子里有什么。",
-                stream_id,
-            )
-            return True, "没有对手卡组", 1
-        expected = (rounds * 2) * len(opponents) * 2 if len(opponents) == 2 else rounds * 2
-        await self.ctx.send.text(
-            f"开始优化「{deck.display_name}」，对手：{'、'.join(item.display_name for item in opponents)}。\n"
-            f"每个候选约打 {expected} 局，跑到几十局的批次通常要十几到几十分钟"
-            "（WindBot 偶发错误会拖慢）；基线打完、每个候选打完我都会说一声，跑完发结果。",
-            stream_id,
-        )
-        self._optimize_task = asyncio.create_task(
-            self._run_optimize(deck, rounds, opponents, stream_id, group_id)
-        )
-        return True, "优化已开始", 1
-
-    def _optimize_command(
-        self, deck: StoredDeck, rounds: int, opponents: Sequence[StoredDeck]
-    ) -> List[str]:
-        """拼出优化搜索的命令行（独立进程，见 tools/optimize_deck.py）。
-
-        ``--opponents`` 是那个工具的**必填**参数：漏掉的话 argparse 直接退出，输出里只有一段
-        usage、连一行 ``[错误]`` 都没有，群里就会被说成"这一轮没有候选通过判定"（实测踩过）。
-        优化器自己不用模型（只用卡库与对局数据），所以**不要**给它传 ``--model``。
-        """
-
-        command = [
-            sys.executable,
-            str(_PLUGIN_ROOT / "tools" / "optimize_deck.py"),
-            "--plugin-root",
-            str(_PLUGIN_ROOT),
-            "--deck-id",
-            str(deck.deck_id),
-            "--opponents",
-            ",".join(str(item.deck_id) for item in opponents),
-            "--rounds",
-            str(rounds),
-            # 候选越多，局数线性增长（基线 100 局 + 每个候选 100 局，4 并发下要几十分钟）。
-            # 群里跑两副就够了：区间判定本来就不会在几十局规模下通过，真正落地的是死牌清理。
-            "--candidates",
-            "2",
-        ]
-        return command
-
-    @staticmethod
-    def _optimize_summary(output: str, returncode: int = 0) -> str:
-        """从优化进程的输出里整理一条群消息（单独抽出来是为了能测）。
-
-        ``returncode`` 用来兜住"输出里没有可识别的错误、但进程就是没跑完"的情况
-        （argparse 用法错误、没捕获的异常）：那时候只报"没有候选通过判定"会把真因吞掉。
-        """
-
-        lines = output.strip().splitlines()
-        # 认"基线（原卡表）"这个前缀，别只认"基线"：进度行是「    [基线] 已打 10/20 局…」，
-        # 它排在结果行前面，只认两个字的话群里看到的就是进度而不是结果（实测踩过）
-        base = next((line for line in lines if line.strip().startswith("基线（原卡表）")), "")
-        accepted = [line for line in lines if "采纳：" in line or "已新建卡组" in line]
-        verdict = "这一轮没有候选通过判定，原卡组没动。"
-        for line in lines:
-            if "已新建卡组" in line:
-                verdict = line.strip()
-                break
-
-        # 子进程要是根本没跑起来（参数错、卡表体检不过、引擎缺数据），输出里是一行 [错误]。
-        # 这时候报"没有候选通过判定"会把真正的原因吞掉——实测就是这样把"这副牌有白板卡"
-        # 说成了"候选都不合格"，后来又有一次是 argparse 的 usage（连 [错误] 都没有），
-        # 所以这里连 usage/异常一起认。
-        problems = [
-            line.strip()
-            for line in lines
-            if line.strip().startswith(("[错误]", "usage:", "Traceback"))
-            or "本身的" in line
-            or "没能" in line
-            or line.strip().startswith("optimize_deck.py: error:")
-        ]
-        if problems and not accepted:
-            return "【卡组优化】没能跑完：\n" + "\n".join(problems[:4])
-        if returncode not in (0, 1) and not accepted and not base:
-            tail = "\n".join(line.strip() for line in lines[-3:] if line.strip())
-            return f"【卡组优化】没能跑完（退出码 {returncode}）：\n{tail or '（子进程没有输出）'}"
-
-        # 体检给的是警告（比如"主体卡组里有查不到脚本的卡"）：不拦优化，但得让群里知道
-        # ——那几张卡在游戏里是白板，打不出来不是打法问题
-        warnings = [line.strip() for line in lines if line.strip().startswith("[警告]")]
-
-        parts = ["【卡组优化】"]
-        if base:
-            parts.append(base.strip())
-        if accepted:
-            parts.extend(line.strip() for line in accepted[:3])
-        else:
-            parts.append(verdict)
-            note = next((line for line in lines if "每组约需" in line), "")
-            if note:
-                parts.append(note.strip())
-        parts.extend(warnings[:2])
-        return "\n".join(parts)
-
-    async def _run_optimize(
-        self,
-        deck: StoredDeck,
-        rounds: int,
-        opponents: Sequence[StoredDeck],
-        stream_id: str,
-        group_id: str,
-    ) -> None:
-        """跑一轮优化，结束后把结果发到群里（独立进程，别占住事件循环）。
-
-        整批要跑几十分钟，所以**边跑边报里程碑**（基线打完、每个候选打完、出错）：只在结束时
-        吭一声的话，群里看着就像卡死了——实测用户就是这么以为的。
-        """
-
-        target = stream_id or group_id
-        command = self._optimize_command(deck, rounds, opponents)
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=str(_PLUGIN_ROOT),
-            )
-        except Exception as exc:  # noqa: BLE001  优化失败不该影响插件其余功能
-            if self._logger is not None:
-                self._logger.exception("优化进程启动失败")
-            await self._announce(target, f"优化没能跑起来：{type(exc).__name__}: {exc}")
-            return
-        lines: List[str] = []
-        try:
-            assert process.stdout is not None
-            while True:
-                raw = await process.stdout.readline()
-                if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                lines.append(line)
-                milestone = self._optimize_milestone(line)
-                if milestone:
-                    await self._announce(target, milestone)
-            await process.wait()
-        except Exception as exc:  # noqa: BLE001  读进程输出失败也要有个交代
-            if self._logger is not None:
-                self._logger.exception("优化进程输出读取失败")
-            process.kill()
-            await self._announce(target, f"优化中途断了：{type(exc).__name__}: {exc}")
-            return
-        await self._announce(
-            target, self._optimize_summary("\n".join(lines), returncode=process.returncode or 0)
-        )
-
-    @staticmethod
-    def _optimize_milestone(line: str) -> str:
-        """把优化进程的关键输出翻成一条群消息（不是关键行就返回空串）。"""
-
-        text = line.strip()
-        if text.startswith("[错误]"):
-            return f"【卡组优化】{text}"
-        if text.startswith("基线（原卡表）"):
-            return f"【卡组优化】基线跑完了，{text}"
-        if text.startswith("候选 ") and "→" in text:
-            return f"【卡组优化】{text}"
-        return ""
+    # ⚠ 这里原来是"卡组训练/调优与 AI 打牌"的一整片指令，2026-10-07 用户口径全删：
+    # `/优化卡组`（＋ `_optimize_command` / `_optimize_summary` / `_run_optimize` / `_optimize_milestone`）、
+    # `/挑脚本`（cmd_pick_style）、`/写打法`（cmd_write_playbook）、`/训练`（＋
+    # `_parse_training_rounds` / `_training_command` / `_run_training` / `_training_summary`），
+    # 以及只给它们用的 `_run_tool` / `_style_tool_command` 两个跑独立进程的辅助方法。
+    # 留下的只有 `_list_position`（`/卡组列表`、`/卡组详情`、`/固定卡组` 要用）。
 
     def _list_position(self, deck: StoredDeck) -> int:
         """卡组在 ``/卡组列表`` 里的位置号（命令行工具按这个号取卡组，见 tools 的约定）。"""
@@ -1366,329 +1007,15 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 return index
         return 0
 
-    async def _run_tool(
-        self, label: str, command: List[str], target: str, *, milestones: Tuple[str, ...] = ()
-    ) -> None:
-        """在独立进程里跑一个工具，把关键行播到群里，最后把结论整理成一条消息。
+    # ⚠ 这里原来是 `_run_tool` / `_style_tool_command` 两个方法：在独立进程里跑
+    # tools/ 下的"挑脚本 / 写打法"工具，边跑边把里程碑播到群里。它们只被下面那几条
+    # 已删的指令使用（`/挑脚本` 与 `/写打法`），2026-10-07 用户口径一并删掉。
 
-        与优化那边同一套做法：**边跑边报**（工具要跑几分钟），结束时再给一条带结论的汇报。
-        工具报错一律原样贴出来——这一路上被"报错被说成别的东西"坑过好几次。
-        """
-
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=str(_PLUGIN_ROOT),
-            )
-        except Exception as exc:  # noqa: BLE001  工具起不来不该影响插件其余功能
-            if self._logger is not None:
-                self._logger.exception("%s 进程启动失败", label)
-            await self._announce(target, f"{label}没能跑起来：{type(exc).__name__}: {exc}")
-            return
-        lines: List[str] = []
-        try:
-            assert process.stdout is not None
-            while True:
-                raw = await process.stdout.readline()
-                if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace").rstrip()
-                lines.append(line)
-                text = line.strip()
-                if text.startswith("[错误]"):
-                    await self._announce(target, f"{label}：{text}")
-                elif any(text.startswith(mark) for mark in milestones):
-                    await self._announce(target, f"{label}｜{text}")
-            await process.wait()
-        except Exception as exc:  # noqa: BLE001  读输出失败也要有个交代
-            if self._logger is not None:
-                self._logger.exception("%s 输出读取失败", label)
-            process.kill()
-            await self._announce(target, f"{label}中途断了：{type(exc).__name__}: {exc}")
-            return
-        tail = [line.strip() for line in lines if line.strip()][-12:]
-        report = "\n".join(tail) if tail else "（工具没有任何输出）"
-        if process.returncode not in (0, 1):
-            report = f"退出码 {process.returncode}：\n{report}"
-        await self._announce(target, f"{label}\n{report}")
-
-    def _style_tool_command(self, tool: str, deck: StoredDeck, extra: Sequence[str]) -> List[str]:
-        """拼"给某副牌挑脚本/写打法"的命令行（卡组用 ``/卡组列表`` 的位置号传）。"""
-
-        return [
-            sys.executable,
-            str(_PLUGIN_ROOT / "tools" / tool),
-            "--plugin-root",
-            str(_PLUGIN_ROOT),
-            "--deck-id",
-            str(self._list_position(deck)),
-            *extra,
-        ]
-
-    @Command(
-        "ygo_cmd_pick_style",
-        description="实测挑出牌脚本：让这副牌用几个现成脚本各打几局，挑会出牌、每局中位动作最多的那个",
-        pattern=r"^/(?:挑脚本|选脚本)\s+\S+",
-    )
-    async def cmd_pick_style(
-        self, text: str = "", stream_id: str = "", group_id: str = "", **kwargs: Any
-    ) -> Tuple[bool, str, int]:
-        """按实测排名给这副牌挑一个出牌脚本。"""
-
-        del kwargs
-        if self._deck_pool is None:
-            await self.ctx.send.text("卡组池还没准备好。", stream_id)
-            return True, "卡组池不可用", 1
-        for task, label in ((self._pick_task, "挑脚本"), (self._training_task, "训练"), (self._optimize_task, "优化")):
-            if task is not None and not task.done():
-                await self.ctx.send.text(f"已经有{label}在跑了，等它结束再来。", stream_id)
-                return True, "已有重活在跑", 1
-        parts = text.strip().split()
-        reference = f"{parts[0]} {parts[1]}" if len(parts) > 1 else parts[0]
-        deck = self._deck_by_argument(group_id, reference) or self._deck_by_argument(
-            BUILTIN_GROUP, reference
-        )
-        if deck is None:
-            await self.ctx.send.text(
-                "用法：/挑脚本 <编号或名字>\n"
-                "会让这副牌用几个现成的出牌脚本各打几局（对手固定，候选里含它现在用的那个），"
-                "按「会不会出牌 + 每局中位动作数」排名（均值与胜率只用来裁决平手），"
-                "然后把它记下来供对局使用。",
-                stream_id,
-            )
-            return True, "缺卡组参数", 1
-        position = self._list_position(deck)
-        if position <= 0:
-            await self.ctx.send.text(f"「{deck.display_name}」不在卡组列表里，没法挑脚本。", stream_id)
-            return True, "卡组不在列表里", 1
-        await self.ctx.send.text(
-            f"开始给「{deck.display_name}」实测挑脚本：几个候选各打几局，大概几分钟；跑完发排名。",
-            stream_id,
-        )
-        self._pick_task = asyncio.create_task(
-            self._run_tool(
-                "【挑脚本】",
-                self._style_tool_command("pick_style.py", deck, ["--rounds", "3"]),
-                stream_id or group_id,
-                milestones=("[结果]",),
-            )
-        )
-        return True, "挑脚本已开始", 1
-
-    @Command(
-        "ygo_cmd_write_playbook",
-        description="让模型写这副牌的打法数据（先出谁、检索什么、哪些牌别发动），由通用执行器执行",
-        pattern=r"^/(?:写打法|打法数据|生成打法)\s+\S+",
-    )
-    async def cmd_write_playbook(
-        self, text: str = "", stream_id: str = "", group_id: str = "", **kwargs: Any
-    ) -> Tuple[bool, str, int]:
-        """生成并保存卡组打法数据。"""
-
-        del kwargs
-        if self._deck_pool is None:
-            await self.ctx.send.text("卡组池还没准备好。", stream_id)
-            return True, "卡组池不可用", 1
-        if self._playbook_task is not None and not self._playbook_task.done():
-            await self.ctx.send.text("已经有一份打法数据在写了，等它结束再来。", stream_id)
-            return True, "已有重活在跑", 1
-        parts = text.strip().split()
-        reference = f"{parts[0]} {parts[1]}" if len(parts) > 1 else parts[0]
-        deck = self._deck_by_argument(group_id, reference) or self._deck_by_argument(
-            BUILTIN_GROUP, reference
-        )
-        if deck is None:
-            await self.ctx.send.text(
-                "用法：/写打法 <编号或名字>\n"
-                "会让模型写成一份「这副牌怎么打」的清单（先出谁、检索什么、哪些牌留着别发动），"
-                "校验通过后保存；用通用执行器出牌的那些对局会按它打。",
-                stream_id,
-            )
-            return True, "缺卡组参数", 1
-        position = self._list_position(deck)
-        if position <= 0:
-            await self.ctx.send.text(f"「{deck.display_name}」不在卡组列表里。", stream_id)
-            return True, "卡组不在列表里", 1
-        await self.ctx.send.text(
-            f"开始给「{deck.display_name}」写打法数据（模型写、我们校验卡号），大概一两分钟。",
-            stream_id,
-        )
-        self._playbook_task = asyncio.create_task(
-            self._run_tool(
-                "【写打法】",
-                self._style_tool_command("generate_playbook.py", deck, ["--activate"]),
-                stream_id or group_id,
-                milestones=("[成功]",),
-            )
-        )
-        return True, "写打法已开始", 1
-
-    @Command(
-        "ygo_cmd_train",
-        description="让两副卡组互相对打若干局（镜像配对），打完报胜率",
-        pattern=r"^/(?:训练|对战训练)\s+\S+",
-    )
-    async def cmd_train(
-        self, text: str = "", stream_id: str = "", group_id: str = "", **kwargs: Any
-    ) -> Tuple[bool, str, int]:
-        """挑两副卡组互相对打，训练/评估它们的强弱并汇报。"""
-
-        del kwargs
-        parts = text.strip().split()
-        if len(parts) < 3:
-            await self.ctx.send.text(
-                "用法：/训练 <卡组A> <卡组B> [轮数]\n"
-                "两边用同一副牌各坐一次先攻（镜像配对），轮数默认 20（每轮 2 局）。\n"
-                "卡组可以用 /卡组列表 里的编号或名字；不填轮数就按默认来。",
-                stream_id,
-            )
-            return True, "用法提示", 1
-        if self._deck_pool is None:
-            await self.ctx.send.text("卡组池还没准备好。", stream_id)
-            return True, "卡组池不可用", 1
-        if self._training_task is not None and not self._training_task.done():
-            await self.ctx.send.text("已经有一批训练在跑了，等它结束再来。", stream_id)
-            return True, "已有训练在跑", 1
-
-        # 注意：_deck_by_argument 期望收到**整行指令**（它内部再 split 取参数词），
-        # 直接喂单个参数会让它取到空串、永远"找不到卡组"（实测踩过）
-        left = self._deck_by_argument(group_id, f"{parts[0]} {parts[1]}")
-        right = self._deck_by_argument(group_id, f"{parts[0]} {parts[2]}")
-        if left is None or right is None:
-            missing = parts[1] if left is None else parts[2]
-            await self.ctx.send.text(f"找不到卡组「{missing}」，发 /卡组列表 看看编号。", stream_id)
-            return True, "卡组不存在", 1
-        if left.deck_id == right.deck_id:
-            await self.ctx.send.text("两边是同一副牌，换一副再来。", stream_id)
-            return True, "两边相同", 1
-
-        rounds = self._parse_training_rounds(parts[3] if len(parts) > 3 else "")
-        if rounds is None:
-            await self.ctx.send.text("轮数要写成 1~100 之间的整数。", stream_id)
-            return True, "轮数不合法", 1
-
-        arena = f"train-g{group_id}-{int(time.time())}"
-        await self.ctx.send.text(
-            f"开始训练：「{left.display_name}」vs「{right.display_name}」，"
-            f"{rounds} 轮镜像（共 {rounds * 2} 局）。\n"
-            "训练会占满 CPU，期间对局可能变慢；打完了我把结果发上来。",
-            stream_id,
-        )
-        self._training_task = asyncio.create_task(
-            self._run_training(arena, left, right, rounds, stream_id, group_id)
-        )
-        return True, "训练已开始", 1
-
-    @staticmethod
-    def _parse_training_rounds(raw: str) -> Optional[int]:
-        """把轮数参数读成 1~100；留空用默认值，写错返回 None。"""
-
-        if not raw.strip():
-            return DEFAULT_TRAINING_ROUNDS
-        try:
-            value = int(raw.strip())
-        except ValueError:
-            return None
-        return value if 1 <= value <= MAX_TRAINING_ROUNDS else None
-
-    def _training_command(self, arena: str, left: StoredDeck, right: StoredDeck, rounds: int) -> List[str]:
-        """拼出擂台命令行的参数（单独抽出来是为了能测）。"""
-
-        command = [
-            sys.executable,
-            str(_PLUGIN_ROOT / "tools" / "train_arena.py"),
-            "--plugin-root",
-            str(_PLUGIN_ROOT),
-            "--arena",
-            arena,
-            "--pairs",
-            # 脚本名=卡表路径：按这两副牌**实际在用的打法**训练（生成的专属脚本也在这里生效）
-            f"{left.windbot_deck}={left.ydk_path},{right.windbot_deck}={right.ydk_path}",
-            "--rounds",
-            str(rounds),
-            "--parallel",
-            "4",
-        ]
-        # 训练默认不下计划（跑卡组自带的出牌思路）；只有配了 train_model 才让模型参与决策，
-        # 而且是"用你指定的那个模型"，不碰 planner
-        model = self.config.duel.train_model.strip()
-        if model:
-            command += ["--coach", "llm", "--llm-model", model]
-        else:
-            command += ["--coach", "none"]
-        return command
-
-    async def _run_training(
-        self,
-        arena: str,
-        left: StoredDeck,
-        right: StoredDeck,
-        rounds: int,
-        stream_id: str,
-        group_id: str,
-    ) -> None:
-        """跑一批训练，结束后把胜率发到群里。
-
-        训练是独立进程（``tools/train_arena.py``）：它要起内核与 WindBot、吃满 CPU，
-        放在插件进程里会把事件循环拖死。
-        """
-
-        command = self._training_command(arena, left, right, rounds)
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=str(_PLUGIN_ROOT),
-            )
-            stdout, _ = await process.communicate()
-        except Exception as exc:  # noqa: BLE001  训练失败不该影响插件其余功能
-            if self._logger is not None:
-                self._logger.exception("训练进程启动失败")
-            await self._announce(stream_id or group_id, f"训练没能跑起来：{type(exc).__name__}: {exc}")
-            return
-        output = (stdout or b"").decode("utf-8", errors="replace")
-        report = self._training_summary(left, right, rounds, output)
-        await self._announce(stream_id or group_id, report)
-
-    @staticmethod
-    def _training_summary(left: StoredDeck, right: StoredDeck, rounds: int, output: str) -> str:
-        """把擂台输出整理成一条群消息（单独抽出来是为了能测）。"""
-
-        rates: Dict[str, Tuple[int, int]] = {}
-        for line in output.splitlines():
-            match = re.match(r"^(\S.*?)\s+(\d+)\s+(\d+)\s+([\d.]+)%\s*$", line.strip())
-            if match:
-                rates[match.group(1).strip()] = (int(match.group(2)), int(match.group(3)))
-        head = f"训练完成：「{left.display_name}」vs「{right.display_name}」（{rounds} 轮镜像）"
-        if not rates:
-            return head + "\n没能从训练输出里读到胜率，原始输出的最后几行：\n" + "\n".join(
-                output.strip().splitlines()[-4:]
-            )
-        left_stat = rates.get(left.windbot_deck) or rates.get(left.display_name)
-        right_stat = rates.get(right.windbot_deck) or rates.get(right.display_name)
-        lines = [head]
-        if left_stat and right_stat:
-            left_wins, left_total = left_stat
-            right_wins, right_total = right_stat
-            lines.append(
-                f"「{left.display_name}」{left_wins}/{left_total} = {left_wins / max(left_total, 1):.0%}｜"
-                f"「{right.display_name}」{right_wins}/{right_total} = {right_wins / max(right_total, 1):.0%}"
-            )
-            if left_wins == right_wins:
-                lines.append("打平：这两副牌在这个对手池里看不出强弱差别。")
-            else:
-                better = left if left_wins > right_wins else right
-                lines.append(f"这一批里「{better.display_name}」更占上风。")
-            silent = [line for line in output.splitlines() if "动作数 < 3" in line]
-            if silent:
-                lines.append("（有整局空过的对局，胜负参考价值有限，可以再跑一批看看）")
-        else:
-            for name, (wins, total) in rates.items():
-                lines.append(f"{name}：{wins}/{total} = {wins / max(total, 1):.0%}")
-        return "\n".join(lines)
+    # ⚠ 这里原来是三条"训练/调优"指令：`/挑脚本`（cmd_pick_style，实测几个现成脚本挑一个）、
+    # `/写打法`（cmd_write_playbook，让模型写打法数据）、`/训练`（cmd_train，两副牌互相对打 +
+    # `_parse_training_rounds` / `_training_command` / `_run_training` / `_training_summary`）。
+    # **2026-10-07 用户口径：卡组训练与调优整块去掉**——想给某副牌写专属执行器改用 AI agent
+    # 按 executors/README.md 多轮迭代着写，插件自己不再做这些。
 
     @Command(
         "ygo_cmd_field",
@@ -1880,105 +1207,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             lines.append("  （这局已经打完了，以上是结束时的局面）")
         return lines
 
-    @Command(
-        "ygo_cmd_replay",
-        description="复盘刚打完的那局：问 AI 问了多少次、拦下多少、时间花在哪，并说清问题出在哪",
-        pattern=r"^/(?:复盘|上把复盘)\s*$",
-    )
-    async def cmd_replay(
-        self, stream_id: str = "", group_id: str = "", **kwargs: Any
-    ) -> Tuple[bool, str, int]:
-        """把这一局的决策日志读出来，回答"这把为什么打得菜"。
-
-        机读事实（问了多少次、否决率、最慢几问）**永远照发**，模型只负责把它讲成人话——
-        和播报同一个口径：数字不能被模型改写，解释才由它写。
-        """
-
-        del kwargs
-        knowledge = self._knowledge()
-        if knowledge is None:
-            await self.ctx.send.text("这台机器上还没有知识库（决策日志也记在里面）。", stream_id)
-            return True, "没有知识库", 1
-        trace = knowledge.last_duel(f"room:{stream_id[:12]}")
-        if trace is None:
-            await self.ctx.send.text(
-                "还没有可复盘的局：开着问 AI 打完一局之后再来（每局的问答与胜负都会落到决策日志里）。",
-                stream_id,
-            )
-            return True, "没有可复盘的局", 1
-
-        lines = self._replay_lines(trace, knowledge)
-        comment = await self._write_replay_commentary(trace, lines)
-        text = "\n".join(["【复盘】" + lines[0]] + lines[1:] + ([comment] if comment else []))
-        await self.ctx.send.text(text, stream_id)
-        return True, "已复盘", 1
-
-    def _replay_lines(self, trace: DuelTrace, knowledge: Knowledge) -> List[str]:
-        """复盘要发的那几行机读事实（模型不许改这些数字）。"""
-
-        verdict = {"win": "我方赢了", "loss": "我方输了", "draw": "平局"}.get(
-            trace.result, "没分出胜负"
-        )
-        parts = [f"最近一局（{verdict}）：问 AI {trace.asks} 次"]
-        if trace.activate_asks:
-            parts.append(
-                f"其中「要不要发动」{trace.activate_asks} 次、被拦下 {trace.vetos} 次"
-                f"（{trace.vetos / trace.activate_asks:.0%}）"
-            )
-        lines = ["｜".join(parts)]
-        if trace.kinds:
-            lines.append(
-                "问法分布：" + "、".join(f"{kind}×{count}" for kind, count in sorted(trace.kinds.items()))
-            )
-        slowest = [item for item in knowledge.duel_decisions(trace.duel_key, limit=4) if item[3]]
-        if slowest:
-            lines.append(
-                "最费时间的几问："
-                + "；".join(
-                    f"{self._card_label(knowledge, card_id)} {cost / 1000:.1f} 秒"
-                    for _kind, card_id, _answer, cost in slowest
-                )
-            )
-        if trace.result == "loss":
-            lines.append("（这一局的完整问答都在决策日志里，/复盘 每次读的就是它）")
-        return lines
-
-    def _card_label(self, knowledge: Knowledge, card_id: int) -> str:
-        """卡号 → 卡名（查不到就用卡号；别为了个名字去查两次库）。"""
-
-        if not card_id:
-            return "「这一步做什么」"
-        fact = knowledge.card_facts(int(card_id))
-        return fact.name if fact is not None and fact.name else f"卡 {card_id}"
-
-    async def _write_replay_commentary(self, trace: DuelTrace, lines: List[str]) -> str:
-        """请模型把复盘事实讲成人话：问题出在哪、下次怎么改。
-
-        失败（模型不可用、返回空、被拒）返回空串，由调用方只发机读事实——
-        不编一段"看起来像解释"的话盖住失败。
-        """
-
-        self_name = self._resolve_bot_name()
-        prompt = (
-            f"你是群里的游戏王玩家「{self_name}」，刚打完一局。看下面这份**这一局的实际数据**，"
-            "用两三句话说明：这一局为什么打成这样、下次该怎么改。要求：\n"
-            "* 只说数据支持得住的话——否决率高就说它在拦自己的牌，问得慢就说时间被吃掉了；\n"
-            "* 数据不足以判断原因时，直接说「看不出」，不要编；\n"
-            "* 口语化，别用列表，控制在 100 字以内，不要复述字段名。\n\n"
-            f"这一局的数据：\n" + "\n".join(lines)
-        )
-        try:
-            result = await self.ctx.llm.generate(prompt=prompt)
-        except Exception:  # noqa: BLE001  模型不可用不该让复盘整条消失
-            if self._logger is not None:
-                self._logger.exception("生成复盘点评失败")
-            return ""
-        if not isinstance(result, dict) or not result.get("success", False):
-            if self._logger is not None:
-                self._logger.warning("生成复盘点评被拒绝：%s", result)
-            return ""
-        written = str(result.get("response") or result.get("text") or "").strip()
-        return written
+    # ⚠ 这里原来有一条 `/复盘` 指令（cmd_replay）与它的三个私有方法 `_replay_lines` /
+    # `_card_label` / `_write_replay_commentary`：读这一局的决策日志，报"问 AI 多少次、
+    # 拦下多少、时间花在哪"，再让模型讲成人话。**2026-10-07 用户口径：复盘与 AI 打牌一起去掉**
+    #（决策日志本身也存在已删的 duel/knowledge.py 里），所以整块删掉了。
 
     @Command(
         "ygo_cmd_start",
@@ -2150,8 +1382,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         lines = [
             f"【{deck.display_name}】{'WindBot 自带卡组' if deck.is_builtin else '群友投稿'}",
             f"随机池：{'在' if deck.in_random else '不在'}｜出牌思路：{deck.windbot_deck or '未设置'}",
-            # 问 AI 档位（/出牌模式 改的就是它）：空串＝跟随全局
-            "问 AI：" + BRAIN_MODES.get(deck.brain_scope, ("跟随全局（库里的值认不出）", ""))[0],
+            # ⚠ 这里原来还有一行"问 AI：<档位>"（/出牌模式 改的就是它）。AI 打牌整条链路
+            # 已按 2026-10-07 用户口径删除，卡组详情不再报这一项。
         ]
         if deck.is_builtin:
             lines.append("内置卡组配着它自己的出牌脚本，牌力最稳")
@@ -2216,74 +1448,9 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         await self.ctx.send.text(text_out, stream_id)
         return True, f"随机池 {len(pool)} 副", 1
 
-    @Command(
-        "ygo_cmd_brain_mode",
-        description="按卡组切换问 AI 的档位（不问 / 每问都问 / 只问高压 / 只应对不掌舵 / 跟随全局）",
-        pattern=r"^/(?:出牌模式|模式|ai模式|AI模式)\s*\S*",
-    )
-    async def cmd_brain_mode(
-        self, text: str = "", stream_id: str = "", group_id: str = "", **kwargs: Any
-    ) -> Tuple[bool, str, int]:
-        """``/出牌模式 <编号或名字> [档位]``：不带档位就看当前，带了就改。
-
-        为什么要按牌分别设：实测"脚本本来就能打"的牌（升辉月跑自带的 Lucky）开着问 AI 反而少打动作
-        （16 局：特召 4.4 → 3.6、还多出空过局），而"脚本一步都走不出来"的牌全靠 AI 才动得起来。
-        一个全局开关满足不了两种牌，所以档位记在卡组上。
-        """
-
-        del kwargs
-        if self._deck_pool is None:
-            await self.ctx.send.text("卡组池还没准备好。", stream_id)
-            return True, "卡组池不可用", 1
-        group_key = group_id or stream_id
-        parts = text.strip().split(maxsplit=2)
-        if len(parts) < 2 or not parts[1].strip():
-            await self.ctx.send.text(
-                "用法：/出牌模式 <编号或名字> [档位]\n"
-                "档位：不问 / 每问都问 / 只问高压 / 只应对 / 跟随全局（默认）。\n"
-                "不带档位就看这副牌现在是什么档。",
-                stream_id,
-            )
-            return True, "缺卡组参数", 1
-
-        # _deck_by_argument 收的是"命令 + 一个参数"这种文本（它自己取第二个词），而这条命令
-        # 有两个参数（编号 + 档位）——所以先规整成它能认的两段式，别把"1 只问高压"整串当名字
-        lookup = f"/模式 {parts[1].strip()}"
-        deck = self._deck_by_argument(group_key, lookup) or self._deck_by_argument(BUILTIN_GROUP, lookup)
-        if deck is None:
-            await self.ctx.send.text(f"没找到「{parts[1].strip()}」这副牌。", stream_id)
-            return True, "缺卡组参数", 1
-
-        if len(parts) < 3 or not parts[2].strip():
-            current = BRAIN_MODES.get(deck.brain_scope, ("跟随全局（库里的值认不出）", ""))[0]
-            global_mode = self._brain_scope_for(None)
-            shown = {"off": "不问 AI", "all": "每一问都问"}.get(global_mode, global_mode)
-            await self.ctx.send.text(
-                f"「{deck.display_name}」当前的问 AI 档位：{current}。\n"
-                f"（全局配置是「{shown}」；发 /出牌模式 {parts[1].strip()} 不问 可以改）",
-                stream_id,
-            )
-            return True, "已报出档位", 1
-
-        wanted = parts[2].strip()
-        if wanted in BRAIN_MODE_ALIASES:
-            scope = BRAIN_MODE_ALIASES[wanted]
-        elif wanted in BRAIN_MODES:
-            scope = wanted
-        else:
-            await self.ctx.send.text(
-                f"「{wanted}」这个档位不认识。可用：不问 / 每问都问 / 只问高压 / 只应对 / 跟随全局。",
-                stream_id,
-            )
-            return True, "档位不认识", 1
-
-        self._deck_pool.set_brain_scope(deck.deck_id, scope)
-        label = BRAIN_MODES[scope][0]
-        await self.ctx.send.text(
-            f"好了：「{deck.display_name}」之后每局**{label}**（下一局生效）。",
-            stream_id,
-        )
-        return True, f"已设为 {label}", 1
+    # ⚠ 这里原来有一条 `/出牌模式` 指令（cmd_brain_mode）：按卡组切换"问 AI"的档位
+    # （不问 / 每问都问 / 只问高压 / 只应对不掌舵 / 跟随全局），改的是卡组库里的 brain_scope。
+    # AI 打牌整条链路已按 2026-10-07 用户口径删除，这条指令连同档位表一起删掉了。
 
     @Command(
         "ygo_cmd_deck_fix",
@@ -2473,12 +1640,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         """决定用哪个 WindBot 可执行文件。
 
         出牌脚本是编译进 exe 的（WindBot 用反射扫 ``[Deck(...)]`` 注册），所以选错 exe
-        不会报错，只会静默换一个随机脚本 —— 具体分三种情况：
+        不会报错，只会静默换一个随机脚本 —— 具体分两种情况：
 
-        1. 开了 AI 教练：必须用编译进 ``PlanAwareExecutor`` 的那份（``bin/PlanAware``），
-           否则教练写的计划根本没人读；
-        2. 没开教练但配了源码树且编译过：用编译产物（里面含自己写/agent 写的执行器）；
-        3. 其余情况：用配置里那个原版 exe。
+        1. 配了源码树且编译过：用编译产物（里面含自己写/agent 写的执行器）；
+        2. 其余情况：用配置里那个原版 exe。
         """
 
         configured = self.config.paths.resolved_windbot_executable() or Path(
@@ -2487,27 +1652,11 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         src_dir = self.config.paths.resolved_windbot_src_dir()
         if src_dir is None:
             return configured
-        if self._plan_coach_requested():
-            plan_built = src_dir / "bin" / "PlanAware" / "WindBot.exe"
-            if plan_built.is_file():
-                return plan_built
-            # 计划感知执行器没编译出来。这里不能用兜底糊过去：用原版 exe 时
-            # Deck=PlanAware 会被随机执行器顶替，计划无人读取而日志里看不出异常
-            self._logger.error(
-                "配置开了 AI 教练（duel.ai_plan_coach=%s），但找不到计划感知执行器：%s；"
-                "这一局会退回各卡组自带的出牌脚本（教练写的计划不会生效）。"
-                "需要先按 README 用 msbuild 把 windbot-src 编译到 bin/PlanAware",
-                self.config.duel.ai_plan_coach,
-                plan_built,
-            )
-            return configured
+        # ⚠ 这里原来还有一条分支："开了 AI 教练就必须用 bin/PlanAware 那份计划感知执行器"。
+        # AI 教练已按 2026-10-07 用户口径删除（连带 `_plan_coach_requested`），现在只按源码树
+        # 编译产物优先、否则用配置的 exe 这条简单逻辑走。
         built = src_dir / "bin" / "Release" / "WindBot.exe"
         return built if built.is_file() else configured
-
-    def _plan_coach_requested(self) -> bool:
-        """配置里是否要求了 AI 教练（``duel.ai_plan_coach``）。"""
-
-        return self.config.duel.ai_plan_coach.strip().lower() not in ("", "off", "none", "无", "关")
 
     # ⚠ 这里原来有四段"让模型现写 C# 出牌脚本"的代码：
     #   `_make_script_generator`（造 DeckScriptGenerator）／`_llm_generate`（调宿主模型）
@@ -2524,75 +1673,20 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
     # 让模型写 C# 执行器、编译、再把脚本名写回卡组库。**2026-10-07 用户口径：不再自动写脚本**，
     # 所以整块删掉——投稿回执里只说明"先用通用脚本打，想更强就让 agent 写专属执行器"。
     # 手工编译出来的执行器依旧生效：卡组库里的 `generated_script` / `picked_style` 字段还在，
-    # `_with_current_style()` 照旧优先用它（`set_generated_script` 现在只由命令行工具调用）。
+    # `_with_current_style()` 照旧优先用它。（原来那两支"写入这两个字段"的命令行工具
+    # ——`tools/pick_style.py` / `tools/optimize_deck.py`——也随训练调优一起删了，
+    # 所以这两个字段现在由 agent 手工写库/由旧数据带着走。）
 
-    def _make_deck_plan_handler(self, stream_id: str, group_id: str) -> Callable[[StoredDeck], None]:
-        """造一个「导入卡组后写展开流程」的回调（后台任务，不阻塞投稿回执）。
-
-        只做一件事：让模型按卡表写一份人话的展开流程，存进知识库的 ``deck:<编号>``；
-        问 AI 时（"这一步做什么"那一问）会整份喂给模型。
-        所以它失败也不影响开局——最多少一份资料。
-        """
-
-        def handler(deck: StoredDeck) -> None:
-            task = asyncio.create_task(self._generate_deck_plan(stream_id, group_id, deck))
-            self._background_tasks.add(task)
-
-            def done(finished: asyncio.Task) -> None:
-                self._background_tasks.discard(finished)
-                if finished.cancelled():
-                    return
-                error = finished.exception()
-                if error is not None and self._logger is not None:
-                    self._logger.error(
-                        "写展开流程的后台任务异常退出：%s: %s", type(error).__name__, error
-                    )
-
-            task.add_done_callback(done)
-
-        return handler
-
-    async def _generate_deck_plan(self, stream_id: str, group_id: str, deck: StoredDeck) -> None:
-        """让模型按卡表写一份展开流程，存进知识库（独立进程，几十秒）。"""
-
-        del group_id
-        command = [
-            sys.executable,
-            str(_PLUGIN_ROOT / "tools" / "build_deck_plan_ai.py"),
-            "--plugin-root",
-            str(_PLUGIN_ROOT),
-            "--deck-id",
-            str(deck.deck_id),
-            "--activate",
-        ]
-        try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=str(_PLUGIN_ROOT),
-            )
-            stdout, _ = await process.communicate()
-        except Exception:  # noqa: BLE001  后台任务必须自己吞异常
-            if self._logger is not None:
-                self._logger.exception("启动「写展开流程」进程失败：卡组 %s", deck.deck_id)
-            return
-        output = (stdout or b"").decode("utf-8", errors="replace")
-        # 缓存要失效：这条进程刚往 knowledge.db 里写了数据
-        self._knowledge_cache = None
-        if process.returncode != 0:
-            tail = "\n".join(output.strip().splitlines()[-4:]) or "（没有任何输出）"
-            if self._logger is not None:
-                self._logger.warning("「%s」的展开流程没写成功：%s", deck.display_name, tail)
-            return
-        if self._logger is not None:
-            self._logger.info("「%s」的展开流程已写进知识库", deck.display_name)
+    # ⚠ 这里原来是 `_make_deck_plan_handler` / `_generate_deck_plan` 两块：导入卡组后排一个
+    # 后台任务，调 tools/build_deck_plan_ai.py 让模型按卡表写一份展开流程存进知识库，
+    # 问 AI 时整份喂给模型。展开流程 / 知识库 / 问 AI 已按 2026-10-07 用户口径整条删除
+    # （连带 `_background_tasks` 这个"后台任务集合"与 `_knowledge_cache` 失效逻辑）。
 
     # ⚠ 这里原来还有三块：`_script_command`（拼 `tools/generate_deck_script.py` 的命令行）、
     # `_parse_generated_style`（从子进程输出里抠脚本类名）、`_collect_card_info`
     # （把卡组整理成含效果文本的清单喂给模型）。自动写脚本整条链路已按 2026-10-07 用户口径删除。
-    # 卡牌清单这份口径本身还有用（写打法数据、展开流程的两支 CLI 都要），
-    # 已经挪到 `duel/cards.py` 的 `collect_card_info()`。
+    # 卡牌清单那份口径本身是通用工具，留在 `duel/cards.py` 的 `collect_card_info()`
+    # （原来那两支 CLI——写打法数据 / 写展开流程——也一起删了，所以现在没有人调它）。
 
     async def _announce(self, stream_id: str, text: str) -> None:
         """往群里发一条消息；发不出去也只记日志。"""
@@ -2626,11 +1720,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             outcome = await session.wait_finished()
             summary = session.summary_lines()
             result_data = session.result_dict()
-            # 这一局的决策日志补上结果（`/复盘` 与 review_decisions 靠它判断干预的对错）
-            self._finish_room_brain(stream_id, session, result_data, outcome)
-            # 打完的真实对局也进结果库（与擂台同一个库，arena="room" 区分）——
-            # 不落库的话，"改动有没有效果"就只能在擂台模拟里看，真实对局一点数据都不留
-            self._record_room_duel(session, result_data, outcome)
+            # ⚠ 这里原来还有两步收尾：`_finish_room_brain`（把这一局的胜负回填进决策日志，
+            # 供 /复盘 与 review_decisions 判断干预对错）与 `_record_room_duel`（把真实房间对局
+            # 写进擂台那张结果库，arena="room"）。AI 打牌 / 复盘 / 训练调优整条链路已按
+            # 2026-10-07 用户口径删除，这两步连同 duel/duelrecord.py 与 train/store.py 一起去掉了。
             report = self._compose_result_message(outcome, summary)
             if outcome == OUTCOME_FINISHED:
                 # 打完的总结交给模型写成一段人话，再由插件直接发到群里。
@@ -2675,7 +1768,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 self._logger.exception("播报对局结果失败：群 %s", group_id)
         finally:
             self._rooms.pop(stream_id, None)
-            self._stop_room_brain(stream_id)
+            # ⚠ 这里原来还会 `_stop_room_brain(stream_id)`：撤掉这一局的"问 AI"答复任务
+            # 并清掉问答文件。AI 打牌已按 2026-10-07 用户口径删除，收摊只剩关房间。
             await session.stop()
             if self._logger is not None:
                 self._logger.info("房间已收摊：群 %s，结束原因 %s", group_id, outcome)
@@ -2824,294 +1918,17 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
     # ------------------------------------------------------------------ 辅助
 
-    def _brain_scope_for(self, deck: Optional[StoredDeck]) -> str:
-        """这一局实际的问 AI 档位：``deck.brain_scope`` 优先，空串跟随全局。
+    # ⚠ 这里原来是 AI 打牌的核心几块：`_brain_scope_for`（这一局的问 AI 档位）、
+    # `_start_room_brain`（起"逐步问 AI"的答复任务：模型走 <数据目录>/brain_model.toml，
+    # 把打法数据 + 攻略要点 + 知识库检索结果一起喂给模型，再把问答文件交给 WindBot）、
+    # `_finish_room_brain`（打完把胜负回填决策日志）、`_record_room_duel`（真实对局写进结果库）、
+    # `_stop_room_brain`（收摊撤任务）。**2026-10-07 用户口径：AI 打牌整条链路去掉**——
+    # 出牌交回各卡组自带的 WindBot 脚本（见 `_with_current_style`），这几块连同
+    # train/ 整包、duel/knowledge.py、duel/duelrecord.py 一起删了。
 
-        返回 ``"off"`` 表示不问（调用方据此不开通道），其余值直接当模型的 ``scope``。
-        """
-
-        per_deck = (deck.brain_scope if deck is not None else "").strip()
-        if per_deck:
-            # 库里的值可能是老版本/手改的，认不出就跟随全局（不拿未知值去当 scope）
-            return per_deck if per_deck in BRAIN_MODES else ""
-        if not self.config.duel.ai_brain:
-            return "off"
-        return self.config.duel.brain_scope.strip() or "all"
-
-    def _start_room_brain(
-        self, stream_id: str, deck: Optional[StoredDeck] = None
-    ) -> Tuple[Optional[Path], Optional[asyncio.Task]]:
-        """按配置决定这一局要不要"逐步问 AI"，要就起一个答复任务。
-
-        模型走**插件自带的配置**（``<数据目录>/brain_model.toml``：密钥不进仓库、也不动宿主配置）。
-        拿不到模型就**不开这条通道**——否则每次决策都会白等执行器的超时，
-        把房间的每回合时限吃光（实测动作数从 12~18 掉到 1~6）。
-
-        要不要问、问到什么程度，**先看这副牌自己的档位**（``/出牌模式`` 设的
-        ``deck.brain_scope``），空串才跟随全局配置 ``duel.brain_scope``：
-        "脚本本来就能打"的牌不问反而更好，而"脚本走不出来"的牌非问不可。
-        """
-
-        scope = self._brain_scope_for(deck)
-        if scope == "off":
-            if self._logger is not None:
-                self._logger.info("这副牌设了「不问 AI」（/出牌模式），本局不开问答通道")
-            return None, None
-        # 注意：这里必须**相对导入**——插件是按包加载的，绝对导入 train.* / duel.* 会直接崩
-        # （实测：ModuleNotFoundError: No module named 'train'）
-        from .duel.netguard import guarded_request
-        from .train.ai_brain import (
-            BrainServer,
-            load_brain_model_settings,
-            load_combo_guide,
-            make_model_decider,
-        )
-
-        data_dir = self._data_dir()
-        settings = load_brain_model_settings(data_dir)
-        if settings is None:
-            if self._logger is not None:
-                self._logger.warning(
-                    "配置开了 ai_brain，但没读到 %s，这一局照脚本打",
-                    data_dir / "brain_model.toml",
-                )
-            return None, None
-        card_db = self._card_db
-        # 把这副牌的打法数据 + **攻略要点**（展开流程）一起塞进提示词：不然它会把展开链上的
-        # 关键卡"省下来"不发（用户实测"连基础展开都断了"就是这么来的）
-        deck_playbook = deck.playbook if deck is not None else ""
-        deck_name = deck.display_name if deck is not None else ""
-        guide = load_combo_guide(data_dir, deck.deck_id) if deck is not None else ""
-        # 知识库：按"这一问的局面"临场检索几条（本机 SQLite，毫秒级、不花钱）
-        knowledge = None
-        if self.config.duel.brain_knowledge:
-            knowledge = self._knowledge()
-        if deck is not None and self._logger is not None:
-            self._logger.info(
-                "本局问 AI 的素材：打法数据 %s 字、攻略要点 %s 字、知识库 %s",
-                len(deck_playbook),
-                len(guide),
-                "开" if knowledge is not None else "关",
-            )
-        # 决策日志：一个实例 = 一局（毫秒级本地写入）。打完由 `_finish_room_brain` 回填胜负——
-        # 没有胜负的日志只能看"问了什么"，看不出"这一步到底帮没帮上忙"
-        decision_log = (
-            DecisionLog(
-                knowledge.path,
-                arena=f"room:{stream_id[:12]}",
-                deck_key=str(deck.deck_id),
-                duel_key=f"{stream_id[:12]}-{int(time.time())}",
-            )
-            if knowledge is not None and deck is not None
-            else None
-        )
-        decide = make_model_decider(
-            settings,
-            request=guarded_request,
-            card_db=card_db,
-            logger=self._logger,
-            playbook=deck_playbook,
-            deck_name=deck_name,
-            combo_guide=guide,
-            knowledge=knowledge,
-            deck_id=deck.deck_id if deck is not None else 0,
-            decision_log=decision_log,
-            scope=scope,
-        )
-        prefix = data_dir / "temp" / "brain" / f"room_{stream_id[:12]}_{int(time.time())}.txt"
-        prefix.parent.mkdir(parents=True, exist_ok=True)
-        server = BrainServer(prefix, decide, logger=self._logger)
-        task = asyncio.create_task(server.serve_forever())
-        self._brain_tasks[stream_id] = (prefix, task, server, decision_log)
-        if self._logger is not None:
-            self._logger.info("本局开启逐步问 AI：模型 %s（%s）", settings.model, settings.base_url)
-        return prefix, task
-
-    def _finish_room_brain(
-        self,
-        stream_id: str,
-        session: DuelSession,
-        result_data: Dict[str, object],
-        outcome: str,
-    ) -> None:
-        """给这一局的决策日志回填胜负——`/复盘` 与 review_decisions 靠它判断干预的对错。
-
-        生命值取**实时局面**那份：记录器的 ``lp_final`` 依赖 ``MSG_LPUPDATE``，
-        而本机内核不为掉血发它（会一直是 0），擂台那边踩过同一个坑。
-        """
-
-        entry = self._brain_tasks.get(stream_id)
-        if entry is None:
-            return
-        log = entry[3]
-        if log is None:
-            return
-        try:
-            winner_is_self = result_data.get("winner_is_self")
-            if outcome != OUTCOME_FINISHED or winner_is_self is None:
-                result = "unknown"
-            else:
-                result = "win" if winner_is_self else "loss"
-            lp_self = 0
-            lp_other = 0
-            recorder = session.recorder()
-            seat = recorder.self_seat
-            if seat in (0, 1):
-                field_state = recorder.field_state
-                lp_self = int(field_state.players[seat].lp)
-                lp_other = int(field_state.players[1 - seat].lp)
-            text = duel_outcome_text(
-                result=result,
-                turns=int(result_data.get("turns") or 0),
-                lp_self=lp_self,
-                lp_other=lp_other,
-            )
-            log.finish_duel(text)
-        except Exception as exc:  # noqa: BLE001  决策日志绝不能把这一局的播报搅坏
-            if self._logger is not None:
-                self._logger.warning("回填决策日志结果失败：%s", exc)
-
-    def _record_room_duel(
-        self,
-        session: DuelSession,
-        result_data: Dict[str, object],
-        outcome: str,
-        *,
-        store_path: Optional[Path] = None,
-    ) -> None:
-        """把真实房间对局也写进结果库（``arena="room"``，与擂台同一个库）。
-
-        **为什么必须落库**：以前只有擂台局进库，真实对局只留下决策日志里的问答——
-        于是"改了有没有变好"只能在模拟里看，真实对局没有任何可统计的东西。
-        字段口径与擂台**完全一致**（动作数＝召唤＋特召＋效果＋攻击，生命值取实时局面那份），
-        这样两边能直接放一起比。
-
-        只记**真打完**的局（中途收摊/没人进来那种不算对局）；任何失败都只记日志——
-        写库绝不能把这一局的播报搅坏。
-        """
-
-        if outcome != OUTCOME_FINISHED:
-            return
-        try:
-            # 相对导入（见 _start_room_brain 的说明：插件按包加载，绝对导入 train.* 会崩）。
-            # DuelOutcome 放在 duel/ 下就是为了这里能安全导入（train/arena.py 用绝对导入，进不来）
-            from .duel.duelrecord import DuelOutcome
-            from .train.store import DuelStore
-
-            recorder = session.recorder()
-            seat = recorder.self_seat
-            if seat not in (0, 1):
-                return
-            players = result_data.get("players") or {}
-            self_stats = players.get(str(seat)) or {}
-            other_stats = players.get(str(1 - seat)) or {}
-
-            def actions(stats: Dict[str, object]) -> int:
-                """与擂台同一个口径：召唤 + 盖放 + 效果 + 攻击。
-
-                **盖放要算进来**（2026-10-06 起，与 ``train/arena.py`` 的 ``actions()`` 保持同步）：
-                内核给盖放单发 ``MSG_SET``、不给 summon 报文；漏掉它，"整局只盖牌"的局
-                在台账里看起来就像"整局没出牌"。
-                """
-
-                return sum(
-                    int(stats.get(key) or 0)
-                    for key in ("normal_summons", "sp_summons", "sets", "effects", "attacks")
-                )
-
-            # 双方都取**游戏内的名字**（记录器按座位给的），别一边用配置昵称、一边用游戏内名——
-            # 那样库里的左右两列不是同一套称呼，事后对不上（实测麦麦在游戏内叫「憨憨」）
-            self_name = str(self_stats.get("name") or self._resolve_bot_name())
-            other_name = str(other_stats.get("name") or "群友")
-            winner_is_self = result_data.get("winner_is_self")
-            if winner_is_self is True:
-                winner = self_name
-            elif winner_is_self is False:
-                winner = other_name
-            else:
-                winner = "unknown"
-            field_state = recorder.field_state
-            left_lp = int(field_state.players[seat].lp)
-            right_lp = int(field_state.players[1 - seat].lp)
-            deck_style = str(result_data.get("deck_style") or "")
-            stored = DuelOutcome(
-                left=self_name,
-                right=other_name,
-                left_seat=seat,
-                winner=winner,
-                turns=int(result_data.get("turns") or 0),
-                duration_seconds=int(result_data.get("duration_seconds") or 0),
-                reason=str(result_data.get("reason") or ""),
-                actions_left=actions(self_stats),
-                actions_right=actions(other_stats),
-                lp_left=left_lp,
-                lp_right=right_lp,
-                sp_summons_left=int(self_stats.get("sp_summons") or 0),
-                sp_summons_right=int(other_stats.get("sp_summons") or 0),
-                effects_left=int(self_stats.get("effects") or 0),
-                effects_right=int(other_stats.get("effects") or 0),
-                sets_left=int(self_stats.get("sets") or 0),
-                sets_right=int(other_stats.get("sets") or 0),
-                # 用卡台账按座位分开（2026-10-07）：`card_usage` 只含我方，对手那份单独落一列
-                card_usage=dict(recorder.card_usage),
-                card_usage_opponent=dict(recorder.opponent_card_usage),
-            )
-            store = DuelStore(store_path or (_PLUGIN_ROOT / "temp" / "train" / "arena.db"))
-            try:
-                store.record(
-                    "room",
-                    stored,
-                    left_style=deck_style or "未记录",
-                    right_style="真人",
-                )
-            finally:
-                store.close()
-        except Exception as exc:  # noqa: BLE001  落库失败绝不能影响播报
-            if self._logger is not None:
-                self._logger.warning("房间对局落库失败：%s", exc)
-
-    def _stop_room_brain(self, stream_id: str) -> None:
-        """房间收摊时停掉答复任务并清掉问答文件。"""
-
-        entry = self._brain_tasks.pop(stream_id, None)
-        if entry is None:
-            return
-        prefix, task, server, log = entry
-        task.cancel()
-        if log is not None:
-            log.close()
-        for suffix in (".q", ".a"):
-            try:
-                Path(str(prefix) + suffix).unlink(missing_ok=True)
-            except OSError:
-                pass
-        if self._logger is not None:
-            self._logger.info("逐步问 AI 结束：这一局共答复 %s 次", server.answered)
-
-    def _data_dir(self) -> Path:
-        """插件数据目录（宿主约定：``<MaiBot>/data/plugins/<插件 id>/``）。"""
-
-        return Path(self.ctx.paths.data_dir)
-
-    def _knowledge(self) -> Optional[Knowledge]:
-        """知识库（只读；库不存在时返回 None，问 AI 就退回"只用静态素材"）。
-
-        懒加载 + 缓存：本机 SQLite 查询是毫秒级，但每局都开一次连接没必要。
-        """
-
-        if self._knowledge_cache is None:
-            cards_db = self._resolve_cards_cdb()
-            knowledge = Knowledge.from_data_dir(
-                self._data_dir(), cards_db=cards_db, plugin_root=_PLUGIN_ROOT
-            )
-            self._knowledge_cache = knowledge if knowledge.available else None
-            if self._knowledge_cache is None and self._logger is not None:
-                self._logger.info(
-                    "还没有知识库（%s）——问 AI 只用攻略要点与打法数据；"
-                    "要建的话跑 tools/build_card_facts.py 与 tools/build_deck_plans.py",
-                    knowledge.path,
-                )
-        return self._knowledge_cache
+    # ⚠ 这里原来还有 `_data_dir`（插件数据目录，只有已删的 AI 链路在用）与
+    # `_knowledge`（懒加载 knowledge.db 的知识库缓存）。2026-10-07 用户口径去掉 AI 打牌后
+    # 两个方法都没有消费者了：`duel/knowledge.py` 已删，这里一并删掉。
 
     def _build_session_config(self, stream_id: str) -> SessionConfig:
         """把插件配置映射成会话配置。"""
@@ -3417,106 +2234,11 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             name = (self._deck_pool.get_setting(SETTING_BOT_NAME) or "").strip()
         return name or self.config.duel.bot_name
 
-    async def _invite_loop(self) -> None:
-        """空闲时主动冒泡约战（配置 ``duel.invite_enabled`` 打开才发）。
-
-        间隔在 ``invite_min_minutes``~``invite_max_minutes`` 之间随机；下面两种情况直接跳过：
-
-        * 已经有房间在跑（不打扰正在打的局）；
-        * 还没在哪个群开过房（``_invite_stream_id`` 为空）——只有调用过本插件工具的群
-          才拿得到可用的聊天流，凭空猜一个 stream_id 会发到不存在的地方。
-        """
-
-        while True:
-            duel = self.config.duel
-            low = max(1, min(duel.invite_min_minutes, duel.invite_max_minutes))
-            high = max(low, duel.invite_max_minutes)
-            # 这里的随机只是"让间隔别太机械"，不是安全用途（不需要密码学随机源）
-            await asyncio.sleep(random.uniform(low, high) * 60.0)
-            text = self._compose_invite_text()
-            if text is None:
-                continue
-            try:
-                await self.ctx.send.text(text, self._invite_stream_id)
-                if self._logger is not None:
-                    self._logger.info("主动约战：已向 %s 发出邀请", self._invite_stream_id)
-            except Exception:  # noqa: BLE001  约战失败不能牵连对局与其它功能
-                if self._logger is not None:
-                    self._logger.exception("主动约战发送失败")
-
-    def _compose_invite_text(self) -> Optional[str]:
-        """该不该主动约战、说什么：**关着、正在打、或还没在哪个群开过房**时返回 None。
-
-        把"该不该发"抽出来是为了能测——循环本身要 sleep 几十分钟，测试等不起。
-        """
-
-        duel = self.config.duel
-        if not duel.invite_enabled or self._rooms or not self._invite_stream_id:
-            return None
-        name = self._bot_display_name()
-        return (duel.invite_text or "").strip() or f"{name}在，有人想和{name}打一局吗？说一声就开房。"
-
-    async def _persist_room_loop(self) -> None:
-        """常驻房：插件在跑，就一直有一副「ygopro + WindBot」等着人连。
-
-        和"群里喊一句才开房"的区别：
-
-        * **端口固定**（配置 ``duel.persist_room_port``）——重启电脑/重启插件后地址不变，能直接连；
-        * **一局打完自动再开一副**，进程起崩了 5 秒后重来（所以它是"自启动 + 自愈"，不用人工盯着）；
-        * 不登记进 ``self._rooms``：那是"群里这一局"的账本，常驻房进去会占掉
-          ``max_concurrent_rooms`` 的额度、也会被 ``/查房`` 当成当前对局——两码事。
-
-        开关（``duel.persist_room``）与端口都在循环里读配置，所以热更新即时生效，不用重启插件。
-        """
-
-        while True:
-            duel = self.config.duel
-            if not duel.persist_room:
-                return
-            session: Optional[DuelSession] = None
-            try:
-                deck, _note = self._pick_deck(PERSIST_GROUP, "")
-                config = self._build_session_config(PERSIST_STREAM)
-                if duel.persist_room_port:
-                    config = dataclasses.replace(config, listen_port=duel.persist_room_port)
-                session = DuelSession(
-                    config,
-                    group_id=PERSIST_GROUP,
-                    deck=deck,
-                    card_db=self._card_db,
-                    logger=self._logger,
-                )
-                info = await session.start()
-                message = self._compose_open_message(info, "mdpro3", "（常驻房）")
-                # 地址只发到"最近开过房的群"：没开过房就没有可用的聊天流，凭空猜 stream_id 会发错地方。
-                # 那种情况下写进插件日志——重启电脑后没有群消息可看时，这是唯一能找到端口与口令的地方。
-                if self._invite_stream_id:
-                    await self.ctx.send.text(message, self._invite_stream_id)
-                elif self._logger is not None:
-                    self._logger.info(
-                        "常驻房已就绪（还没有可发的群，信息记在这里）：\n%s", message
-                    )
-                # 等这一局打完（内部会播报结果、落库、写进机器人上下文）
-                # ⚠ **结果必须发到真实的聊天流**：`PERSIST_STREAM` 只是"这一局在账本里的名字"，
-                # 拿它当 stream_id 发消息等于发到不存在的地方——实测症状就是"打完换房间了、
-                # 但总结没发出来"。有开过房的群就发给那个群；没有就只记日志、别假装发出去。
-                report_stream = self._invite_stream_id or PERSIST_STREAM
-                if report_stream == PERSIST_STREAM and self._logger is not None:
-                    self._logger.warning("常驻房打完但还没有可发的群，这一局的结果只写进日志")
-                await self._run_room(session, report_stream, PERSIST_GROUP)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001  常驻房不能因为一次异常就停掉
-                if self._logger is not None:
-                    self._logger.exception("常驻房异常，5 秒后重开")
-            finally:
-                if session is not None:
-                    try:
-                        await session.stop()
-                    except Exception:  # noqa: BLE001  收摊失败不阻塞重开
-                        if self._logger is not None:
-                            self._logger.warning("常驻房收摊失败，忽略后重开")
-            await asyncio.sleep(PERSIST_RETRY_SECONDS)
+    # ⚠ 这里原来是三个常驻循环/辅助：`_invite_loop`（空闲时按随机间隔主动冒泡约战）、
+    # `_compose_invite_text`（该不该发、发什么）、`_persist_room_loop`（常驻房：插件一启动就
+    # 拉起一副 ygopro + WindBot 一直等人连，固定端口、打完自动重开、崩了 5 秒后自愈）。
+    # **2026-10-07 用户口径：常驻房与空闲约战都去掉**，现在只有群里有人要打（`/开房` 或
+    # `ygo_duel_start`）才开房。
 
     def _compose_open_message(self, info: SessionInfo, platform: str, hint: str = "") -> str:
         """开局后发到群里的连接信息。

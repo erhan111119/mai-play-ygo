@@ -23,13 +23,14 @@ import asyncio
 import logging
 import secrets
 import time
-import uuid
 
 from .cards import CardDatabase
 from .deckpool import StoredDeck
 from .gate import ROLE_BOT, DuelGate
 from .netutil import format_endpoint
-from .playbook import write_playbook_file
+# ⚠ 这里原来还有 `from .playbook import write_playbook_file`：会话开局前把卡组打法数据
+# 写成文件交给 WindBot（只有计划感知执行器会读）。打法数据 / AI 打牌整条链路已按
+# 2026-10-07 用户口径删除，`duel/playbook.py` 也删了，所以这行没了。
 from .recorder import DuelRecorder
 from .room import ProcessError, RoomSettings, WindBotProcess, WindBotSettings, YgoProRoom
 from .protocol import Frame
@@ -91,24 +92,10 @@ class SessionConfig:
     擂台并发跑对局时会为每一局准备独立的卡表副本（见 train/arena.py），
     这样各局可以有不同的牌序而不互相干扰。
     """
-    plan_file: Optional[Path] = None
-    """作战计划文件路径；交给 bot 那侧的 WindBot，只有计划感知执行器会读它。"""
-    playbook: str = ""
-    """卡组打法数据的**文本**（``duel/playbook.py`` 的格式）。
-
-    由会话在开局前写成文件再交给 WindBot——这样房间与擂台只有一条写文件的路径，
-    调用方（插件、擂台）不需要各自去管临时文件。
-    """
-    playbook_file: Optional[Path] = None
-    """卡组打法数据文件路径；留空时按 :attr:`playbook` 自动生成一个。
-
-    擂台并发跑对局时要给每一局各自的文件，免得互相覆盖。
-    """
-    brain_file: Optional[Path] = None
-    """逐步问 AI 的问答前缀（``<前缀>.q`` / ``.a``）；留空 = 不问 AI。
-
-    这是"第一步实测"用的通道：只把"要不要发动"和"打谁"两件事交给模型，其余照脚本。
-    """
+    # ⚠ 这里原来还有四个字段：`plan_file`（作战计划）／`playbook` + `playbook_file`
+    # （卡组打法数据与它的文件路径）／`brain_file`（逐步问 AI 的问答前缀）。
+    # 它们都服务于已删的"计划感知执行器 PlanAware"（AI 教练 / 打法数据 / 逐步问 AI），
+    # 2026-10-07 用户口径把整条链路删掉了，写文件的代码（`_playbook_path`）也一起删除。
     taunt_enabled: bool = True
     """是否在局内按概率说挑衅台词。"""
     taunt_chance_per_second: float = 0.03
@@ -213,23 +200,9 @@ class DuelSession:
 
         return self._taunt_count
 
-    def _playbook_path(self) -> Optional[Path]:
-        """把卡组打法数据写成文件并返回路径；没有数据时返回 ``None``。
-
-        文案写在会话里（而不是让插件/擂台各自处理）：**只有一条写文件的路**，
-        免得两边对"数据从哪来、放哪、什么时候写"各有一套。优先用卡组记录里的那份，
-        其次用配置里显式给的文本（擂台做对照实验时要按"人"传各自的打法数据）。
-        """
-
-        text = (self._deck.playbook if self._deck and self._deck.playbook else self._config.playbook)
-        if not text.strip():
-            return None
-        target = self._config.playbook_file
-        if target is None:
-            plans_dir = Path(self._config.windbot_dir) / "MaiBotPlans"
-            plans_dir.mkdir(parents=True, exist_ok=True)
-            target = plans_dir / f"playbook_{uuid.uuid4().hex[:8]}.txt"
-        return write_playbook_file(Path(target), text)
+    # ⚠ 这里原来有一个 `_playbook_path`：把卡组打法数据（卡组记录里的或配置里给的）
+    # 写成文件再交给 WindBot。打法数据已随 AI 打牌整条链路删除（2026-10-07 用户口径），
+    # 写文件这条路没了。
 
     @property
     def info(self) -> Optional[SessionInfo]:
@@ -297,9 +270,6 @@ class DuelSession:
             db_path=self._config.cards_cdb,
             debug=self._config.bot_debug,
             chat=self._config.in_game_chat,
-            plan_file=self._config.plan_file,
-            playbook_file=self._playbook_path(),
-            brain_file=self._config.brain_file,
         )
         self._windbot = WindBotProcess(
             self._config.windbot_executable,

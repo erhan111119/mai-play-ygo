@@ -401,13 +401,11 @@ def test_generated_script_field_and_migration() -> None:
             pool.set_generated_script(decks[0].deck_id, None)
             assert pool.list_decks("111")[0].generated_script == ""
 
-            # 后加的两列也要在同一个迁移里补齐：实测挑出的脚本名、卡组打法数据
-            assert decks[0].picked_style == "" and decks[0].playbook == "", "老库补列后默认值应为空"
+            # 后加的列也要在同一个迁移里补齐：产出脚本名（`generated_script`）与挑定的脚本名
+            assert decks[0].picked_style == "", "老库补列后默认值应为空"
             pool.set_picked_style(decks[0].deck_id, "PlanAware")
-            pool.set_playbook(decks[0].deck_id, "summon_order=89631139\n")
             again = pool.list_decks("111")[0]
             assert again.picked_style == "PlanAware", again.picked_style
-            assert again.playbook.startswith("summon_order="), again.playbook
             # 列序读串的话这几个字段会互相污染，所以顺手确认一下没串
             assert again.generated_script == "", again.generated_script
         finally:

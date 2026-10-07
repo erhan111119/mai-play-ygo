@@ -101,11 +101,6 @@ class WindBotSettings:
         debug: 打开后 WindBot 会把对局过程打到 stdout，排查问题时很有用。
         chat: 是否让 WindBot 发它自带的固化台词。``False`` 表示闭嘴，改由插件用模型生成台词；
             ``None`` 表示不传这个参数、用 WindBot 自己的默认值。
-        plan_file: 作战计划文件路径，只有计划感知执行器（``PlanAware``）会读它。
-            擂台并发跑多个对局时，每个对局必须给各自的文件，否则大家写同一个路径会互相撞。
-        playbook_file: 卡组打法数据文件（``duel/playbook.py`` 的格式），也只有 ``PlanAware`` 会读。
-            与 ``plan_file`` 分开、而且**不过期**：计划是"这回合该怎么打"（最多管几个回合），
-            打法数据是"这副牌先出谁、检索什么"，整局都有效。
     """
 
     name: str = "MaiBot"
@@ -118,12 +113,10 @@ class WindBotSettings:
     debug: bool = False
     hand: int = 0
     chat: Optional[bool] = None
-    plan_file: Optional[Path] = None
-    playbook_file: Optional[Path] = None
-    brain_file: Optional[Path] = None
-    """逐步问 AI 的前缀（问答各写 ``<前缀>.q`` / ``<前缀>.a``），只有计划感知执行器会用它。
-
-    留空 = 不问 AI（默认）。对局里由外面的 Python 侧起一个答复任务（见 ``train/ai_brain.py``）。"""
+    # ⚠ 这里原来还有三个路径参数：`plan_file`（作战计划）／`playbook_file`（卡组打法数据）
+    # ／`brain_file`（逐步问 AI 的问答前缀）——它们只有计划感知执行器 ``PlanAware`` 会读。
+    # AI 教练 / 打法数据 / 逐步问 AI 已按 2026-10-07 用户口径整条删除（连带 `PlanAware`），
+    # 这三个字段与下面拼 ``PlanFile=`` / ``PlaybookFile=`` / ``BrainFile=`` 的代码一并去掉。
 
     def to_args(self, host: str, port: int) -> List[str]:
         """生成 WindBot 的命令行参数（不含可执行文件本身）。
@@ -142,15 +135,6 @@ class WindBotSettings:
             args.append(f"Dialog={self.dialog}")
         if self.db_path is not None:
             args.append(f"DbPath={self.db_path}")
-        if self.plan_file is not None:
-            # 计划感知执行器据此读计划；路径给绝对的，免得受工作目录影响
-            args.append(f"PlanFile={self.plan_file}")
-        if self.playbook_file is not None:
-            # 同理：卡组打法数据也走绝对路径
-            args.append(f"PlaybookFile={self.playbook_file}")
-        if self.brain_file is not None:
-            # 逐步问 AI 的问答前缀（不带扩展名，执行器自己加 .q/.a）
-            args.append(f"BrainFile={self.brain_file}")
         if self.hand:
             args.append(f"Hand={self.hand}")
         if self.debug:

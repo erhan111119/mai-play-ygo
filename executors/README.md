@@ -84,7 +84,8 @@ MaiBotBrain 相关的钩子在没传 `BrainFile=` 时是零开销的空转：只
 
 1. **写一版**——把「内核给的合法动作里先做哪个」写成有序规则（WindBot 的判定就是"外层按注册顺序
    遍历规则、第一条说 yes 的获胜"，等价于优先级列表）；合法性一律交给内核与卡脚本，不重复实现。
-2. **开几局**（`Debug=true` 打决策日志；批量用 `tools/brain_eval.py` / `tools/evaluate_style.py`）。
+2. **开几局**（WindBot 侧 `Debug=true` 打决策日志；一局的动作数与终场直接看日志，
+   也可以用 `tools/room_watch.py` 扫真实对局的日志）。
 3. **看日志里哪一步没走对**——是没发动、发早了、选了错的对象，还是根本没登记这张卡
    （本项目最常查出来的就是"卡表里有、脚本里一条都没登记 → 每局纯白板"）。
 4. **改一处**，再测。一轮只动一个变量，否则分不清是哪条起的作用。
@@ -129,11 +130,12 @@ MaiBotBrain 相关的钩子在没传 `BrainFile=` 时是零开销的空转：只
 
 ## 5. 和仓库里其它留档的关系
 
-* `train/windbot/` 是更早的手工留档（配 `sources.json` 与 `tools/check_windbot_sources.py` 按 sha256
-  校验），只收了 7 份、且副本已落后于源码树；`tools/check_windbot_sources.py` 校验的仍然是那个目录。
-* 本目录（`executors/`）是**十副牌 + 宿主侧依赖**的完整一份，给"照着装一遍"用：
+* 本目录（`executors/`）就是**十副牌 + 宿主侧依赖**的完整一份，给"照着装一遍"用：
   十个 `.cs` + `MaiBotBrain.cs` + 两个 patch 就是全部输入。
+* `MaiBotBrain.cs` 是当年"逐步问 AI"的客户端钩子：**插件侧的 AI 打牌已按 2026-10-07 用户口径删除**，
+  现在没有任何人会写它读的那两个问答文件，钩子在没传 `BrainFile=` 时是零开销空转——
+  保留它只是为了让这十份脚本原样编译，不影响出牌。
 * `PlanAwareExecutor.cs`（`Deck=PlanAware`）**不在这十份脚本的依赖里**：十份里只有代码注释提到过
-  "PlanAware/通用脚本"，没有任何一处引用它的类型，所以没收进来（它在 `train/windbot/` 那份留档里）。
-* 插件运行时用到的卡表在宿主数据目录（`data/plugins/yugioh.duel-arena/decks/<群>/<uuid>.ydk`），
+  "PlanAware/通用脚本"，没有任何一处引用它的类型，所以没收进来。
+* 插件运行时用到的卡表在宿主数据目录（`data/plugins/mai-play-ygo/decks/<群>/<uuid>.ydk`），
   `decks/` 里这十份是**同内容的可读命名副本**，方便对照与重建。

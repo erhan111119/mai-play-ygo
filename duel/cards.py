@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Union
 
 import sqlite3
 import threading
@@ -284,73 +284,3 @@ class CardDatabase:
         """退出上下文时关闭连接。"""
 
         self.close()
-
-
-# ---------------------------------------------------------------------------
-# 卡组 -> 卡牌清单（喂给模型写"打法数据 / 展开流程"的素材）
-#
-# 原先是放在 ``duel/script_gen.py`` 里的（那是"让模型现写 C# 出牌脚本"的模块，已按
-# 2026-10-07 用户口径整条删除）。这份清单本身还有用：写打法数据（tools/generate_playbook.py）
-# 与写展开流程都要"卡号 + 卡名 + 效果文本"，所以挪到卡库这一层，调用方不再各写一份。
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class CardInfo:
-    """提示词里描述一张卡所需的信息。"""
-
-    card_id: int
-    name: str
-    zone: str = "主卡组"
-    type_text: str = ""
-    stats: str = ""
-    effect: str = ""
-
-    def describe(self) -> str:
-        """渲染成一行，供提示词使用。"""
-
-        parts = [f"{self.card_id} {self.name}（{self.zone}"]
-        if self.type_text:
-            parts.append(f"· {self.type_text}")
-        parts.append("）")
-        head = "".join(parts)
-        if self.stats:
-            head += f" {self.stats}"
-        line = f"- {head}"
-        if self.effect:
-            line += f"\n  效果：{self.effect}"
-        return line
-
-
-def collect_card_info(
-    card_db: Optional[CardDatabase], main: Sequence[int], extra: Sequence[int]
-) -> List[CardInfo]:
-    """把卡组整理成卡牌清单（按主卡组、额外卡组分组，同一种卡只出一次）。
-
-    提示词里"有没有效果文本"直接决定模型能不能写对处理函数，所以这里从本地卡库读全；
-    卡库读不动时返回空清单，由调用方决定怎么报（不在这里把它吞成"这张卡查不到"）。
-    """
-
-    if card_db is None or not card_db.available:
-        return []
-    try:
-        details = card_db.card_details(list(main) + list(extra))
-    except Exception:  # noqa: BLE001  卡库读不动时返回空清单，由调用方决定怎么报
-        return []
-    cards: List[CardInfo] = []
-    for zone, card_ids in (("主卡组", dict.fromkeys(main)), ("额外卡组", dict.fromkeys(extra))):
-        for card_id in card_ids:
-            info = details.get(card_id)
-            if info is None:
-                continue
-            cards.append(
-                CardInfo(
-                    card_id=card_id,
-                    name=info.name,
-                    zone=zone,
-                    type_text=info.type_text,
-                    stats=info.stats,
-                    effect=info.effect,
-                )
-            )
-    return cards

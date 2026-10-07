@@ -145,8 +145,8 @@ def test_config_model_builds_and_matches_toml() -> None:
     assert defaults.duel.join_timeout_seconds > 0
     # 版本号提升是有意的：0.21.27 新增了 duel.invite_*（空闲主动约战）；
     # 2026-10-07 起 1.10.0：`taunt_enabled` / `invite_enabled` 默认关闭（用户要求"开房发完地址就不再讲话"）。
+    # 版本号保持 1.0.0 不变（2026-10-07 精简掉 AI 打牌/训练/常驻房，但不改配置版本）。
     assert defaults.plugin.config_version == "1.0.0"  # 合并成「麦麦玩游戏王」后重新从 1.0.0 起版
-    assert defaults.duel.brain_scope == "all", "默认口径不能变，改成 high_stakes 要先用 80 局/腿量过"
 
     with (_PLUGIN_ROOT / "config.toml").open("rb") as handle:
         toml_data = tomllib.load(handle)
@@ -171,9 +171,11 @@ def test_duel_config_exposes_only_group_owner_items() -> None:
     """对局配置的**可见面**只有群主要用的那几项（2026-10-07 用户口径）。
 
     开房地址与端口 / bot 名字 / 等人超时 / 总结开关与提示词 / 挑衅开关与台词池。
-    其余字段（`ai_brain`、`brain_scope`、`persist_room`、`invite_*`、`train_model`…）都标了
-    `hidden`：字段还在模型里（老配置写过的键照旧能读、代码照旧读得到），但插件配置页与
-    `config.toml` 模板上不再出现。这条护栏卡住"以后又把内部参数露出来"。
+    其余字段都标了 `hidden`：字段还在模型里（老配置写过的键照旧能读、代码照旧读得到），
+    但插件配置页与 `config.toml` 模板上不再出现。这条护栏卡住"以后又把内部参数露出来"。
+    （原来列在这里的 `ai_brain` / `brain_scope` / `persist_room` / `invite_*` / `train_model`
+    等"内部参数"已随 AI 打牌 / 常驻房 / 约战 / 训练调优的删除**从模型里彻底去掉**，
+    不再是"隐藏字段"。）
     """
 
     plugin_module = _load_plugin_module()
@@ -224,18 +226,31 @@ def test_plugin_exposes_expected_tools() -> None:
         assert name.startswith("ygo_"), f"工具 {name} 缺少 ygo_ 前缀，容易与其它插件撞名"
     for expected in (
         "ygo_duel_start", "ygo_duel_status", "ygo_duel_stop",
-        # 百科检索（原 yugioh-wiki 插件）并进来后的三个工具
-        "ygo_card_search", "ygo_deck_analyze", "ygo_card_image",
+        # 百科检索（原 yugioh-wiki 插件）并进来后的两个工具
+        "ygo_card_search", "ygo_card_image",
     ):
         assert expected in tool_names, f"缺少工具 {expected}，实际有 {tool_names}"
     # **卡组码只能用指令投稿**（2026-10-07 用户口径）：原来那个「模型看到卡组码就自动收录」的
-    # `ygo_deck_submit` 工具已删除，模型手里不该再有导入卡组的入口
-    assert "ygo_deck_submit" not in tool_names, tool_names
+    # `ygo_deck_submit` 工具已删除，模型手里不该再有导入卡组的入口；
+    # 同一个口径下，「自动识别群里的卡组码」的 `ygo_deck_analyze` 也删掉了
+    for removed_tool in ("ygo_deck_submit", "ygo_deck_analyze"):
+        assert removed_tool not in tool_names, tool_names
 
     # 卡组管理的指令必须注册出来，且破坏性操作要声明管理员权限
     commands = {item["name"]: item for item in components if item.get("type") == "COMMAND"}
     for expected in ("ygo_cmd_deck_list", "ygo_cmd_deck_add", "ygo_cmd_deck_delete", "ygo_cmd_deck_fix"):
         assert expected in commands, f"缺少指令 {expected}，实际有 {sorted(commands)}"
+    # 只留核心功能（2026-10-07 用户口径）：训练调优 / AI 打牌 / 复盘这几条指令已经删掉，
+    # 不该再被注册出来（模型或群友都不该看到入口）
+    for removed_command in (
+        "ygo_cmd_optimize",
+        "ygo_cmd_pick_style",
+        "ygo_cmd_write_playbook",
+        "ygo_cmd_train",
+        "ygo_cmd_replay",
+        "ygo_cmd_brain_mode",
+    ):
+        assert removed_command not in commands, f"{removed_command} 应当已删除，实际有 {sorted(commands)}"
     for guarded in ("ygo_cmd_deck_clear", "ygo_cmd_bot_name"):
         assert guarded in commands, f"缺少指令 {guarded}"
         assert commands[guarded]["metadata"].get("permission") == "operator", (

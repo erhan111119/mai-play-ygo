@@ -38,7 +38,27 @@ if str(_PLUGIN_ROOT) not in sys.path:
 from duel.cards import CardDatabase  # noqa: E402  导入顺序受 sys.path 补丁影响
 from duel.deckcode import parse_deck_code  # noqa: E402  导入顺序受 sys.path 补丁影响
 from duel.deckpool import DeckPool  # noqa: E402  导入顺序受 sys.path 补丁影响
-from duel.knowledge import default_data_dir  # noqa: E402  导入顺序受 sys.path 补丁影响
+
+# ⚠ 原来这里是 `from duel.knowledge import default_data_dir`：AI 打牌整条链路（含
+# duel/knowledge.py）已按 2026-10-07 用户口径删除，而这个工具**还要用"插件数据目录在哪"**
+# （去找卡组池 deck_pool.db），所以把那一小段路径推导原样搬到这里（逻辑与原来一致）。
+
+
+def default_data_dir(plugin_root: Path) -> Path:
+    """插件数据目录（宿主约定：``<MaiBot>/data/plugins/<插件 id>/``）。"""
+
+    import json
+
+    manifest = Path(plugin_root) / "_manifest.json"
+    plugin_id = ""
+    try:
+        plugin_id = str(json.loads(manifest.read_text(encoding="utf-8")).get("id") or "")
+    except (OSError, ValueError):
+        plugin_id = ""
+    if not plugin_id:
+        return Path(plugin_root) / "data"
+    return Path(plugin_root).parent.parent / "data" / "plugins" / plugin_id
+
 
 REPLAY_MAGIC_YRP2 = b"yrp2"
 """录像魔数（``b"yrp2"`` = mycard/ygopro 的 yrp2 格式）。"""
