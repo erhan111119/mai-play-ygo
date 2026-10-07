@@ -1,0 +1,108 @@
+diff --git a/Game/AI/DefaultExecutor.cs b/Game/AI/DefaultExecutor.cs
+index ab31e2d..aafe79b 100644
+--- a/Game/AI/DefaultExecutor.cs
++++ b/Game/AI/DefaultExecutor.cs
+@@ -317,6 +317,51 @@ namespace WindBot.Game.AI
+         /// <summary>Columns 0-4 on Bot's field negated by Infinite Impermanence (enemy's col converted to ours: 4-col). Cleared at turn start.</summary>
+         protected List<int> infiniteImpermanenceNegatedColumns = new List<int>();
+ 
++        /// <summary>
++        /// 对手**这一回合**有没有召唤/特殊召唤过。给「欢聚友伴」两张（水母/山雀）的发动闸门用：
++        /// 它们的收益是"发动后对手每次召唤我就抽 1"，而发动条件本身只有"自己场上没有卡"
++        /// （`c84192580.lua` / `c42141493.lua` 的 `s.drcon`），所以内核在任何时点都可能问一次——
++        /// 对面还没出怪就交＝白扔一张，要等它真的开始召唤再交。
++        ///
++        /// 为什么自己记、不直接用内核现成的信号：
++        /// * `Duel.LastSummonPlayer` 在**阶段开始**（`GameBehavior.OnNewPhase`）与**连锁开始**
++        ///   （`GameBehavior` 的 `OnChaining`）都会被重置成 -1 —— 连锁一开就判断不出"这次连锁是不是
++        ///   对手召唤引出来的"；
++        /// * `Duel.LastSummonedCards` 只在下一次召唤时清空，会跨回合留着上一次的旧值。
++        /// 每个决斗实例各记一份：server 模式下每局一个 Executor 实例，不能放静态字段。
++        /// </summary>
++        protected bool EnemySummonedThisTurn { get; private set; }
++
++        /// <summary>
++        /// 「欢聚友伴」两张（水母 `84192580` / 山雀 `42141493`）的发动闸门档位，环境变量 `MULCHARMY_GATE` 选：
++        /// * `chain`（默认）：**对手回合 + 连锁对手的卡**——对手在自己回合里做第一个动作时就交；
++        /// * `wait_summon`：**对手这一回合已经召唤/特殊召唤过**才交（"别在对面还没出怪时白扔"的口径，
++        ///   见用户 2026-10-07 的 P2 反馈）。
++        /// ⚠ **默认值是量出来的，不是推出来的**：卡文里这两张的**发动条件只有"自己场上没有卡" + 对手回合**
++        ///   （`c84192580.lua` 的 `s.drcon`＝`Duel.GetFieldGroupCount(tp,LOCATION_ONFIELD,0)==0`），
++        ///   抽卡是"**发动之后**对手每次召唤/特殊召唤抽 1"的整回合持续效果 ⇒ **越早交抽得越多**。
++        ///   96 vs 101 各 18 局的 A/B（`MULCHARMY_GATE` 两臂、同种子条件）：
++        ///   `chain` 18 局里"对手回合我方抽卡" **21 次**（其中提前交 3 次）、`wait_summon` **8 次**（提前交 0 次）
++        ///   ——"等对手出怪再交"会少掉约 2/3 的抽卡收益，而且并没有换来别的什么（对手不出怪时
++        ///   `chain` 也不会交：它要求"连锁对手的卡"）。
++        ///   所以默认保留 `chain`；`wait_summon` 留给想再 A/B 的时候用（同一个 exe，不用重编译）。
++        /// </summary>
++        private static readonly bool MulcharmyWaitSummon =
++            (System.Environment.GetEnvironmentVariable("MULCHARMY_GATE") ?? "chain") == "wait_summon";
++
++        /// <summary>
++        /// 「欢聚友伴」现在能不能交（七副牌执行器的闸门都调这里，档位见 <see cref="MulcharmyWaitSummon"/>）。
++        /// ⚠ 调用方仍要自己判"自己场上没有卡"（卡文的硬条件，各副牌的实现不同：杀调看 `Bot.GetFieldCount()`）。
++        /// </summary>
++        protected bool MulcharmyReady()
++        {
++            if (Duel.Player != 1)
++                return false;
++            if (MulcharmyWaitSummon)
++                return EnemySummonedThisTurn;
++            return Duel.LastChainPlayer == 1;
++        }
++
+         /// <summary>
+         /// Defined:
+         /// if monster with code as KEY, other monsters with rules as VALUE won't be targeted for attack.
+@@ -751,10 +796,27 @@ namespace WindBot.Game.AI
+                 }
+             }
+             crossoutDesignatorIdList.Clear();
++            EnemySummonedThisTurn = false;
+ 
+             base.OnNewTurn();
+         }
+ 
++        /// <summary>普通召唤（含上级召唤、翻转召唤）开始：记下"对手召唤过"（见 <see cref="EnemySummonedThisTurn"/>）。</summary>
++        public override void OnSummoning()
++        {
++            base.OnSummoning();
++            if (Duel.LastSummonPlayer == 1)
++                EnemySummonedThisTurn = true;
++        }
++
++        /// <summary>特殊召唤开始：同上（内核在这一步已经把 `LastSummonPlayer` 写成召唤方）。</summary>
++        public override void OnSpSummoning()
++        {
++            base.OnSpSummoning();
++            if (Duel.LastSummonPlayer == 1)
++                EnemySummonedThisTurn = true;
++        }
++
+         public override void OnMove(ClientCard card, int previousControler, int previousLocation, int currentControler, int currentLocation)
+         {
+             if (card != null)
+@@ -1923,11 +1985,11 @@ namespace WindBot.Game.AI
+         /// </summary>
+         /// <param name="card">Bot card that would be sent to the GY. Null uses unknown type/location.</param>
+         /// <returns>True if the card would be banished instead of going to the GY.</returns>
+-        protected bool DefaultCheckWhetherBotWillBeBanished(ClientCard card = null)
++        protected bool DefaultCheckWhetherBotWillBeBanished(ClientCard card = null)
+         {
+             if (card == null)
+-                return DefaultCheckWhetherBotWillBeBanished((CardType)0, (CardLocation)0);
+-            return DefaultCheckWhetherBotWillBeBanished((CardType)card.Type, card.Location);
++                return DefaultCheckWhetherBotWillBeBanished((CardType)0, (CardLocation)0);
++            return DefaultCheckWhetherBotWillBeBanished((CardType)card.Type, card.Location);
+         }
+ 
+         /// <summary>
+@@ -1937,7 +1999,7 @@ namespace WindBot.Game.AI
+         /// <param name="type">Type flags of the card that would be sent to the GY. 0 means unknown.</param>
+         /// <param name="location">Current location of the card that would be sent to the GY. 0 means unknown.</param>
+         /// <returns>True if the card would be banished instead of going to the GY.</returns>
+-        protected bool DefaultCheckWhetherBotWillBeBanished(CardType type, CardLocation location = 0)
++        protected bool DefaultCheckWhetherBotWillBeBanished(CardType type, CardLocation location = 0)
+         {
+             // EFFECT_CANNOT_REMOVE stops GY redirects: Artifact Lancea until end of the turn it resolves,
+             // Imperial Iron Wall while face-up and not disabled in either Spell/Trap Zone.

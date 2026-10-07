@@ -1,0 +1,275 @@
+diff --git a/Game/AI/DecksManager.cs b/Game/AI/DecksManager.cs
+index 17d43f7..3be4970 100644
+--- a/Game/AI/DecksManager.cs
++++ b/Game/AI/DecksManager.cs
+@@ -67,10 +67,18 @@ namespace WindBot.Game.AI
+                     infos = _list[_rand.Next(_list.Count)];
+                 }
+                 while (infos.Level != "Normal");
++
++                // 名字没注册时会**静默**换成随机执行器：对局照打，但打出来的数字代表的是别的脚本。
++                // 这种"看起来跑了、其实跑的不是它"的失败已经让一整批评估数据作废过一次，所以必须吼出来。
++                Logger.WriteLine(
++                    "Deck '" + (deck ?? "(未指定)") + "' 没在这份 exe 里注册，改用随机执行器 '"
++                    + infos.Deck + "' —— 这批对局数据不能代表目标脚本");
+             }
+ 
+             Executor executor = (Executor)Activator.CreateInstance(infos.Type, ai, duel);
+             executor.Deck = infos.Deck;
++            // 记一行"这一局用的是哪份脚本"，方便事后对账（配合上面那条未注册告警）
++            Logger.WriteLine("执行器：" + infos.Deck);
+             return executor;
+         }
+ 
+diff --git a/Game/AI/Executor.cs b/Game/AI/Executor.cs
+index ec292fe..f4f2daf 100644
+--- a/Game/AI/Executor.cs
++++ b/Game/AI/Executor.cs
+@@ -343,6 +343,8 @@ namespace WindBot.Game.AI
+             Card = card;
+             ActivateDescription = description;
+             CurrentTiming = timing;
++            // 让"逐步问 AI"的守卫拿到当前正在判定的卡片与执行器（没开 AI 时这行没副作用）
++            MaiBotBrain.NoteCurrent(this, card);
+         }
+ 
+         /// <summary>
+@@ -350,7 +352,7 @@ namespace WindBot.Game.AI
+         /// </summary>
+         public void AddExecutor(ExecutorType type, int cardId, Func<bool> func)
+         {
+-            Executors.Add(new CardExecutor(type, cardId, func));
++            Executors.Add(MaiBotBrain.MaybeWrap(new CardExecutor(type, cardId, func)));
+         }
+ 
+         /// <summary>
+@@ -358,7 +360,7 @@ namespace WindBot.Game.AI
+         /// </summary>
+         public void AddExecutor(ExecutorType type, int cardId)
+         {
+-            Executors.Add(new CardExecutor(type, cardId, null));
++            Executors.Add(MaiBotBrain.MaybeWrap(new CardExecutor(type, cardId, null)));
+         }
+ 
+         /// <summary>
+@@ -366,7 +368,7 @@ namespace WindBot.Game.AI
+         /// </summary>
+         public void AddExecutor(ExecutorType type, Func<bool> func)
+         {
+-            Executors.Add(new CardExecutor(type, -1, func));
++            Executors.Add(MaiBotBrain.MaybeWrap(new CardExecutor(type, -1, func)));
+         }
+ 
+         /// <summary>
+@@ -374,7 +376,7 @@ namespace WindBot.Game.AI
+         /// </summary>
+         public void AddExecutor(ExecutorType type)
+         {
+-            Executors.Add(new CardExecutor(type, -1, DefaultNoExecutor));
++            Executors.Add(MaiBotBrain.MaybeWrap(new CardExecutor(type, -1, DefaultNoExecutor)));
+         }
+ 
+         private bool DefaultNoExecutor()
+diff --git a/Game/GameAI.cs b/Game/GameAI.cs
+index da8adf8..7bed52e 100644
+--- a/Game/GameAI.cs
++++ b/Game/GameAI.cs
+@@ -333,7 +333,15 @@ namespace WindBot.Game
+                     attacker.IsLastAttacker = (k == attackers.Count - 1);
+                     result = Executor.OnSelectAttackTarget(attacker, defenders);
+                     if (result != null)
++                    {
++                        // 打谁问一次 AI（脚本自己决定要打之后才问，所以它只能改选或取消）：
++                        // 钩子放在这里，任何出牌脚本都覆盖得到；没传 BrainFile 时它原样放行
++                        ClientCard target;
++                        bool skip;
++                        if (MaiBotBrain.TryOverrideAttackTarget(attacker, defenders, out target, out skip))
++                            return skip ? null : Attack(attacker, target);
+                         return result;
++                    }
+                 }
+             }
+ 
+@@ -587,6 +595,28 @@ namespace WindBot.Game
+         {
+             _selectingPendulumSummon = false;
+             CheckSurrender();
++            // 先问 AI「这一步做什么」：**这是"AI 打牌"的入口**。脚本层只能否决它自己想做的事，
++            // 所以碰上脚本不认识的卡组（新系列、投稿卡组）它一步都走不出来——实测用户反馈
++            // "脚本根本无法正常展开"就是这个。这里给的是提议权：AI 选哪个就执行哪个。
++            // 没传 BrainFile / 超预算 / 本回合问够次数时 AskIdleChoice 返回 0，照旧走脚本。
++            if (MaiBotBrain.Enabled)
++            {
++                List<IdleOption> aiOptions = CollectIdleOptions(main);
++                if (aiOptions.Count >= 2)
++                {
++                    List<string> labels = new List<string>();
++                    bool hasCardOption = false;
++                    foreach (IdleOption option in aiOptions)
++                    {
++                        labels.Add(option.Label);
++                        if (option.Card != null)
++                            hasCardOption = true;
++                    }
++                    int aiPick = MaiBotBrain.AskIdleChoice(labels, hasCardOption);
++                    if (aiPick > 0 && aiPick <= aiOptions.Count)
++                        return BuildIdleAction(aiOptions[aiPick - 1]);
++                }
++            }
+             foreach (CardExecutor exec in Executor.Executors)
+             {
+             	if (exec.Type == ExecutorType.GoToEndPhase && main.CanEndPhase && exec.Func()) // check if should enter end phase directly
+@@ -668,6 +698,100 @@ namespace WindBot.Game
+             return new MainPhaseAction(MainPhaseAction.MainAction.ToEndPhase); 
+         }
+ 
++        /// <summary>
++        /// 当前主要阶段所有合法动作（给"问 AI 这一步做什么"用）。
++        ///
++        /// 顺序是刻意的：召唤 → 特召 → 发动 → 盖放 → 进战斗 → 结束。模型看到的是**有序菜单**，
++        /// 越靠前的越"主动"（先铺场再做事，符合这个游戏的一般直觉）。
++        /// 卡名后面带攻守——没有数值它会做出"拿 700 攻打手去打对面 3000"这种选择（实测）。
++        /// </summary>
++        private List<IdleOption> CollectIdleOptions(MainPhase main)
++        {
++            List<IdleOption> options = new List<IdleOption>();
++            foreach (ClientCard card in main.SummonableCards)
++                options.Add(new IdleOption(MainPhaseAction.MainAction.Summon, card, 0, "召唤 " + DescribeCard(card)));
++            foreach (ClientCard card in main.SpecialSummonableCards)
++                options.Add(new IdleOption(MainPhaseAction.MainAction.SpSummon, card, 0, "特殊召唤 " + DescribeCard(card)));
++            for (int i = 0; i < main.ActivableCards.Count && i < main.ActivableDescs.Count; ++i)
++                options.Add(new IdleOption(MainPhaseAction.MainAction.Activate, main.ActivableCards[i],
++                    main.ActivableDescs[i], "发动 " + DescribeCard(main.ActivableCards[i])));
++            foreach (ClientCard card in main.SpellSetableCards)
++                options.Add(new IdleOption(MainPhaseAction.MainAction.SetSpell, card, 0, "盖放 " + DescribeCard(card)));
++            foreach (ClientCard card in main.MonsterSetableCards)
++                options.Add(new IdleOption(MainPhaseAction.MainAction.SetMonster, card, 0, "里侧盖放 " + DescribeCard(card)));
++
++            // 卡类选项截断到 10 个：再多对模型没帮助，还会把提示词撑爆
++            if (options.Count > MaxIdleCardOptions)
++                options.RemoveRange(MaxIdleCardOptions, options.Count - MaxIdleCardOptions);
++            if (main.CanBattlePhase)
++                options.Add(new IdleOption(MainPhaseAction.MainAction.ToBattlePhase, null, 0, "进入战斗阶段"));
++            if (main.CanEndPhase)
++                options.Add(new IdleOption(MainPhaseAction.MainAction.ToEndPhase, null, 0, "结束主要阶段"));
++            return options;
++        }
++
++        /// <summary>卡名 + 攻守（没有攻守的卡就不写）。</summary>
++        private static string DescribeCard(ClientCard card)
++        {
++            if (card == null)
++                return "（未知卡）";
++            if (card.Attack <= 0 && card.Defense <= 0 && !card.HasType(CardType.Monster))
++                return card.Name;
++            return card.Name + "（攻" + card.Attack + "/守" + card.Defense + "）";
++        }
++
++        /// <summary>把 AI 选中的那一项变成实际动作（对话提示也照脚本自己的写法补上）。</summary>
++        private MainPhaseAction BuildIdleAction(IdleOption option)
++        {
++            switch (option.Kind)
++            {
++                case MainPhaseAction.MainAction.Summon:
++                    _dialogs.SendSummon(option.Card.Name);
++                    return new MainPhaseAction(option.Kind, option.Card.ActionIndex);
++                case MainPhaseAction.MainAction.SpSummon:
++                    ClientCard leftScale = Executor.Util.GetPZone(0, 0);
++                    ClientCard rightScale = Executor.Util.GetPZone(0, 1);
++                    _selectingPendulumSummon = option.Card.HasType(CardType.Pendulum)
++                        && (option.Card == leftScale || option.Card == rightScale);
++                    if (!_selectingPendulumSummon)
++                        _dialogs.SendSummon(option.Card.Name);
++                    return new MainPhaseAction(option.Kind, option.Card.ActionIndex);
++                case MainPhaseAction.MainAction.Activate:
++                    _dialogs.SendActivate(option.Card.Name);
++                    return new MainPhaseAction(option.Kind, option.Card.ActionActivateIndex[option.Desc]);
++                case MainPhaseAction.MainAction.SetMonster:
++                    _dialogs.SendSetMonster();
++                    return new MainPhaseAction(option.Kind, option.Card.ActionIndex);
++                case MainPhaseAction.MainAction.SetSpell:
++                    return new MainPhaseAction(option.Kind, option.Card.ActionIndex);
++                case MainPhaseAction.MainAction.ToEndPhase:
++                    _dialogs.SendEndTurn();
++                    return new MainPhaseAction(option.Kind, 0);
++                default:
++                    return new MainPhaseAction(option.Kind, 0);
++            }
++        }
++
++        /// <summary>一个候选动作（凑给 AI 看的菜单项）。</summary>
++        private class IdleOption
++        {
++            public MainPhaseAction.MainAction Kind { get; private set; }
++            public ClientCard Card { get; private set; }
++            public int Desc { get; private set; }
++            public string Label { get; private set; }
++
++            public IdleOption(MainPhaseAction.MainAction kind, ClientCard card, int desc, string label)
++            {
++                Kind = kind;
++                Card = card;
++                Desc = desc;
++                Label = label;
++            }
++        }
++
++        /// <summary>菜单里最多列几个"卡类"选项（战斗/结束总是保留）。</summary>
++        private const int MaxIdleCardOptions = 10;
++
+         /// <summary>
+         /// Called when the AI has to select an option.
+         /// </summary>
+@@ -763,7 +887,22 @@ namespace WindBot.Game
+             int sequence = 0;
+             if (location != CardLocation.PendulumZone && location != CardLocation.FieldZone)
+             {
+-                if ((filter & Zones.z2) != 0) sequence = 2;
++                // **额外怪兽区优先**：只在开局时由需要它的卡组打开（见 PreferExtraMonsterZone）。
++                //
++                // 为什么改成"按卡组开关"：这条曾经是**全局默认**，理由是我们这副「升辉月」的超量怪
++                // （卡 100267022/100267023）必须站额外怪兽区才有 ① 效果，落在主怪兽区就是个白板。
++                // 但它是引擎级共享代码——连接卡组（群里对手用的码丽丝那种）也被一起改了：
++                // 连接怪的箭头要靠站位连，被塞进额外区就连接不到，整副牌跟着变弱
++                // （用户报："你有改码丽丝脚本吗，怎么弱这么多"）。所以现在默认取原来的顺序
++                // （主怪兽区 z2→z1→z3→z0→z4，额外区排最后），只有显式打开的卡组才用额外区优先。
++                // 「效果选格」那条路（OnSelectDisfield）本来就没改：那里主区优先是对的。
++                bool extraZoneOffered = PreferExtraMonsterZone && (filter & Zones.ExtraMonsterZones) != 0;
++                if (extraZoneOffered)
++                {
++                    if ((filter & Zones.z6) != 0) sequence = 6;
++                    else if ((filter & Zones.z5) != 0) sequence = 5;
++                }
++                else if ((filter & Zones.z2) != 0) sequence = 2;
+                 else if ((filter & Zones.z1) != 0) sequence = 1;
+                 else if ((filter & Zones.z3) != 0) sequence = 3;
+                 else if ((filter & Zones.z0) != 0) sequence = 0;
+@@ -1209,6 +1348,16 @@ namespace WindBot.Game
+         private CardSelector m_materialSelector;
+         private int m_materialSelectorHint;
+         private int m_place;
++
++        /// <summary>
++        /// 选格时是否优先额外怪兽区。**默认 false＝WindBot 原来的顺序**（主怪兽区优先）。
++        /// 需要它的卡组在自己的执行器里打开（见 <c>RaiseMoonExecutor</c>：它的超量怪
++        /// 必须站额外怪兽区才有 ① 效果）。做成开关是因为它当初被写成全局默认，
++        /// 把连接卡组（码丽丝那种）的站位也改了、整副牌变弱。
++        /// 环境变量 `WINDBOT_EMZ_FIRST=1` 可强制打开，用来复现/量化这个影响。
++        /// </summary>
++        public static bool PreferExtraMonsterZone =
++            System.Environment.GetEnvironmentVariable("WINDBOT_EMZ_FIRST") == "1";
+         private int m_option;
+         private int m_number;
+         private int m_announce;
+diff --git a/WindBot.csproj b/WindBot.csproj
+index b8a3242..1343fce 100644
+--- a/WindBot.csproj
++++ b/WindBot.csproj
+@@ -87,6 +87,7 @@
+     <Compile Include="Game\AI\Enums\*.cs" />
+     <Compile Include="Game\AI\Executor.cs" />
+     <Compile Include="Game\AI\HintMsg.cs" />
++    <Compile Include="Game\AI\MaiBotBrain.cs" />
+     <Compile Include="Game\AI\Opcodes.cs" />
+     <Compile Include="Game\AI\Zones.cs" />
+     <Compile Include="Game\AI\ExecutorType.cs" />

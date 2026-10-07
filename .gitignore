@@ -1,0 +1,36 @@
+# 运行期产物，不进版本库
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 插件日志（Runner 或本地加载插件时会生成）
+logs/
+
+# 插件运行数据：卡组池、.ydk 投稿文件等都在宿主的数据目录里，
+# 但如果有人在插件目录下跑过实验脚本，可能留下这些
+data/
+temp/
+
+# 本机的配置备份（WebUI 改配置时留下的）：里面有隧道域名/端口/机器路径等个人配置，绝不入库
+config_back/
+
+# 本地安全扫描工具的台账
+.mimosa/
+
+# 自带客户端的运行期产物（客户端本体与 WindBot 自带的 Decks/ 要进版本库，这些不进）
+clients/ygopro/replay/
+clients/windbot/MaiBotPlans/
+# 本机实验留下的卡表（不是 WindBot 自带的）：`AI_Gen*` 是"当年生成的脚本"配套卡表，
+# `AI_MirrorDeck` / `AI_PlanAware` 是擂台实验用的。WindBot 自带的 AI_*.ydk 仍然入库，
+# 否则新机器上"内置卡组"会是空的。
+clients/windbot/Decks/AI_Gen*.ydk
+clients/windbot/Decks/AI_MirrorDeck.ydk
+clients/windbot/Decks/AI_PlanAware.ydk
+# 卡图不进版本库（太大、版权归属不明）：要用就把 paths.card_art_dir 指到你客户端的卡图目录
+clients/art/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
