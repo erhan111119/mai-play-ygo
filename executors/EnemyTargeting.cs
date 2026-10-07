@@ -49,6 +49,21 @@ namespace WindBot.Game.AI
         }
 
         /// <summary>
+        /// 对面**空场**时，要不要"能打出伤害就进战斗阶段"（＝压血）。
+        ///
+        /// 背景（2026-10-08）：各卡组执行器的 `LethalAvailable()` 原来在对面空场时要求**一击斩杀**
+        /// （`damage >= Enemy.LifePoints`）才肯进战阶，后果是"打不到斩杀就整局不进攻"——本机日志里
+        /// 「杀调 / 虫惑魔蕾祸 / 魔女术 / 耀圣」都出现过**整局 0 次攻击宣言**（`0 got damage` 一条都没有），
+        /// 伤害那一栏永远是空的。对面空场时攻击是白赚（打不打某一只仍由 `OnSelectAttackTarget` 再判，
+        /// 它会拒绝打不过的），所以这里放开压血；`DoEverythingExecutor.BattlePressureWorthIt()` 是
+        /// 落点（所有卡组共用，含投稿卡组用的通用脚本）。
+        ///
+        /// 开关：环境变量 `AI_BATTLE_PRESSURE=0` 回到旧口径（只有一击斩杀才进战阶），给 A/B 用。
+        /// </summary>
+        public static readonly bool BattlePressure =
+            System.Environment.GetEnvironmentVariable("AI_BATTLE_PRESSURE") != "0";
+
+        /// <summary>
         /// "把对面场上的卡弄掉一张"时该挑哪张（候选里**同时有双方的卡**也只会挑对面的）。
         ///
         /// 挑法（按卡文）：

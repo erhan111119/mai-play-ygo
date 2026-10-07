@@ -115,6 +115,7 @@ MaiBotBrain 相关的钩子在没传 `BrainFile=` 时是零开销的空转：只
 | 开关 | 在哪 | 管什么 |
 |---|---|---|
 | `MULCHARMY_GATE` | `DefaultExecutor.cs` | 「欢聚友伴」的发动闸门：`chain`（默认）/ `wait_summon` |
+| `AI_BATTLE_PRESSURE` | `EnemyTargeting.cs` | 对面**空场**时要不要压血：默认就能打就进战阶；`=0` 回到旧口径（只有一击斩杀才进，用于 A/B） |
 | `RAISEMOON_AB` | `RaiseMoonExecutor.cs` | 升辉月的一处分臂 |
 | `KT_ALLOW_PLAN_EXTRA` | `KillerTuneExecutor.cs` | 杀调额外怪"计划中不放行" |
 | `KZ_GRYPHON_ALWAYS` / `KZ_GOBLIN_FREE` | `KezmoYixiangmingExecutor.cs` | 刻魔的狮鹫/哥布林闸门 |
