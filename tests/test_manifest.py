@@ -332,6 +332,29 @@ def test_sdk_calls_use_the_current_keyword_forms() -> None:
     assert not problems, "；".join(problems)
 
 
+def test_windows_only_is_declared_in_manifest_and_readme() -> None:
+    """这是个 Windows-only 插件，清单与 README 都要写明（2026-10-07 评审要求）。
+
+    对局内核 ygopro 与出牌引擎 WindBot 都是 Windows 可执行文件，Linux / macOS 上开房必然失败；
+    不写清楚的话，非 Windows 的部署者只会看到"麦麦一声不响"。
+    """
+
+    raw = json.loads((_PLUGIN_ROOT / "_manifest.json").read_text(encoding="utf-8"))
+    assert "Windows" in raw["description"], "清单描述里要写明只支持 Windows"
+    readme = (_PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "只支持 Windows" in readme, "README 开头要写明只支持 Windows"
+
+
+def test_packaged_binaries_have_a_licensing_stance() -> None:
+    """随包二进制/卡库的许可要有明确结论，不能只写"请自行判断"（2026-10-07 评审要求）。"""
+
+    readme = (_PLUGIN_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "发行结论" in readme, "README 要写明随包内容的发行结论"
+    assert "cards.cdb" in readme and "GPL-2.0" in readme and "MIT" in readme
+    clients_readme = (_PLUGIN_ROOT / "clients" / "README.md").read_text(encoding="utf-8")
+    assert "cards.cdb" in clients_readme
+
+
 def main() -> int:
     """逐个执行测试函数。"""
 

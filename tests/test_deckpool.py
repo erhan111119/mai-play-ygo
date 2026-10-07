@@ -396,6 +396,28 @@ def test_delete_all_matches_sanitised_group_id() -> None:
             pool.close()
 
 
+def test_delete_all_removes_rows_before_files() -> None:
+    """`/清空卡组` 要先删记录、再清文件：清文件失败也不能退回"文件没了、记录还在"。
+
+    回归（2026-10-07 评审指出）：原来 unlink 全排在 SQL 之前，一旦中途抛 OSError，删除就断在那儿
+    ——已经消失的 .ydk 对应的记录还留在库里，随机抽到那副牌又是一张都出不了牌而且不报错。
+    这里用"删的时候文件还开着"来逼 unlink 失败（Windows 上必然 PermissionError）。
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        pool = DeckPool(Path(directory))
+        try:
+            stored = submit(pool, "111", "占着文件的牌")
+            with open(stored.ydk_path, "r+", encoding="utf-8") as handle:
+                handle.read()
+                assert pool.delete_all("111") == 1, "文件删不掉不该拦住记录删除"
+            assert pool.own_decks("111") == [], "记录没删干净，就成了悬空引用"
+            assert pool.count("111") == 0
+            assert pool.delete_all("111") == 0, "再清一次应返回 0"
+        finally:
+            pool.close()
+
+
 def test_default_windbot_deck_applied() -> None:
     """未显式指定风格卡组时应当套用配置里的默认值。"""
 

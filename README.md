@@ -2,7 +2,12 @@
 
 > 让麦麦和群友开房间打一局游戏王。两个虚拟客户端（对局内核 ygopro + 出牌大脑 WindBot）随插件自带，开箱即用。
 
-**当前版本：1.0.1** —— 1.0.0 是上架评审前的那份，1.0.1 收三轮评审的修复（见 [CHANGELOG](CHANGELOG.md)）。
+**平台：只支持 Windows。** 对局内核与出牌引擎都是 Windows 可执行文件，要由插件直接起进程；
+在 Linux / macOS 上插件仍会加载，但只在启动日志里写明对局功能不可用、开房会被明确拒绝，
+只有查卡与发卡图能用（不会静默失败到 "麦麦一声不响"）。
+
+**当前版本：1.0.2** —— 1.0.0 是上架评审前的那份，1.0.1 收前三轮评审的修复，1.0.2 收第四轮
+（见 [CHANGELOG](CHANGELOG.md)）。
 
 ## 功能
 
@@ -80,7 +85,7 @@ python tools/setup_clients.py --from <你的 ygopro 环境>   # 缺了就从别�
 ## 安全与边界
 
 * **闸门默认监听 `0.0.0.0`**，房间口令是 6 位随机字符、由插件直接发到群里。开房打牌本来就要对外开口子；建议在防火墙上**只放行闸门端口**（`listen_port`），别把内核端口也暴露出去。
-* **出网请求都过 `duel/netguard`**：只允许 http/https、只连公网地址（内网/回环/链路本地/保留地址一律拒绝）、最多跟 3 跳重定向且每跳重新校验、响应体上限 512 KiB、不允许走代理隧道。解析与连接之间的换址窗口也堵上了——**校验发生在连接那一刻的目标 IP 上**（`_pinned_connect`），DNS rebinding 换不到内网。
+* **出网请求都过 `duel/netguard`**：只允许 http/https、只连公网地址（内网/回环/链路本地/保留地址一律拒绝）、最多跟 3 跳重定向且每跳重新校验、不允许走代理隧道。响应体默认上限 512 KiB，查卡接口给到 2 MiB、在线卡图给到 4 MiB。解析与连接之间的换址窗口也堵上了——**校验发生在连接那一刻的目标 IP 上**（`_pinned_connect`），DNS rebinding 换不到内网。
 * 卡图与卡号只发给 `ygocdb.com` 与卡图 CDN；对局总结只把"双方统计"交给模型，聊天记录、用户 ID、密钥都不外传。
 * 卡组码**只能用指令导入**，模型不会自动识别群里贴的卡组码。
 
@@ -88,16 +93,16 @@ python tools/setup_clients.py --from <你的 ygopro 环境>   # 缺了就从别�
 
 ```
 mai-play-ygo/
-├── plugin.py          # 插件主体：开房、卡组池、指令与工具
-├── wiki.py            # 百科检索：查卡、发卡图
-├── config.toml        # 配置模板（每项都有注释）
-├── clients/           # 自带的两个虚拟客户端（ygopro + WindBot），见其中的 README
-├── decks/             # 随插件附带的十副卡表（与 executors/ 里的执行器配套）
-├── executors/         # 十份专属出牌脚本（C#）与安装说明
-├── duel/              # 对局运行时：房间、闸门、报文记录、查房出图、卡库、卡组码解析
-├── tools/             # 运维工具：客户端同步、引擎体检、出图预览、录像分析、对局监视
-├── tests/             # 测试套件（pytest）
-└── docs/              # 查房出图与对局监视的说明、各卡组的教程摘要
+├── plugin.py           # 插件主体：开房、卡组池、指令与工具
+├── wiki.py             # 百科检索：查卡、发卡图
+├── config.toml.example # 配置模板（每项都有注释；本机的 config.toml 不进仓库）
+├── clients/            # 自带的两个虚拟客户端（ygopro + WindBot），见其中的 README
+├── decks/              # 随插件附带的十副卡表（与 executors/ 里的执行器配套）
+├── executors/          # 十份专属出牌脚本（C#）与安装说明
+├── duel/               # 对局运行时：房间、闸门、报文记录、查房出图、卡库、卡组码解析
+├── tools/              # 运维工具：客户端同步、引擎体检、出图预览、录像分析、对局监视
+├── tests/              # 测试套件（pytest）
+└── docs/               # 查房出图与对局监视的说明、各卡组的教程摘要
 ```
 
 ## 开发
@@ -113,9 +118,24 @@ python tools/room_watch.py --once                      # 只读扫描对局日�
 
 ## 许可与随包内容
 
-插件本体 **MIT**（见 [LICENSE](LICENSE)）。`clients/` 里的第三方组件许可见
-[`clients/README.md`](clients/README.md)：ygopro 内核与 1.4 万个卡牌脚本是 **GPL-2.0**，WindBot 是 **MIT**；
-`cards.cdb` 与卡图**上游没有声明许可**——要把它们一起分发（尤其上架插件市场）请自行判断是否合适，
-不想带就在配置里把 `paths` 指到你自己客户端的对应文件，或只保留 `tools/setup_clients.py` 让用户自己同步。
-`executors/` 里的十份 C# 执行器同样属于 WindBot 生态（MIT），其中 `MaiBotBrain.cs` 是留给客户端编译用的空转钩子。
+插件本体 **MIT**（见 [LICENSE](LICENSE)）；`LICENSE` 只覆盖插件代码，`clients/` 下的第三方内容
+各自保留原许可与来源，逐项清单见 [`clients/README.md`](clients/README.md)。
+
+**发行结论**（2026-10-07 应市场评审要求定下，不再反复）：**继续随包分发**两个客户端与卡库。
+理由是插件的主打能力就是"开箱即用"——没有 `cards.cdb`，投稿时的缺卡核对和麦麦出牌都做不了，
+要求每个部署者自己凑一套 ygopro 环境等于把插件废掉一半。按权利状态分三类处置：
+
+| 随包内容 | 权利状态 | 处置 |
+| --- | --- | --- |
+| `clients/ygopro/ygopro.exe`、`clients/ygopro/script/`（卡牌脚本） | GPL-2.0（上游已声明） | 随包分发，附上游源码地址（`clients/README.md`），满足 GPL 的源码可获取要求 |
+| `clients/windbot/`、`executors/` | MIT | 随包分发，许可证随包（`clients/windbot/LICENSE`） |
+| `clients/ygopro/cards.cdb`、`clients/ygopro/expansions/`、卡图 | **上游从未声明许可** | 作为社区资料**原样**随包（不主张任何权利、不单独收费），仅用于让插件跑起来；来源逐项写在 `clients/README.md` |
+
+第三类是 ygopro 生态里长期公开流通、各家客户端都在分发的数据，本站照实标注而不假装有许可。
+**权利方若要我们停止分发，在仓库开 Issue 说明即可，我们会立刻把对应文件从仓库与 Release 里剔除**
+（不要求举证）。不想带第三类的部署者可以删掉 `clients/ygopro/cards.cdb` 与 `clients/ygopro/expansions/`，
+改让使用者用 `python tools/setup_clients.py --from <自己的 ygopro 环境>` 从本机客户端同步，
+或把配置里的 `[paths]` 直接指向自己客户端的同名文件。
+
+`executors/` 里的十份 C# 执行器同属 WindBot 生态（MIT），其中 `MaiBotBrain.cs` 是留给客户端编译用的空转钩子。
 

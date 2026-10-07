@@ -1,7 +1,7 @@
 # clients/ —— 随插件自带的两个虚拟客户端
 
 「麦麦玩游戏王」把**对局内核**与**出牌大脑**都放在这里，所以插件目录整个拷到别的机器上
-也能直接开打（默认配置就是指向这两个目录，见 `config.toml` 的 `[paths]`）。
+也能直接开打（默认配置就是指向这两个目录，见 `config.toml` 的 `[paths]`，模板是 `config.toml.example`）。
 
 ```
 clients/
@@ -35,9 +35,9 @@ python tools/setup_clients.py --check-only
 * **卡图**（`card_art_dir` 默认指向 `clients/art/`，但那份不进版本库——太大且版权归属不明）。
   想让 `/查房` 出图上带卡面，把 `paths.card_art_dir` 指到你客户端自带的卡图目录即可
   （例如 MDPro3 的 `Picture/Art` + `Picture/Closeup`）；没有卡图时图里画的是卡名框，功能不受影响。
-* **WindBot 源码树**（约 250 MB）：只有两种用法需要它——给投稿卡组**生成**专属出牌脚本、
-  以及编译**计划感知执行器**（`duel.ai_plan_coach`）。要用的时侯把 `paths.windbot_src_dir`
-  指过去即可；不带它，插件就把投稿卡组交给通用脚本打。
+* **WindBot 源码树**（约 250 MB）：只有想自己（或让 agent）**改/加执行器**时才需要它——
+  在源码树里编译出一份带定制执行器的 `WindBot.exe`，玩法见 `executors/README.md`。
+  把 `paths.windbot_src_dir` 指过去即可；不带它，插件就用 `clients/windbot/WindBot.exe` 打。
 
 ## 许可与来源（**再分发前请读**）
 
@@ -58,6 +58,13 @@ GPL-2.0 的两个组件再分发时需要随附许可文本与对应源码的获
 * `WindBot.exe` 与 `Decks/` 是 MIT：许可文本随包放在 `windbot/LICENSE`；本插件在这份构建里加的
   各卡组执行器（`executors/`）与宿主侧补丁也一并公开在同一个仓库里。
 
-`cards.cdb` 这类卡牌数据上游没有写明许可，**如果你要公开发布这个插件，请自行判断是否把
-`cards.cdb` / `expansions/` 也放进仓库**（把它们从版本库里排除、让使用者用
-`tools/setup_clients.py` 或 `tools/update_card_data.py` 自己补，同样能跑）。
+上游**未声明许可**的只有 `cards.cdb` / `strings.conf` / `expansions/` / 卡图这几样（表中已逐项标注来源）。
+这类数据在 ygopro 生态里长期公开流通、各家客户端都在分发，本插件的处置是：
+
+* **仓库与 Release 原样随包**——不主张任何权利、不单独收费，只为了让插件开箱即用；
+* **权利方要求即删**：在仓库开个 Issue 说一声，我们会立刻把对应文件从仓库与 Release 里剔除（不要求举证）；
+* **不想带这几样的部署者**：删掉 `clients/ygopro/cards.cdb` 与 `clients/ygopro/expansions/`，
+  让使用者跑 `python tools/setup_clients.py --from <自己的 ygopro 环境>` 从本机客户端补回来，
+  或把 `[paths]` 直接指向自己客户端的同名文件（这两种做法都不需要改动插件代码）。
+
+完整的发行结论（含三类内容的处置表）在根目录 [README](../README.md) 的「许可与随包内容」一节。

@@ -41,6 +41,7 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 import asyncio
 import dataclasses
 import logging
+import sys
 
 from .duel.builtin_decks import builtin_decks
 from .duel.cards import CardDatabase, CardDatabaseError
@@ -533,6 +534,14 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         # （常驻房，插件一启动就拉一副 ygopro + WindBot 一直等着）。2026-10-07 用户口径把
         # 约战与常驻房都去掉了，现在只在群里有人要打时才开房。
         self._logger.info("游戏王对局管家已加载，数据目录 %s", self.ctx.paths.data_dir)
+        if sys.platform != "win32":
+            # 非 Windows 上只有百科那半边能用：这里先明说，别让部署者等到有人开房才发现
+            #（`_check_ready` 也会拦，但那时是群里看到报错，日志里看不到原因）
+            self._logger.warning(
+                "当前平台 %s 不是 Windows：对局功能（ygopro.exe / WindBot.exe）不可用，"
+                "开房会被拒绝；查卡与发卡图不受影响。",
+                sys.platform,
+            )
         # 把生效中的关键配置打进日志：内网穿透时"闸门端口是否真的固定了"全靠这一行确认
         self._log_effective_config()
         # 自定义的对局总结提示词先试渲染一次：占位符写错要现在就说，别等打完一局才发现没总结
@@ -2106,6 +2115,13 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
     def _check_ready(self) -> str:
         """开局前的配置自检，返回空字符串表示可以开局。"""
 
+        # 对局内核与出牌引擎都是 Windows 可执行文件（2026-10-07 评审提醒：这是个 Windows-only 插件）。
+        # 非 Windows 上不假装能开，直接说清楚——查卡与发卡图那半边不受影响，仍然可用。
+        if sys.platform != "win32":
+            return (
+                f"本插件只在 Windows 上能开房打牌（当前平台 {sys.platform}）：对局内核 ygopro.exe 与"
+                "出牌引擎 WindBot.exe 都是 Windows 程序。查卡与发卡图不受影响。"
+            )
         if self._deck_pool is None:
             return "插件还没加载完，稍后再试。"
         missing = self._missing_paths()

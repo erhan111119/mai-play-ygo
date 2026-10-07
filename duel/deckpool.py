@@ -24,11 +24,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
+import logging
 import random
 import re
 import sqlite3
 import time
 import uuid
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 _SCHEMA = """
@@ -522,6 +526,10 @@ class DeckPool:
 
         ⚠ 群号要先过 :meth:`canonical_group`：库里存的是归一后的值，拿原始群号去比会一副都匹配不到
         （群号带 `/`、`:`、`..` 时），于是静默返回 0——看着像"本群没人投过稿"（2026-10-07 评审指出）。
+
+        ⚠ 顺序是**先删记录、再清文件**（2026-10-07 评审指出）：反过来的话，unlink 到一半失败
+        （Windows 上文件被别的进程占着就会 PermissionError）会让一部分 .ydk 已经消失、记录却还在，
+        又回到上面那个悬空引用的坑。现在最坏情况只是留下几个没人引用的孤儿 .ydk。
         """
 
         group_key = self.canonical_group(group_id)
@@ -529,16 +537,17 @@ class DeckPool:
         if not decks:
             return 0
         removed_ids = tuple(deck.deck_id for deck in decks)
-        for deck in decks:
-            try:
-                deck.ydk_path.unlink(missing_ok=True)
-            except OSError as exc:
-                raise DeckPoolError(f"删除 {deck.ydk_path} 失败：{exc}") from exc
         placeholders = ", ".join("?" for _ in removed_ids)
         self._connection.execute(
             f"DELETE FROM decks WHERE deck_id IN ({placeholders})", removed_ids
         )
         self._connection.commit()
+        for deck in decks:
+            try:
+                deck.ydk_path.unlink(missing_ok=True)
+            except OSError as exc:
+                # 记录已经删了，删不掉的文件只是孤儿，不影响任何对局，记一条日志就够了
+                _LOGGER.warning("清空投稿：%s 删不掉，留下孤儿文件：%s", deck.ydk_path, exc)
         # 清掉的投稿里可能有当前固定的那副，交给 fixed_deck() 自己发现悬空并清设置
         return len(decks)
 
