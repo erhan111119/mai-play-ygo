@@ -1,0 +1,48 @@
+diff --git a/Game/AI/Decks/DoEveryThingExecutor.cs b/Game/AI/Decks/DoEveryThingExecutor.cs
+index 8699807..7f4a9ef 100644
+--- a/Game/AI/Decks/DoEveryThingExecutor.cs
++++ b/Game/AI/Decks/DoEveryThingExecutor.cs
+@@ -25,15 +25,41 @@ namespace WindBot.Game.AI.Decks
+             AddExecutor(ExecutorType.SpellSet);
+         }
+ 
++        /// <summary>
++        /// 通用选卡兜底。
++        ///
++        /// ⚠ 2026-10-08 改过（群友反馈"效果点不对对象"是**通用**问题，不只某一副牌）：
++        /// 上游这里只有一句"select the last cards"——**按内核给的候选顺序从尾部取**，
++        /// 等于把目标选择交给报文的排列。实测吃到的两个坑：
++        /// * 「落胤与圣女」的"以场上 1 张表侧卡为对象，那张卡破坏"炸了对面刚拉出来的
++        ///   「黑森林的魔女」（从场上去墓地就检索 ⇒ 白送对面一次检索）；
++        /// * 手坑/无效类的目标也会挑到"没在发效果的那只"。
++        /// 现在：**先把"弄掉对面哪张卡"这类提问按卡文挑好**（见 <see cref="DefaultExecutor.PickEnemyRemovalTarget"/>），
++        /// 其余保持上游口径，只补上越界保护（原来 `max` 大于候选数时 `cards[cards.Count-i]` 会直接抛异常）。
++        /// 这条兜底是"投稿卡组用通用脚本"时的唯一选择逻辑，所以通用层的收益最大。
++        /// </summary>
+         public override IList<ClientCard> OnSelectCard(IList<ClientCard> cards, int min, int max, int hint, bool cancelable)
+         {
+             if (Duel.Phase == DuelPhase.BattleStart)
+                 return null;
++            if (cards == null || cards.Count == 0)
++                return null;
++
++            // ① "把对面场上的卡弄掉一张"：按卡文挑（排除"炸了反而帮对面"和"根本弄不动"的目标）
++            if (min >= 1 && max >= 1
++                && (hint == HintMsg.Destroy || hint == HintMsg.Remove
++                    || hint == HintMsg.ReturnToHand || hint == HintMsg.ToDeck))
++            {
++                IList<ClientCard> enemy = PickEnemyRemovalTarget(cards, hint, max);
++                if (enemy != null)
++                    return enemy;
++            }
+ 
+             IList<ClientCard> selected = new List<ClientCard>();
+ 
+-            // select the last cards
+-            for (int i = 1; i <= max; ++i)
++            // ② 兜底：沿用上游的"取候选尾部"（顺序对绝大多数提问（检索/选素材/送墓）都无所谓），
++            //    但把越界修掉：`i <= max` 同时要 `i <= cards.Count`。
++            for (int i = 1; i <= max && i <= cards.Count; ++i)
+                 selected.Add(cards[cards.Count-i]);
+ 
+             return selected;

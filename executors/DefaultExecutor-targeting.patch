@@ -1,0 +1,69 @@
+diff --git a/Game/AI/DefaultExecutor.cs b/Game/AI/DefaultExecutor.cs
+--- a/Game/AI/DefaultExecutor.cs
++++ b/Game/AI/DefaultExecutor.cs
+@@ -1082,16 +1144,33 @@ namespace WindBot.Game.AI
+         }
+ 
++        /// <summary>
++        /// "把对面场上的卡弄掉一张"时该挑哪张：**判据在 <see cref="EnemyTargeting.PickEnemyRemovalTarget"/>**。
++        ///
++        /// 为什么单独放一个文件：这是**通用**判据（每副牌都会遇到"该炸/该弹哪张"），而基类是上游文件、
++        /// 我们的改动越薄越好维护——那边只剩这一个薄封装 + <see cref="DefaultGetDisableMonsterTarget"/>
++        /// 的顺序调整。各执行器（DoEverything / RaiseMoon …）都调这里，别在别处再抄一份。
++        /// </summary>
++        protected static IList<ClientCard> PickEnemyRemovalTarget(IList<ClientCard> cards, int hint, int max)
++        {
++            return EnemyTargeting.PickEnemyRemovalTarget(cards, hint, max);
++        }
++
+         /// <summary>
+         /// Return the enemy monster that should be disabled by the default logic.
++        ///
++        /// ⚠ 顺序在 2026-10-08 被调过（群友实测、通用问题）：**"刚发效果的那只"要排在"最该被废的那只"前面**。
++        /// 上游原来先问 <see cref="ClientField.MonsterZone"/> 的 `GetShouldBeDisabledBeforeItUseEffectMonster()`
++        /// （＝"还没发过效果、最值得预防性废掉的那只"，靠 WindBot 的卡表登记猜），只有它给不出答案时才看链上
++        /// 最后一张卡。于是"对面刚发效果"的场合会去废另一只：实测（`logs/app_20261008_005046.log.jsonl`
++        /// 00:30:20 那局）对手「白龙之落胤」在场上发 ②（从卡组特召 1 只「艾克莉西娅」），我们的
++        /// 「效果遮蒙者」却点在对面的「魔女术师傅·玻璃女巫」身上——刚发的那只照常结算，等于白扔一张手坑
++        /// （群友原话："我白阿发效果他无效我玻璃"）。
++        /// 卡文口径（`c97268402.lua` / `c10045474.lua`）："以对方场上 1 只效果怪兽为对象才能发动。
++        /// 那只对方怪兽的效果直到回合结束时无效"——要无效的是**正在发效果的那只**，链上那一刻的目标
++        /// 是确定的（不受"猜哪只更值钱"影响），所以先看它；它不合法（已经被无效过／不能被选为目标）时
++        /// 才退回启发式，最后再看战斗相关与场上的特定卡。
+         /// </summary>
+         protected ClientCard DefaultGetDisableMonsterTarget()
+         {
+-            if (Duel.Player == 1)
+-            {
+-                ClientCard target = Enemy.MonsterZone.GetShouldBeDisabledBeforeItUseEffectMonster();
+-                if (target != null)
+-                    return target;
+-            }
+-
+             ClientCard LastChainCard = Util.GetLastChainCard();
+ 
+@@ -1099,7 +1178,24 @@ namespace WindBot.Game.AI
+                 !LastChainCard.IsDisabled() && !LastChainCard.IsShouldNotBeTarget() && !LastChainCard.IsShouldNotBeSpellTrapTarget())
+             {
++                // 只在这条**推翻了**旧口径（"最该被废的那只"是另一张）时打一行：下一局实录里
++                // 出现 `[手坑]` 就说明新顺序生效了（群友实测那次就是把刚发效果的放了过去）。
++                ClientCard guessed = Duel.Player == 1
++                    ? Enemy.MonsterZone.GetShouldBeDisabledBeforeItUseEffectMonster()
++                    : null;
++                if (guessed != null && guessed != LastChainCard)
++                {
++                    Logger.WriteLine("[手坑] 无效目标＝刚发效果的「" + EnemyTargeting.NameOf(LastChainCard)
++                        + "」（旧口径会点「" + EnemyTargeting.NameOf(guessed) + "」）");
++                }
+                 return LastChainCard;
+             }
+ 
++            if (Duel.Player == 1)
++            {
++                ClientCard target = Enemy.MonsterZone.GetShouldBeDisabledBeforeItUseEffectMonster();
++                if (target != null)
++                    return target;
++            }
++
+             if (Bot.BattlingMonster != null && Enemy.BattlingMonster != null)
+             {

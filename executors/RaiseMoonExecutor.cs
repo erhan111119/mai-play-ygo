@@ -899,19 +899,25 @@ namespace WindBot.Game.AI.Decks
             // "对面有表侧魔陷"之后，目标的候选列表里两边都有（对面那张 + 我们自己的「未眠之城」），
             // 而基类从尾部取 → 炸掉自己的场地（实测 `mb3-88.log` 20 局里 6 次，
             // 其中一次是"群星① 放顶→抽到→当场打出"的未眠之城，同一回合被自己炸掉）。
-            // 只处理"破坏/弹回/除外场上的卡"这三类提示，且只在两侧都有候选时生效；
+            // 只处理"破坏/弹回/除外/洗回卡组"这几类提示，且只在两侧都有候选时生效；
             // 纯我方的候选（检索、选素材、把自己场上的怪当代价）原样交给基类。
+            //
+            // ⚠ 2026-10-08 群友实测（`logs/app_20261008_005046.log.jsonl` 00:33:32 那局）：
+            // 这里原来是"**按内核给的候选顺序**拿前 max 张对面的卡"，于是「落胤与圣女」的
+            // "破坏场上 1 张表侧卡"炸了对面刚用「黑魔导的幕帘」拉出来的「黑森林的魔女」——
+            // 那张卡的卡文是"①：这张卡从场上送去墓地的场合发动。从卡组把 1 只守备力 1500 以下的
+            // 怪兽加入手卡"（`c78010363.lua`），**炸掉＝白送对面一次检索**（同时我们付了
+            // 额外卡组 1 只「阿不思」名怪兽当费用）。群友的原话："他上来炸我黑森林"。
+            // 现在交给**共享挑选器**（`DefaultExecutor.PickEnemyRemovalTarget` →
+            // `Game/AI/EnemyTargeting.cs`，打分口径与卡文出处写在那里）：这是通用层的问题、
+            // 不只这副牌，所以实现在那个文件里，这里只负责"把提问交给它"。
             if (min >= 1
-                && (hint == HintMsg.Destroy || hint == HintMsg.ReturnToHand || hint == HintMsg.Remove))
+                && (hint == HintMsg.Destroy || hint == HintMsg.ReturnToHand
+                    || hint == HintMsg.Remove || hint == HintMsg.ToDeck))
             {
-                List<ClientCard> enemyCards = new List<ClientCard>();
-                foreach (ClientCard card in cards)
-                {
-                    if (card.Controller == 1 && enemyCards.Count < max)
-                        enemyCards.Add(card);
-                }
-                if (enemyCards.Count >= min)
-                    return enemyCards;
+                IList<ClientCard> best = PickEnemyRemovalTarget(cards, hint, max);
+                if (best != null)
+                    return best;
             }
 
             // 解放/吃自己场上的怪当费用：挑**最不心疼的**（token → 攻最低），

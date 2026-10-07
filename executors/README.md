@@ -34,16 +34,23 @@
 ```bash
 # 0) 目录：<windbot-src> = 你的 WindBot 源码树（`git clone` 后自己 build 出来的那份），<plugin> = 本插件仓库根
 
-# 1) 先打宿主侧的两个 patch（对上游 HEAD 的 diff，git apply 用默认 -p1，从源码树根跑）
+# 1) 先打宿主侧的四个 patch（对上游 HEAD 的 diff，git apply 用默认 -p1，从源码树根跑）
 cd <windbot-src>
 git apply <plugin>/executors/DefaultExecutor.patch
+git apply <plugin>/executors/DefaultExecutor-targeting.patch
+git apply <plugin>/executors/DoEveryThingExecutor.patch
 git apply <plugin>/executors/host-integration.patch
 
 # 2) 十份执行器 → Game/AI/Decks/
 cp <plugin>/executors/*Executor.cs Game/AI/Decks/
 
-# 3) AI 问答通道 → Game/AI/（KillerTuneExecutor.cs 直接调用它，缺了编译不过）
-cp <plugin>/executors/MaiBotBrain.cs Game/AI/
+# 3) AI 问答通道 + 通用选目标判据 → Game/AI/
+#    KillerTuneExecutor.cs 直接调用 MaiBotBrain；EnemyTargeting 是"该炸/该弹对面哪张"的共享判据
+#    （DoEverything / RaiseMoon 都调它），两个都缺一编译不过
+cp <plugin>/executors/MaiBotBrain.cs <plugin>/executors/EnemyTargeting.cs Game/AI/
+
+# 3.5) 老式 csproj 是显式文件清单：新加的 Game/AI/ 根下文件各要一行
+#      <Compile Include="Game\AI\EnemyTargeting.cs" />（MaiBotBrain 那行在 host-integration.patch 里）
 
 # 4) 编译
 dotnet build WindBot.csproj -c Release
@@ -57,12 +64,18 @@ uv run python tools/check_windbot_build.py            # 不一致会报错并给
 uv run python tools/check_windbot_build.py --deploy   # 备份后直接覆盖
 ```
 
-### 两个 patch 分别是什么
+### 四个 patch 分别是什么
 
 | 文件 | 内容 | 为什么装脚本必须带上 |
 |---|---|---|
 | `DefaultExecutor.patch` | 上游 `Game/AI/DefaultExecutor.cs` 的 diff（+66/-4） | 七份执行器（RaiseMoon / WitchcraftShop / ToonShop / KillerTune / SkyStrikerShop / TraptrixRagnaraika / KezmoYixiangming）用了它新增的成员：`EnemySummonedThisTurn`、`MulcharmyReady()`、`MulcharmyWaitSummon`。缺了**编译不过** |
+| `DefaultExecutor-targeting.patch` | 同一个文件的第二段 diff：`DefaultGetDisableMonsterTarget()` 的**判定顺序**（先看"刚发效果的那只"、再看"最该被废的那只"）+ `PickEnemyRemovalTarget` 的薄封装 | 通用层的"该无效哪只怪"（群友实测：对面「白龙之落胤」发效果、我们的「效果遮蒙者」却去点了「魔女术师傅·玻璃女巫」）。缺了只是**行为退回旧口径**，不影响编译 |
+| `DoEveryThingExecutor.patch` | 上游 `Game/AI/Decks/DoEveryThingExecutor.cs` 的 diff | 通用脚本（`Test`）的选卡兜底：上游是"取候选尾部"，投稿卡组全吃这条 → 改成"破坏/除外/弹回/洗回先按卡文挑对面那张"。缺了行为退回旧口径，不影响编译 |
 | `host-integration.patch` | `Game/GameAI.cs`、`Game/AI/Executor.cs`、`Game/AI/DecksManager.cs`、`WindBot.csproj` 四个上游文件的 diff | ① `GameAI.PreferExtraMonsterZone` 字段——RaiseMoon / SkyStrikerShop / TraptrixRagnaraika 三份在构造函数里打开它（把链接怪/超量怪优先放额外怪兽区），缺了**编译不过**；② `WindBot.csproj` 加一行 `<Compile Include="Game\AI\MaiBotBrain.cs" />`（老式 csproj 是显式文件清单，`Game\AI\Decks\*.cs` 那种通配不覆盖 `Game\AI\` 根下的新文件）；③ `MaiBotBrain` 的四处钩子（`Executor.AddExecutor` / `Executor.SetCard` / `GameAI` 的打谁与主要阶段提案）；④ `DecksManager` 的未注册告警与「执行器：」日志 |
+
+`Game/AI/EnemyTargeting.cs`（本目录里同名文件，不在 patch 之列）是**通用选目标判据**的落点：
+"弄掉对面哪张卡"的打分与「弄掉它反而帮对面」的卡表（每条都带卡文出处）都写在那里；
+`DoEveryThingExecutor.patch` 与升辉月执行器都调它，所以两份 patch 和这个文件要一起装。
 
 patch 都是用 `git diff` 从上游 HEAD（`7acd93d`）导出的，已验证能干净地 `git apply` 到 HEAD；
 `Game/AI/Decks/KashtiraExecutor.cs`、`TearlamentsExecutor.cs` 本身就是上游文件，本目录里的版本是
