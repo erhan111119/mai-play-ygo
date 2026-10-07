@@ -319,6 +319,58 @@ def test_remove_works_from_any_group() -> None:
             pool.close()
 
 
+def test_delete_all_only_touches_the_calling_group() -> None:
+    """`/清空卡组` 只清本群投稿：别群的行与 .ydk 都要留着。
+
+    这条是回归测试（2026-10-07 评审指出的坑）：以前 `delete_all` 按"全池投稿"删文件、
+    却只 `DELETE ... WHERE group_id = ?` 删本群的行——别群的记录会变成指向已删文件的悬空引用，
+    之后随机抽到那副牌，机器人一张都出不了牌，而且不报错。
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        pool = DeckPool(Path(directory))
+        try:
+            mine_a = submit(pool, "111", "本群甲")
+            mine_b = submit(pool, "111", "本群乙")
+            other = submit(pool, "222", "别群的")
+            assert pool.delete_all("111") == 2
+            assert not mine_a.ydk_path.exists() and not mine_b.ydk_path.exists()
+            # 别群的牌：行还在、文件也还在（否则就是悬空引用）
+            assert other.ydk_path.is_file(), "别群的 .ydk 被误删了"
+            remaining = pool.own_decks("222")
+            assert [deck.deck_id for deck in remaining] == [other.deck_id]
+            assert all(deck.ydk_path.is_file() for deck in pool.own_decks("222"))
+            assert pool.delete_all("111") == 0, "再清一次应返回 0"
+        finally:
+            pool.close()
+
+
+def test_group_dir_name_is_sanitised() -> None:
+    """群号当目录名要过白名单：`/`、`\\`、`..` 之类不能拼进数据目录。"""
+
+    from duel.deckpool import _group_dir_name
+
+    assert _group_dir_name("27dc88f323272580afdcce4edf26b5be") == "27dc88f323272580afdcce4edf26b5be"
+    assert _group_dir_name("100907480") == "100907480"
+    assert _group_dir_name("__builtin__") == "__builtin__"
+    for bad in ("../evil", "a/b", "a\\b", "..", "", "x" * 200):
+        cleaned = _group_dir_name(bad)
+        assert "/" not in cleaned and "\\" not in cleaned, (bad, cleaned)
+        assert ".." not in cleaned, (bad, cleaned)
+        assert 0 < len(cleaned) <= 64, (bad, cleaned)
+
+    # 端到端：恶意群号投稿后，文件必须落在数据目录里面
+    with tempfile.TemporaryDirectory() as directory:
+        pool = DeckPool(Path(directory))
+        try:
+            stored = submit(pool, "../evil", "越界测试")
+            data_dir = Path(directory).resolve()
+            assert data_dir in stored.ydk_path.resolve().parents, stored.ydk_path
+            assert stored.ydk_path.is_file()
+        finally:
+            pool.close()
+
+
 def test_default_windbot_deck_applied() -> None:
     """未显式指定风格卡组时应当套用配置里的默认值。"""
 

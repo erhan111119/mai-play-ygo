@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List
 
 import json
+import re
 import sys
 import tomllib
 
@@ -203,10 +204,17 @@ def test_duel_config_exposes_only_group_owner_items() -> None:
         label = (duel_model.model_fields[name].json_schema_extra or {}).get("label")
         assert label and not label.isascii(), f"{name} 缺中文标签：{label!r}"
 
-    # 模板里也只留这七项：装完插件打开配置页，看到的就是这七个
+    # 配置页看到的十项都要在模板里出现；反过来模板里**不许有拼错的键**
+    # （以前这里断言"模板里只有这十项"，但本机在跑的 config.toml 是同一份文件：
+    #  开发机可以合法地额外钉几个内部参数（bot_debug / no_check_deck 之类），
+    #  那条"严格相等"会把"本机配置"当成"模板写错了"。可见面由上面模型级的断言守着。）
     with (_PLUGIN_ROOT / "config.toml").open("rb") as handle:
         toml_data = tomllib.load(handle)
-    assert sorted(toml_data["duel"]) == visible, sorted(toml_data["duel"])
+    assert set(visible) <= set(toml_data["duel"]), (
+        f"config.toml 的 [duel] 缺少可见项：{sorted(set(visible) - set(toml_data['duel']))}"
+    )
+    unknown = set(toml_data["duel"]) - set(duel_model.model_fields)
+    assert not unknown, f"config.toml 的 [duel] 有模型里不存在的键：{sorted(unknown)}"
 
 
 def test_plugin_exposes_expected_tools() -> None:
@@ -268,6 +276,53 @@ def test_plugin_exposes_expected_tools() -> None:
         assert item["metadata"].get("visibility") == "visible", (
             f"工具 {item['name']} 的 visibility 不是 visible，模型需要额外搜索才能发现它"
         )
+
+
+def _strip_comments(block: str) -> List[str]:
+    """去掉整行注释与行尾注释，只留真正的代码行（否则注释里提到 `type=` 会被误判）。"""
+
+    lines: List[str] = []
+    for line in block.splitlines():
+        code = line.split("#", 1)[0].rstrip()
+        if code.strip():
+            lines.append(code)
+    return lines
+
+
+def test_sdk_calls_use_the_current_keyword_forms() -> None:
+    """组件声明要用 SDK 现行的关键字：`brief_description` / `param_type`。
+
+    为什么值得一条护栏（2026-10-07 评审指出）：两代写法在 2.5.0 上都能"跑起来"，
+    但**旧写法是静默失效**的——`ToolParameterInfo(param_type=...)` 才是字段名，写成 `type=`
+    pydantic 会当多余关键字丢掉、参数类型悄悄回落到 STRING；`@Tool(description=...)` 只是兼容别名，
+    现行字段是 `brief_description` / `detailed_description`。写错了没有任何报错，
+    只会在别处表现出"为什么模型不按我写的类型传参"。
+    """
+
+    problems: List[str] = []
+    for path in (_PLUGIN_ROOT / "plugin.py", _PLUGIN_ROOT / "wiki.py"):
+        text = path.read_text(encoding="utf-8")
+
+        # ① @Tool 的**顶层**关键字（与第一个参数同缩进）不许是裸 description=
+        for match in re.finditer(r"@Tool\(\n(.*?)\n(\s*)\)\n", text, re.S):
+            body, args = match.group(1), _strip_comments(match.group(1))
+            if not args:
+                continue
+            top_indent = len(args[0]) - len(args[0].lstrip())
+            for line in args:
+                indent = len(line) - len(line.lstrip())
+                if indent == top_indent and re.match(r"\s*description\s*=", line):
+                    problems.append(f"{path.name}: @Tool 顶层用了 description=（应改成 brief_description）")
+                    break
+            del body
+
+        # ② ToolParameterInfo 里不许有裸 type=（字段名是 param_type）
+        for match in re.finditer(r"ToolParameterInfo\((.*?)\)", text, re.S):
+            for line in _strip_comments(match.group(1)):
+                if re.search(r"(?<!param_)\btype\s*=", line):
+                    problems.append(f"{path.name}: ToolParameterInfo 用了 type=（应改成 param_type）")
+                    break
+    assert not problems, "；".join(problems)
 
 
 def main() -> int:

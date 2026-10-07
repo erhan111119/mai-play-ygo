@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import random
+import re
 import sqlite3
 import time
 import uuid
@@ -74,6 +75,23 @@ BUILTIN_GROUP = "__builtin__"
 
 # 固定卡组存在 settings 表里的键名（全局一份，见 DeckPool.set_fixed_deck）
 _FIXED_DECK_KEY = "fixed_deck_id"
+
+#: 群号当目录名时的白名单：字母/数字/下划线/横线（本机见过的群号都是十六进制哈希或纯数字）
+_GROUP_DIR_OK = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _group_dir_name(group_id: str) -> str:
+    """把群号变成安全的目录名（白名单之外的字符一律换成下划线）。
+
+    ⚠ 别直接拿群号拼路径：`group_id` 来自平台消息，理论上可能带 `/`、`\\` 或 `..`，
+    拼进 ``decks/<group_id>/`` 就能把投稿的 .ydk（连同它的卡表内容）写到数据目录外面去。
+    """
+
+    text = str(group_id)
+    if _GROUP_DIR_OK.match(text):
+        return text
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", text)[:64]
+    return cleaned or "group"
 
 
 class DeckPoolError(RuntimeError):
@@ -165,7 +183,7 @@ class DeckPool:
         ``/加入随机 <编号>`` 才会被抽到。
         """
 
-        group_key = str(group_id)
+        group_key = _group_dir_name(group_id)
         target_dir = self._decks_dir / group_key
         target_dir.mkdir(parents=True, exist_ok=True)
         # 文件名带上随机后缀，避免同名投稿互相覆盖
@@ -479,15 +497,31 @@ class DeckPool:
         return self._row_to_deck(deck_row)
 
     def delete_all(self, group_id: str) -> int:
-        """清空本群的全部投稿（不动内置卡组），返回删掉的副数。"""
+        """清空**本群**的投稿（不动内置卡组、也不动别群的投稿），返回删掉的副数。
 
-        decks = self.own_decks(group_id)
+        ⚠ 这里以前是"文件按全池清、SQL 只删本群"：`own_decks()` 返回的是**全池**投稿（卡组池是
+        全局共享的，见 :meth:`own_decks`），于是别群的 .ydk 文件被 unlink 了、数据库里的行却还在，
+        变成指向已删文件的悬空记录——之后随机抽到那副牌，机器人一张都出不了牌，而且**不报错**
+        （2026-10-07 评审指出）。现在文件与记录按同一个范围删，两边数量必然对得上。
+
+        语义上选"只清本群"而不是"清空整个池子"：清空是破坏性操作，别群辛苦投的牌不该被
+        不相干的管理员一键清掉；卡组池共享只影响"看得到、用得上"，删除范围仍然按来源群。
+        """
+
+        group_key = str(group_id)
+        decks = [deck for deck in self.own_decks(group_key) if deck.group_id == group_key]
+        if not decks:
+            return 0
+        removed_ids = tuple(deck.deck_id for deck in decks)
         for deck in decks:
             try:
                 deck.ydk_path.unlink(missing_ok=True)
             except OSError as exc:
                 raise DeckPoolError(f"删除 {deck.ydk_path} 失败：{exc}") from exc
-        self._connection.execute("DELETE FROM decks WHERE group_id = ?", (str(group_id),))
+        placeholders = ", ".join("?" for _ in removed_ids)
+        self._connection.execute(
+            f"DELETE FROM decks WHERE deck_id IN ({placeholders})", removed_ids
+        )
         self._connection.commit()
         # 清掉的投稿里可能有当前固定的那副，交给 fixed_deck() 自己发现悬空并清设置
         return len(decks)

@@ -298,7 +298,10 @@ class YugiohWikiTools:
         parameters=[
             ToolParameterInfo(
                 name="keyword",
-                type=ToolParamType.STRING,
+                # ⚠ 这里以前写的是 `type=`：ToolParameterInfo 的字段名是 `param_type`，pydantic
+                # 会**静默忽略**多余关键字，于是"我明明声明了类型"其实没生效、悄悄回落到 STRING
+                # （2026-10-07 评审指出）。本工具恰好就是字符串参数，所以一直没暴露。
+                param_type=ToolParamType.STRING,
                 description="要搜索的卡牌名称或关键词，可以是中文、日文、英文",
                 required=True,
             ),

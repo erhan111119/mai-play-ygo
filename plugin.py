@@ -636,7 +636,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
     @Tool(
         TOOL_START,
-        description=(
+        brief_description=(
             "开一局游戏王对战：先把房间建好，再把服务器地址与房间密码发到群里，"
             "群友用 MDPro3 或 YGOMobile 连进来和机器人打一局。"
             "当群聊里有人表示想打牌、想决斗、问有没有人来一局、想和机器人比一场时调用。"
@@ -880,7 +880,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
     @Tool(
         TOOL_LIST_DECKS,
-        description=(
+        brief_description=(
             "查看本群可用的卡组：WindBot 自带的内置卡组与群友投稿，并标出哪些在随机池里、"
             "哪副是当前固定使用的。"
         ),
@@ -922,7 +922,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
     @Tool(
         TOOL_STATUS,
-        description="查看当前游戏王对局的状态：房间地址、机器人是否就位、群友是否进来了、打到哪一步。",
+        brief_description="查看当前游戏王对局的状态：房间地址、机器人是否就位、群友是否进来了、打到哪一步。",
         parameters=[],
         visibility="visible",
         chat_scope="all",
@@ -960,7 +960,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
     @Tool(
         TOOL_STOP,
-        description=(
+        brief_description=(
             "结束并关闭当前房间（群友不来了、要取消这一局、或者房间卡住时用）。"
             "当群里有人说算了不打了、取消对局、或者要重开一局时调用。"
         ),
@@ -1312,13 +1312,18 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
     @Command(
         "ygo_cmd_deck_delete",
-        description="删除本群的一副投稿卡组",
+        description="删除一副投稿卡组（卡组池是全局共享的：看到哪副就能删哪副）",
         pattern=r"^/删卡组\s+\S",
     )
     async def cmd_deck_delete(
         self, text: str = "", stream_id: str = "", group_id: str = "", **kwargs: Any
     ) -> Tuple[bool, str, int]:
-        """按编号或名字删除一副投稿。"""
+        """按编号或名字删除一副投稿。
+
+        ⚠ **删除范围是全局的**（不限本群）：卡组池共享，列表里看得到别群的投稿，也就删得掉；
+        所以回执里会写明这副牌是谁投的，别群的人删到了会有个提示（评审 2026-10-07 指出这点，
+        但保持"看得到就管得着"是刻意的——按群过滤删除会让同一份列表里有的牌删不掉，更难理解）。
+        """
 
         del kwargs
         if self._deck_pool is None:
@@ -1357,8 +1362,11 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         if not removed:
             await self.ctx.send.text("删除失败，这副卡组可能已经被删掉了。", stream_id)
             return True, "删除失败", 1
+        # 投稿来自别的群时说明一句：删的是共享池里的牌，不是"本群那副"
+        source = "" if deck.group_id == group_key else f"（投稿人 {deck.contributor_name}，来自别的群）"
         await self.ctx.send.text(
-            f"已删除「{deck.display_name}」。本群还剩 {self._deck_pool.count(group_key)} 副。", stream_id
+            f"已删除「{deck.display_name}」{source}。卡组池还剩 {self._deck_pool.count(group_key)} 副。",
+            stream_id,
         )
         return True, f"已删除 {deck.display_name}", 1
 
@@ -1507,21 +1515,29 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
     @Command(
         "ygo_cmd_deck_clear",
-        description="清空本群的全部投稿卡组（需管理员）",
+        description="清空**本群**投稿的卡组（需管理员；别群的投稿与内置卡组不受影响）",
         pattern=r"^/(?:清空卡组|删除所有卡组)\s*$",
         permission="operator",
     )
     async def cmd_deck_clear(
         self, stream_id: str = "", group_id: str = "", **kwargs: Any
     ) -> Tuple[bool, str, int]:
-        """清空本群卡组池。"""
+        """清空本群投稿。
+
+        回执里点明"本群"与"卡组池是共享的"：以前这里文件按全池清、记录只删本群，
+        别群的投稿会变成悬空文件引用（2026-10-07 评审指出）；现在两边都只动本群。
+        """
 
         del kwargs
         if self._deck_pool is None:
             return True, "卡组池还没准备好", 1
         group_key = group_id or stream_id
         count = self._deck_pool.delete_all(group_key)
-        await self.ctx.send.text(f"已清空本群的 {count} 副投稿卡组。", stream_id)
+        await self.ctx.send.text(
+            f"已清空本群投稿的 {count} 副卡组。"
+            "（卡组池是全局共享的：别群的投稿和 WindBot 自带卡组都没动）",
+            stream_id,
+        )
         return True, f"已清空 {count} 副卡组", 1
 
     @Command(

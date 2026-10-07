@@ -20,6 +20,8 @@ if str(_PLUGIN_ROOT) not in sys.path:
 from duel.netguard import (  # noqa: E402  导入顺序受 sys.path 补丁影响
     MAX_REDIRECTS,
     UnsafeUrlError,
+    _pinned_connect,
+    is_public_address,
     is_public_host,
     validate_url,
 )
@@ -89,6 +91,61 @@ def test_redirect_limit_is_small() -> None:
     """重定向跳数要压得很小：每多一跳都是一次新的、可能被引导到内网的请求。"""
 
     assert 0 < MAX_REDIRECTS <= 5, MAX_REDIRECTS
+
+
+def test_connect_time_check_blocks_private_target() -> None:
+    """连接那一刻再校验一次目标 IP：解析与连接之间的换址窗口要堵上（2026-10-07 评审指出）。
+
+    这里不真的连网：造一个只有几个属性的假连接对象喂给 `_pinned_connect`，
+    它应当在校验阶段就抛错，压根不走到 socket.connect。
+    """
+
+    class _FakeConnection:
+        """`_pinned_connect` 需要的最小接口。"""
+
+        def __init__(self, host: str, port: int = 80) -> None:
+            self.host = host
+            self.port = port
+            self.timeout = 3
+            self.sock = None
+            self._tunnel_host = None
+
+    for host in ("localhost", "127.0.0.1", "169.254.169.254", "192.168.1.1", "[::1]"):
+        try:
+            _pinned_connect(_FakeConnection(host), allow_private_host=False)
+        except UnsafeUrlError:
+            continue
+        raise AssertionError(f"{host} 应当在连接前被拦下")
+
+    # 走代理隧道时目标地址校验不到，必须明确拒绝而不是照常连
+    tunnel = _FakeConnection("127.0.0.1")
+    tunnel._tunnel_host = "proxy.internal"
+    try:
+        _pinned_connect(tunnel, allow_private_host=False)
+    except UnsafeUrlError:
+        pass
+    else:
+        raise AssertionError("隧道连接应当被拒绝")
+
+
+def test_public_address_predicate() -> None:
+    """`is_public_address` 的边界：内网/回环/链路本地/保留/组播都不算公网。"""
+
+    assert is_public_address("8.8.8.8") and is_public_address("206.237.31.210")
+    for bad in (
+        "127.0.0.1",
+        "10.0.0.5",
+        "172.16.3.4",
+        "192.168.1.1",
+        "169.254.169.254",
+        "0.0.0.0",
+        "224.0.0.1",
+        "::1",
+        "fd00::1",
+        "fe80::1",
+        "not-an-ip",
+    ):
+        assert not is_public_address(bad), bad
 
 
 def main() -> int:
