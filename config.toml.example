@@ -1,4 +1,8 @@
-# 麦麦玩游戏王（Mai Play YGO）· 配置文件（模板）
+# 麦麦玩游戏王（Mai Play YGO）· 配置模板
+#
+# 用法：复制成 config.toml 再改（`cp config.toml.example config.toml`）。
+# 仓库里**只放这份模板**：真正在跑的 config.toml 是本地文件（已加进 .gitignore），
+# 这样升级/拉取代码时不会和你的本地配置打架，也不会有谁的隧道地址被提交上去。
 #
 # 每一项都写着默认值与作用；不想改的项整行删掉即可（会回落默认值）。
 # 路径支持「相对于插件目录」的写法（推荐）：默认值就指向插件自带的 clients/，
@@ -6,7 +10,7 @@
 
 [plugin]
 # 插件：插件基础配置。
-enabled = false  # 是否启用插件
+enabled = false  # 是否启用插件（复制成 config.toml 后改成 true）
 config_version = "1.0.0"  # 配置版本
 
 [paths]
@@ -18,12 +22,12 @@ windbot_dir = "clients/windbot"  # WindBot 工作目录，需要包含 Decks/ �
 cards_cdb = "clients/ygopro/cards.cdb"  # cards.cdb 路径；留空则用 ygopro 工作目录下的同名文件
 card_art_dir = "clients/art/Art"  # 卡图目录（查房出图与发卡图用；缺图会退到 card_art_fallback_dir，再缺就画卡名框）
 card_art_fallback_dir = "clients/art/Closeup"  # 备用卡图目录（大图；Art 里没有的卡常在这里能找到）
-windbot_src_dir = ""  # 【可选】WindBot 源码树（含 WindBot.csproj）：自己或 agent 写的执行器要在这里编译，玩法见 executors/README.md；不填就用现成的 exe
+windbot_src_dir = ""  # 【可选】WindBot 源码树（含 WindBot.csproj）：自己或 agent 写的执行器要在这里编译，玩法见 executors/README.md
 
 [duel]
 # 对局：开房、播报与局内说话。
-# **这里只有群主要用的十项**；AI 教练、常驻房、空闲约战、训练用模型、房间规则这些内部参数
-# 仍在代码里（老配置里写过的键照旧能读），只是不再出现在配置页与这份模板上。
+# **这里只有群主要用的十项**；AI 教练、房间规则这些内部参数仍在代码里
+# （老配置里写过的键照旧能读），只是不再出现在配置页与这份模板上。
 bot_name = "麦麦"  # bot 在对局中显示的名字
 public_host = ""  # 发给群友的服务器地址；留空自动探测局域网地址（做内网穿透时填隧道域名/公网地址）
 public_port = 0  # 发给群友的端口；0 表示用闸门监听端口（隧道公网端口与本地不同时填这里）
@@ -36,6 +40,6 @@ taunt_enabled = false  # 局内是否按概率说挑衅台词（默认关：开�
 taunt_lines = []  # 挑衅台词池（集合，一条一句）；留空用内置的 20 句（duel/taunts.py）
 
 [wiki]
-# 百科检索：查卡 / 解析卡组码 / 发卡图（原「游戏王百科检索」插件）
+# 百科检索：查卡 / 发卡图
 endpoint = "https://ygocdb.com/api/v0/"  # 查卡接口地址（ygocdb 兼容；换自建/镜像时改这里，末尾带斜杠）
 timeout = 15  # 在线接口超时时间（秒）：查卡与取卡图都用它

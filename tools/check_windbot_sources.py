@@ -73,14 +73,21 @@ def _default_source() -> Path:
 
 
 def _configured_source() -> Optional[Path]:
-    """插件 config.toml 里的 `paths.windbot_src_dir`（相对路径按插件目录解析）。"""
+    """插件配置里的 `paths.windbot_src_dir`（相对路径按插件目录解析）。
+
+    配置优先读本机的 ``config.toml``；仓库里只有模板 ``config.toml.example`` 时读模板
+    （那份的 `windbot_src_dir` 默认是空的，`_default_source` 会据此给出明确报错）。
+    """
 
     if not _PLUGIN_ROOT.is_dir():
         return None
+    config = _PLUGIN_ROOT / "config.toml"
+    if not config.is_file():
+        config = _PLUGIN_ROOT / "config.toml.example"
     try:
         import tomllib
 
-        data = tomllib.loads((_PLUGIN_ROOT / "config.toml").read_text(encoding="utf-8"))
+        data = tomllib.loads(config.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     raw = str((data.get("paths") or {}).get("windbot_src_dir") or "").strip()

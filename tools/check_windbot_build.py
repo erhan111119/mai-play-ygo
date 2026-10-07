@@ -26,8 +26,26 @@ import shutil
 import sys
 
 
+def pick_config_file(plugin_root: Path) -> Path:
+    """挑出要读的配置文件：本机的 ``config.toml``，没复制过就用仓库里的模板。
+
+    仓库里只放 `config.toml.example`（真正在跑的 config.toml 是本地文件、已 gitignore），
+    所以新克隆的仓库上直接跑工具时按模板的默认值来（路径指向自带的 `clients/`），
+    并且**说一声**用的是哪份，免得"我明明改了路径却没生效"。
+    """
+
+    config = plugin_root / "config.toml"
+    if config.is_file():
+        return config
+    example = plugin_root / "config.toml.example"
+    if example.is_file():
+        print(f"（没找到 {config.name}，按模板 {example.name} 的默认值来；要改路径就复制一份 config.toml）")
+        return example
+    raise SystemExit(f"既没有 {config} 也没有 {example}：请从仓库里复制 config.toml.example 成 config.toml")
+
+
 def _read_paths(config: Path) -> Tuple[str, str]:
-    """从 config.toml 里取出 ``windbot_executable`` 与 ``windbot_src_dir``（只解析这两行）。"""
+    """从配置文件里取出 ``windbot_executable`` 与 ``windbot_src_dir``（只解析这两行）。"""
 
     if not config.is_file():
         raise SystemExit(f"读不到 {config}")
@@ -109,7 +127,7 @@ def main() -> int:
     args = parser.parse_args()
 
     plugin_root = Path(args.plugin_root)
-    executable, source_dir = _read_paths(plugin_root / "config.toml")
+    executable, source_dir = _read_paths(pick_config_file(plugin_root))
     target = Path(executable)
     built = Path(source_dir) / "bin" / "Release" / "WindBot.exe"
     runtime = _resolve_runtime(target, source_dir)

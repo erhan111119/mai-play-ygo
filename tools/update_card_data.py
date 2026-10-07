@@ -109,11 +109,19 @@ class UpdateError(RuntimeError):
 
 
 def load_config_paths(plugin_root: Path) -> Dict[str, str]:
-    """从插件 config.toml 里读路径（与其它工具一致）。"""
+    """从插件配置里读路径（与其它工具一致）。
+
+    优先读本机的 ``config.toml``；没复制过就读仓库里的模板 ``config.toml.example``
+    （模板里的路径默认指向自带的 `clients/`，所以新克隆的仓库上也能直接跑）。
+    """
 
     import tomllib
 
     config_path = plugin_root / "config.toml"
+    if not config_path.is_file():
+        config_path = plugin_root / "config.toml.example"
+        if config_path.is_file():
+            print(f"（没找到 config.toml，按模板 {config_path.name} 的默认路径来）")
     if not config_path.is_file():
         return {}
     with config_path.open("rb") as handle:

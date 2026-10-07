@@ -132,7 +132,12 @@ def _load_plugin_module():
 
 
 def test_config_model_builds_and_matches_toml() -> None:
-    """配置模型必须能给每个字段生成默认值，且与 config.toml 的节保持一致。"""
+    """配置模型必须能给每个字段生成默认值，且与模板 ``config.toml.example`` 的节保持一致。
+
+    ⚠ 校验的是**模板**而不是本机的 `config.toml`：仓库里只放 `config.toml.example`，
+    真正在跑的那份是本地文件（已 gitignore，可能钉了内部参数、还带隧道地址），
+    拿它当"模板校验"会把本机配置误判成模板写错。
+    """
 
     plugin_module = _load_plugin_module()
     config_model = plugin_module.MaiPlayYgoConfig
@@ -149,16 +154,16 @@ def test_config_model_builds_and_matches_toml() -> None:
     # 版本号保持 1.0.0 不变（2026-10-07 精简掉 AI 打牌/训练/常驻房，但不改配置版本）。
     assert defaults.plugin.config_version == "1.0.0"  # 合并成「麦麦玩游戏王」后重新从 1.0.0 起版
 
-    with (_PLUGIN_ROOT / "config.toml").open("rb") as handle:
+    with (_PLUGIN_ROOT / "config.toml.example").open("rb") as handle:
         toml_data = tomllib.load(handle)
-    assert set(toml_data) >= {"plugin", "paths", "duel", "wiki"}, "config.toml 缺少必要的配置节"
+    assert set(toml_data) >= {"plugin", "paths", "duel", "wiki"}, "配置模板缺少必要的配置节"
     assert toml_data["plugin"]["config_version"] == defaults.plugin.config_version, (
-        "config.toml 的 config_version 与代码默认值不一致，会导致每次启动都触发配置迁移"
+        "配置模板的 config_version 与代码默认值不一致，会导致每次启动都触发配置迁移"
     )
 
-    # config.toml 里出现的键必须在模型里有对应字段，否则是写错了名字
+    # 模板里出现的键必须在模型里有对应字段，否则是写错了名字
     model_fields = set(config_model.model_fields)
-    assert set(toml_data) <= model_fields, f"config.toml 存在模型里没有的节：{set(toml_data) - model_fields}"
+    assert set(toml_data) <= model_fields, f"配置模板存在模型里没有的节：{set(toml_data) - model_fields}"
     for section in ("paths", "duel", "wiki"):
         section_model = config_model.model_fields[section].annotation
         assert section_model is not None
@@ -259,7 +264,9 @@ def test_plugin_exposes_expected_tools() -> None:
         "ygo_cmd_brain_mode",
     ):
         assert removed_command not in commands, f"{removed_command} 应当已删除，实际有 {sorted(commands)}"
-    for guarded in ("ygo_cmd_deck_clear", "ygo_cmd_bot_name"):
+    # 破坏性/全局性的指令要声明管理员权限：清空与改名会动全局数据，
+    # 删卡组是**跨群**删除（卡组池共享，列表里看得见别群的投稿）
+    for guarded in ("ygo_cmd_deck_clear", "ygo_cmd_bot_name", "ygo_cmd_deck_delete"):
         assert guarded in commands, f"缺少指令 {guarded}"
         assert commands[guarded]["metadata"].get("permission") == "operator", (
             f"指令 {guarded} 会改动全局数据，应当声明 permission=operator"

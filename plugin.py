@@ -1312,17 +1312,18 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
     @Command(
         "ygo_cmd_deck_delete",
-        description="删除一副投稿卡组（卡组池是全局共享的：看到哪副就能删哪副）",
+        description="删除一副投稿卡组（卡组池全局共享，删除范围不限本群；需管理员）",
         pattern=r"^/删卡组\s+\S",
+        permission="operator",
     )
     async def cmd_deck_delete(
         self, text: str = "", stream_id: str = "", group_id: str = "", **kwargs: Any
     ) -> Tuple[bool, str, int]:
         """按编号或名字删除一副投稿。
 
-        ⚠ **删除范围是全局的**（不限本群）：卡组池共享，列表里看得到别群的投稿，也就删得掉；
-        所以回执里会写明这副牌是谁投的，别群的人删到了会有个提示（评审 2026-10-07 指出这点，
-        但保持"看得到就管得着"是刻意的——按群过滤删除会让同一份列表里有的牌删不掉，更难理解）。
+        ⚠ **删除范围是全局的**（不限本群）：卡组池共享，列表里看得到别群的投稿，也就删得掉。
+        所以这里要管理员权限（2026-10-07 评审两次指出：没有门槛时任何群友都能删掉别群投的牌），
+        回执里也会写明这副牌是谁投的。
         """
 
         del kwargs

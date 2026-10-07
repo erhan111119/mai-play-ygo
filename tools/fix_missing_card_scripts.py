@@ -45,13 +45,19 @@ def _plugin_root() -> Path:
 
 
 def _read_paths(plugin_root: Path) -> Path:
-    """从 config.toml 里读引擎目录（只解析 ``ygopro_dir`` 一行，不引入完整配置层）。"""
+    """从配置里读引擎目录（只解析 ``ygopro_dir`` 一行，不引入完整配置层）。
+
+    优先读本机的 ``config.toml``；没复制过就读仓库里的模板 ``config.toml.example``
+    （模板里的 `ygopro_dir` 指向自带的 `clients/ygopro`）。
+    """
 
     config = plugin_root / "config.toml"
+    if not config.is_file():
+        config = plugin_root / "config.toml.example"
     try:
         text = config.read_text(encoding="utf-8")
     except OSError as exc:
-        raise SystemExit(f"读不到 {config}：{exc}") from exc
+        raise SystemExit(f"读不到 {config}：{exc}（仓库里应有一份 config.toml.example）") from exc
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("ygopro_dir"):

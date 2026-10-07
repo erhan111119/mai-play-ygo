@@ -14,6 +14,9 @@ temp/
 # 本机的配置备份（WebUI 改配置时留下的）：里面有隧道域名/端口/机器路径等个人配置，绝不入库
 config_back/
 
+# 真正在跑的配置：仓库里只放 config.toml.example 模板，本地这份由使用者自己复制/由 WebUI 生成
+config.toml
+
 # 本地安全扫描工具的台账
 .mimosa/
 

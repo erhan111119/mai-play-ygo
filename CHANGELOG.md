@@ -4,6 +4,22 @@
 
 ## 1.0.0
 
+### 上架评审第二次反馈后的收尾（2026-10-07）
+
+* **`/删卡组` 加管理员权限**（`permission="operator"`）：卡组池共享，删除范围是全局的
+  （列表里看得见别群的投稿就删得掉），原来任何群友都能删掉别群投的牌。README 与指令说明同步写明范围与门槛。
+* **配置文件移出版本库**：仓库里只放 `config.toml.example`（模板），真正在跑的 `config.toml`
+  加进 `.gitignore` 由使用者复制/由 WebUI 生成——避免拉代码时和本地配置打架，也不会有人把隧道地址提交上去。
+  四个读配置的工具（`check_windbot_build` / `check_windbot_sources` / `update_card_data` /
+  `fix_missing_card_scripts`）与 manifest 校验测试都改成"没有 config.toml 就用模板的默认值，并说明用的是哪份"。
+* **`duel/netguard.py` 文档改成与实现一致**：原来那段还写着"只允许 https / 自建搜索服务开关"
+  （那套搜索功能早删了）。现在写清：谁在用（查卡接口 + 卡图 CDN）、只允许 http/https、
+  默认只连公网、重定向逐跳校验、响应体上限、代理隧道直接拒绝、连接时校验目标 IP。
+* **README 补两处**：在线卡图的 CDN 域名；插件会以子进程方式拉起 `clients/` 下两个 exe 的用途
+  （ygopro 对局内核 / WindBot 出牌大脑，参数来自配置与常量、不经 shell）。
+* **manifest 描述补许可说明**：随包客户端的来源与许可（ygopro 与卡牌脚本 GPL-2.0、WindBot MIT、
+  卡库与卡图上游未声明许可），以及"不想随包分发可用 setup_clients.py 自行同步"。
+
 ### 上架评审后的修复（2026-10-07）
 
 * **`/清空卡组` 跨群误删**（评审指出的静默出错）：以前按"全池投稿"删 .ydk 文件、却只删本群的数据库行，
