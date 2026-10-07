@@ -47,10 +47,10 @@ python tools/field_image.py --demo --render --out temp/field-demo.html
 
 | 配置项 | 作用 |
 |---|---|
-| `paths.card_art_dir` | 首选卡图目录（默认 `D:\Game\MDPro3\Picture\Art`，约 1.3 万张） |
-| `paths.card_art_fallback_dir` | 备用目录（默认 `Picture\Closeup`；Art 里没有的卡常在这里） |
+| `paths.card_art_dir` | 首选卡图目录（默认插件自带的 `clients/art/Art`；也可以指到你客户端的 `Picture/Art`） |
+| `paths.card_art_fallback_dir` | 备用目录（默认 `clients/art/Closeup`；Art 里没有的卡常在这里） |
 
-两处都找不到 → 画卡名框。`config_version` 1.11.0 起有这两项。
+两处都找不到 → 画卡名框。
 
 ## 数据从哪来
 
