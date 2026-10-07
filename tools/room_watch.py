@@ -23,8 +23,8 @@
 * ``内核脚本报错``（high）——``attempt to call an error function`` / ``[对局进程:err]`` /
   ``[string "./script/…``。这一类＝某张卡的脚本加载失败，那张卡在对局里是白板
   （2026-10-07 异解那局就是这么表现的：能召唤、能送墓，效果全空）。
-* ``插件报错``（high）／``插件警告``（medium）——yugioh 插件自己打出的 error/警告；
-  "被拒绝"这类大模型拒答只记 info。
+* ``插件报错``（high）／``插件警告``（medium）——本插件自己打出的 error/警告（日志名 `plugin.mai-play-ygo`，
+  见 :data:`PLUGIN_LOGGER_PREFIXES`）；"被拒绝"这类大模型拒答只记 info。
 * ``进房未开打``（medium）——玩家进了房间却迟迟没有 ``duel_started``（版本不一致/卡握手）。
 * ``开局未结束``（medium）——``duel_started`` 之后迟迟没有 ``duel_ended``。
 * ``闸门/房间异常``（medium）——闸门、房间启动/收摊报错。
@@ -58,6 +58,12 @@ KERNEL_SCRIPT_PATTERNS = (
 )
 #: 插件警告里"像真问题"的关键词（其余警告只当 info，避免刷屏）
 PLUGIN_PROBLEM_WORDS = ("失败", "错误", "异常", "超时", "占用", "崩溃")
+#: 本插件的日志名：宿主按 ``plugin.<插件 id>`` 命名，插件自己的模块日志也都挂在这个名字下
+#: （实测 2026-10-08 的日志里就是 ``plugin.mai-play-ygo``）。
+#: ⚠ 这里原来写的是合并前的 ``plugin.yugioh.duel-arena`` —— 对不上真实日志名，于是
+#: "插件报错 / 插件警告"三类**永远匹配不到**，看门狗会安静地漏掉真问题（2026-10-07 第五轮评审指出）。
+#: 插件改名时这里要跟着改；`tests/test_room_watch.py` 会拿 `_manifest.json` 的 id 对一遍。
+PLUGIN_LOGGER_PREFIXES = ("plugin.mai-play-ygo",)
 #: 进房后多久还没开打就记一笔（秒）
 JOIN_GRACE_SECONDS = 180
 #: 开局后多久还没结束就记一笔（秒）：房间每股时钟 180 秒，正常局 3~8 分钟
@@ -87,7 +93,7 @@ def classify(logger: str, level: str, event: str) -> Optional[str]:
 
     if any(pattern in event for pattern in KERNEL_SCRIPT_PATTERNS):
         return "内核脚本报错"
-    if logger.startswith("plugin.yugioh.duel-arena"):
+    if logger.startswith(PLUGIN_LOGGER_PREFIXES):
         if level == "error":
             return "插件报错"
         if level == "warning":

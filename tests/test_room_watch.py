@@ -76,13 +76,31 @@ def test_plugin_error_and_warning_noise() -> None:
     """插件 error 记 high；warning 只记"像真问题"的；大模型拒答这类噪声不落账。"""
 
     rows = _run([
-        _line("plugin.yugioh.duel-arena", "error", "开局失败"),
-        _line("plugin.yugioh.duel-arena", "warning", "读卡表失败：卡组 3"),
-        _line("plugin.yugioh.duel-arena", "warning", "生成复盘点评被拒绝：模型拒答"),
-        _line("plugin.yugioh.duel-arena", "info", "房间已就绪，内核端口 52663"),
+        _line("plugin.mai-play-ygo", "error", "开局失败"),
+        _line("plugin.mai-play-ygo", "warning", "读卡表失败：卡组 3"),
+        _line("plugin.mai-play-ygo", "warning", "生成复盘点评被拒绝：模型拒答"),
+        _line("plugin.mai-play-ygo", "info", "房间已就绪，内核端口 52663"),
     ])
     assert [r["category"] for r in rows] == ["插件报错", "插件警告"], rows
     assert rows[0]["severity"] == "high" and rows[1]["severity"] == "medium", rows
+
+
+def test_plugin_logger_prefix_matches_manifest_id() -> None:
+    """分类用的日志名前缀必须跟得上插件 id（2026-10-07 第五轮评审指出）。
+
+    这是那种**静默失效**的错误：合并前这里写的是 `plugin.yugioh.duel-arena`，而宿主现在把本插件的
+    日志挂在 `plugin.mai-play-ygo` 下（实测 2026-10-08 的 `logs/app_*.log.jsonl`：插件自己的消息
+    与两个子进程的转发全在这个名字下）——对不上就意味着"插件报错 / 插件警告"永远不落账，
+    看门狗看着还在跑，真问题一条都记不到。所以拿 `_manifest.json` 的 id 钉住。
+    """
+
+    manifest = json.loads((_PLUGIN_ROOT / "_manifest.json").read_text(encoding="utf-8"))
+    expected = (f"plugin.{manifest['id']}",)
+    assert WATCH.PLUGIN_LOGGER_PREFIXES == expected, (
+        f"room_watch 的日志名前缀失配：{WATCH.PLUGIN_LOGGER_PREFIXES} != {expected}"
+    )
+    # 合并前那个旧名字不能再被认（否则是"改了插件名却忘了改规则"的反向残留）
+    assert not "plugin.yugioh.duel-arena".startswith(WATCH.PLUGIN_LOGGER_PREFIXES)
 
 
 def test_player_joined_but_no_duel_started() -> None:
@@ -92,7 +110,7 @@ def test_player_joined_but_no_duel_started() -> None:
         tmp_path = Path(tmp)
         log = tmp_path / "app_test.log.jsonl"
         log.write_text(
-            _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：玩家 二憨$aN9sW") + "\n",
+            _line("plugin.mai-play-ygo", "info", "有客户端进入房间：玩家 二憨$aN9sW") + "\n",
             encoding="utf-8",
         )
         state = WATCH.WatchState(tmp_path / "state.json")
@@ -109,9 +127,9 @@ def test_join_then_started_is_clean() -> None:
     """进房后正常开打 → 不记任何东西（不能打扰正常游玩）。"""
 
     rows = _run([
-        _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：玩家 二憨$aN9sW"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_started"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_ended"),
+        _line("plugin.mai-play-ygo", "info", "有客户端进入房间：玩家 二憨$aN9sW"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_started"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_ended"),
     ])
     assert [r["category"] for r in rows] == ["对局摘要"], rows      # 只有摘要，没有告警
 
@@ -122,7 +140,7 @@ def test_duel_stuck_open_is_reported_once() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         log = tmp_path / "app_test.log.jsonl"
-        log.write_text(_line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_started") + "\n",
+        log.write_text(_line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_started") + "\n",
                        encoding="utf-8")
         state = WATCH.WatchState(tmp_path / "state.json")
         watcher = WATCH.Watcher(tmp_path, state, tmp_path / "f.jsonl", tmp_path / "r.md")
@@ -142,12 +160,12 @@ def test_idle_side_is_flagged_from_placements() -> None:
     """
 
     rows = _run([
-        _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：机器人 憨憨"),
-        _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：玩家 二憨$aN9sW"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_started"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 1 回合 憨憨（我方） 主怪兽区3 ← 「珠淚哀歌 雪蓮」"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 3 回合 憨憨（我方） 主怪兽区2 ← 「珠淚哀歌 梅露」"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_ended"),
+        _line("plugin.mai-play-ygo", "info", "有客户端进入房间：机器人 憨憨"),
+        _line("plugin.mai-play-ygo", "info", "有客户端进入房间：玩家 二憨$aN9sW"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_started"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 1 回合 憨憨（我方） 主怪兽区3 ← 「珠淚哀歌 雪蓮」"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 3 回合 憨憨（我方） 主怪兽区2 ← 「珠淚哀歌 梅露」"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_ended"),
     ])
     idle = [r for r in rows if r["category"] == "整局无动作"]
     assert len(idle) == 1, rows
@@ -159,10 +177,10 @@ def test_short_duel_without_placements_is_not_flagged() -> None:
     """2 回合就结束的局不判「整局无动作」（可能是正常速杀/投降，不打扰）。"""
 
     rows = _run([
-        _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：玩家 二憨$aN9sW"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_started"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 2 回合 憨憨（我方） 主怪兽区3 ← 「珠淚哀歌 雪蓮」"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_ended"),
+        _line("plugin.mai-play-ygo", "info", "有客户端进入房间：玩家 二憨$aN9sW"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_started"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 2 回合 憨憨（我方） 主怪兽区3 ← 「珠淚哀歌 雪蓮」"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_ended"),
     ])
     assert [r["category"] for r in rows] == ["对局摘要"], rows
 
@@ -174,8 +192,8 @@ def test_identical_event_is_recorded_once_even_in_two_files() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         bad = _line("", "", '[对局进程:err] "CallCardFunction"(c60811211.initial_effect): attempt to call an error function')
-        started = _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_started")
-        ended = _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_ended")
+        started = _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_started")
+        ended = _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_ended")
         (tmp_path / "app_a.log.jsonl").write_text("\n".join([started, bad, ended]) + "\n", encoding="utf-8")
         (tmp_path / "app_b.log.jsonl").write_text("\n".join([started, bad, ended]) + "\n", encoding="utf-8")
         state = WATCH.WatchState(tmp_path / "state.json")
@@ -195,14 +213,14 @@ def test_lobby_name_and_seat_label_are_one_person() -> None:
     """
 
     rows = _run([
-        _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：机器人 憨憨"),
-        _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：玩家 未报名"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_started"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 1 回合 座位0（对方） 主怪兽区4 ← 「威光魔人」"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 1 回合 憨憨（我方） 主怪兽区3 ← 「漫画猫」"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 3 回合 座位0（对方） 主怪兽区2 ← 「瞳之魔女 梦根娜」"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 3 回合 憨憨（我方） 主怪兽区3 ← 「漫画猫」"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_ended"),
+        _line("plugin.mai-play-ygo", "info", "有客户端进入房间：机器人 憨憨"),
+        _line("plugin.mai-play-ygo", "info", "有客户端进入房间：玩家 未报名"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_started"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 1 回合 座位0（对方） 主怪兽区4 ← 「威光魔人」"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 1 回合 憨憨（我方） 主怪兽区3 ← 「漫画猫」"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 3 回合 座位0（对方） 主怪兽区2 ← 「瞳之魔女 梦根娜」"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 3 回合 憨憨（我方） 主怪兽区3 ← 「漫画猫」"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_ended"),
     ])
     assert [r["category"] for r in rows] == ["对局摘要"], rows
 
@@ -215,15 +233,15 @@ def test_renamed_player_between_rooms_is_not_idle() -> None:
     """
 
     rows = _run([
-        _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：机器人 憨憨"),
-        _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：玩家 嘻嘻$aN9sW"),
-        _line("plugin.yugioh.duel-arena", "info", "有客户端进入房间：玩家 库里波是最强的！"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_started"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 1 回合 嘻嘻$aN9sW（对方） 主怪兽区3 ← 「威光魔人」"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 1 回合 憨憨（我方） 主怪兽区3 ← 「漫画猫」"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 3 回合 嘻嘻$aN9sW（对方） 主怪兽区2 ← 「No.59 背反之料理人」"),
-        _line("plugin.yugioh.duel-arena", "info", "落位：第 3 回合 憨憨（我方） 主怪兽区4 ← 「闪刀姬-零衣」"),
-        _line("plugin.yugioh.duel-arena", "info", "对局阶段变化：duel_ended"),
+        _line("plugin.mai-play-ygo", "info", "有客户端进入房间：机器人 憨憨"),
+        _line("plugin.mai-play-ygo", "info", "有客户端进入房间：玩家 嘻嘻$aN9sW"),
+        _line("plugin.mai-play-ygo", "info", "有客户端进入房间：玩家 库里波是最强的！"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_started"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 1 回合 嘻嘻$aN9sW（对方） 主怪兽区3 ← 「威光魔人」"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 1 回合 憨憨（我方） 主怪兽区3 ← 「漫画猫」"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 3 回合 嘻嘻$aN9sW（对方） 主怪兽区2 ← 「No.59 背反之料理人」"),
+        _line("plugin.mai-play-ygo", "info", "落位：第 3 回合 憨憨（我方） 主怪兽区4 ← 「闪刀姬-零衣」"),
+        _line("plugin.mai-play-ygo", "info", "对局阶段变化：duel_ended"),
     ])
     assert [r["category"] for r in rows] == ["对局摘要"], rows
 
@@ -254,8 +272,8 @@ def test_gate_failure_recorded() -> None:
     """闸门/收摊报错要记（high 之外的中等级别，便于和脚本报错区分）。"""
 
     rows = _run([
-        _line("plugin.yugioh.duel-arena", "info", "收摊失败：端口仍被占用"),
-        _line("plugin.yugioh.duel-arena", "warning", "闸门启动失败：端口 7911 被占用"),
+        _line("plugin.mai-play-ygo", "info", "收摊失败：端口仍被占用"),
+        _line("plugin.mai-play-ygo", "warning", "闸门启动失败：端口 7911 被占用"),
     ])
     assert [r["category"] for r in rows] == ["闸门/房间异常", "插件警告"], rows
 

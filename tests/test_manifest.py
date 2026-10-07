@@ -120,7 +120,8 @@ def _load_plugin_module():
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "yugioh_duel_arena_under_test",
+        # 模块名跟着现在的插件 id 走（2026-10-07 第五轮评审顺带指出旧名残留）
+        "mai_play_ygo_under_test",
         str(_PLUGIN_ROOT / "plugin.py"),
         submodule_search_locations=[str(_PLUGIN_ROOT)],
     )
@@ -209,17 +210,29 @@ def test_duel_config_exposes_only_group_owner_items() -> None:
         label = (duel_model.model_fields[name].json_schema_extra or {}).get("label")
         assert label and not label.isascii(), f"{name} 缺中文标签：{label!r}"
 
-    # 配置页看到的十项都要在模板里出现；反过来模板里**不许有拼错的键**
+    # 配置页看到的十项都要在配置里出现；反过来配置里**不许有拼错的键**
     # （以前这里断言"模板里只有这十项"，但本机在跑的 config.toml 是同一份文件：
     #  开发机可以合法地额外钉几个内部参数（bot_debug / no_check_deck 之类），
     #  那条"严格相等"会把"本机配置"当成"模板写错了"。可见面由上面模型级的断言守着。）
-    with (_PLUGIN_ROOT / "config.toml").open("rb") as handle:
-        toml_data = tomllib.load(handle)
-    assert set(visible) <= set(toml_data["duel"]), (
-        f"config.toml 的 [duel] 缺少可见项：{sorted(set(visible) - set(toml_data['duel']))}"
-    )
-    unknown = set(toml_data["duel"]) - set(duel_model.model_fields)
-    assert not unknown, f"config.toml 的 [duel] 有模型里不存在的键：{sorted(unknown)}"
+    #
+    # ⚠ 校验对象：**模板一份必查，本机 `config.toml` 存在时再加查一份**（2026-10-07 第五轮评审指出）：
+    # `config.toml` 恰恰是不入库的那份，原来无条件 open 会让新克隆的仓库与 CI 直接 FileNotFoundError
+    # ——"配置不入库"这条实践不能被自己的测试绊倒。四个 tools 用的是同一套"没有就回落模板"的口径。
+    config_paths = [_PLUGIN_ROOT / "config.toml.example"]
+    local_config = _PLUGIN_ROOT / "config.toml"
+    if local_config.is_file():
+        config_paths.insert(0, local_config)
+    checked: List[str] = []
+    for config_path in config_paths:
+        with config_path.open("rb") as handle:
+            toml_data = tomllib.load(handle)
+        assert set(visible) <= set(toml_data["duel"]), (
+            f"{config_path.name} 的 [duel] 缺少可见项：{sorted(set(visible) - set(toml_data['duel']))}"
+        )
+        unknown = set(toml_data["duel"]) - set(duel_model.model_fields)
+        assert not unknown, f"{config_path.name} 的 [duel] 有模型里不存在的键：{sorted(unknown)}"
+        checked.append(config_path.name)
+    print(f"      （已核对的配置：{'、'.join(checked)}）")
 
 
 def test_plugin_exposes_expected_tools() -> None:

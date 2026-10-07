@@ -2,6 +2,26 @@
 
 > 本文件从「麦麦玩游戏王」1.0.0 起版（合并前的「游戏王对局管家」历史已不随仓库保留）。
 
+## 1.0.3
+
+### 上架评审第五轮收尾（2026-10-07）
+
+这一轮没有阻断项，两条小改动 + 顺手清掉合并前的旧插件名。
+
+* **测试不再依赖不入库的 `config.toml`**：`test_duel_config_exposes_only_group_owner_items`
+  原来无条件 `open("config.toml")`，而 `config.toml` 恰恰是 gitignore 的那份——新克隆的仓库与 CI 上
+  这条会直接 `FileNotFoundError`。现在**模板 `config.toml.example` 一份必查、本机 `config.toml`
+  存在时再加查一份**（与四个 `tools/` 的"没有就回落模板"同一口径），并在输出里写明核对的是哪几份。
+* **看门狗的分类规则改回真实日志名**：`tools/room_watch.py` 原来按 `plugin.yugioh.duel-arena`
+  前缀挑"插件报错/插件警告"，而宿主现在把本插件的日志挂在 **`plugin.mai-play-ygo`** 下
+  （实测 2026-10-08 的 `logs/app_*.log.jsonl`：插件自己的消息与两个子进程的转发全在这个名字下）。
+  对不上就意味着这两类**永远不落账**——本机日志里有 43 条该被归为「插件警告」的记录，
+  旧前缀一条都认不出。现在前缀提成常量 `PLUGIN_LOGGER_PREFIXES`，并加了
+  `test_plugin_logger_prefix_matches_manifest_id` 拿 `_manifest.json` 的 id 钉住，改名时会被测试拦住。
+* **合并前的旧插件名清干净**：`_append_to_planner` 写进机器人上下文的标签从
+  `plugin:yugioh-duel-arena` 改成 `plugin:mai-play-ygo`（它是对外可见的来源标记）；
+  `tools/analyze_replay.py` 导出的 `.ydk` 注释头、测试里的模块别名与合成包名也一并改成新名。
+
 ## 1.0.2
 
 > 上架评审第四轮。三条都处理了，其中前两条是"定结论"，第三条是修回退风险。

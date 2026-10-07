@@ -1937,7 +1937,9 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 stream_id,
                 [{"type": "text", "data": text}],
                 visible_text=text,
-                source_kind="plugin:yugioh-duel-arena",
+                # 标签用合并后的插件名（2026-10-07 第五轮评审指出旧名残留）：
+                # 它会被写进机器人上下文的来源标记，对不上现在注册的插件 id 会让追溯变难
+                source_kind="plugin:mai-play-ygo",
             )
         except Exception:  # noqa: BLE001  注入失败不应影响已经发出的播报
             if self._logger is not None:

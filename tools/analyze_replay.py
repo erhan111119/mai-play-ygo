@@ -256,7 +256,8 @@ def parse_replay(path: Path) -> ReplayInfo:
 def write_ydk(deck: DeckList, target: Path) -> None:
     """把一方的卡表写成 ``.ydk``（可以直接投稿进卡组池）。"""
 
-    lines = ["#created by yugioh-duel-arena", "#main"]
+    # 注释头用现在的插件名（合并前写的是 yugioh-duel-arena，2026-10-07 第五轮评审顺带指出）
+    lines = ["#created by mai-play-ygo", "#main"]
     lines.extend(str(card_id) for card_id in deck.main)
     lines.append("#extra")
     lines.extend(str(card_id) for card_id in deck.extra)

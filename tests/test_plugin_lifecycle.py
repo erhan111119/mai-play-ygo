@@ -191,7 +191,7 @@ class FakeContext:
         import logging
 
         self.paths = type("Paths", (), {"data_dir": data_dir, "runtime_dir": data_dir / "runtime"})()
-        self.logger = logging.getLogger("test.yugioh.duel-arena")
+        self.logger = logging.getLogger("test.mai-play-ygo")
         self.send = FakeSend()
         self.maisaka = FakeMaisaka()
         self.llm = FakeLlm()
@@ -203,7 +203,8 @@ def load_plugin_module():
     """按宿主加载器的方式导入 plugin.py 并返回模块。"""
 
     spec = importlib.util.spec_from_file_location(
-        "yugioh_duel_arena_lifecycle",
+        # 模块名跟着现在的插件 id 走（2026-10-07 第五轮评审顺带指出旧名残留）
+        "mai_play_ygo_lifecycle",
         str(_PLUGIN_ROOT / "plugin.py"),
         submodule_search_locations=[str(_PLUGIN_ROOT)],
     )
@@ -401,7 +402,7 @@ def test_plugin_imports_without_plugin_root_on_sys_path() -> None:
 
     护栏（实测把线上打挂了）：插件自己的模块只能相对导入同包内的东西。宿主的运行器不会把
     插件根目录放进 ``sys.path``，所以 ``from train.plan import ...`` 这种绝对导入会让整个插件
-    **加载失败**（日志里是一行 ``加载插件失败 [yugioh.duel-arena]: No module named 'train'``，
+    **加载失败**（日志里是一行 ``加载插件失败 [mai-play-ygo]: No module named 'train'``，
     表现就是"没法打牌了"）。而单元测试全都自己补了 ``sys.path``，所以本地一片绿、线上直接挂——
     这个测试专门用子进程重现宿主的环境，把这类错拦在提交之前。
     """
@@ -423,7 +424,7 @@ def test_plugin_imports_without_plugin_root_on_sys_path() -> None:
         "    if extra.is_dir() and str(extra) not in sys.path:\n"
         "        sys.path.insert(0, str(extra))\n"
         "assert str(plugin_dir) not in sys.path, '这个测试的前提是插件根目录不在 sys.path 上'\n"
-        "name = 'plugins.yugioh-duel-arena'\n"
+        "name = 'plugins.mai-play-ygo'\n"
         "spec = importlib.util.spec_from_file_location(\n"
         "    name + '.plugin', plugin_dir / 'plugin.py', submodule_search_locations=[str(plugin_dir)])\n"
         "module = importlib.util.module_from_spec(spec)\n"
