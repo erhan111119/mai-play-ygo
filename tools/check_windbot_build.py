@@ -44,6 +44,21 @@ def pick_config_file(plugin_root: Path) -> Path:
     raise SystemExit(f"既没有 {config} 也没有 {example}：请从仓库里复制 config.toml.example 成 config.toml")
 
 
+def _config_value(raw: str) -> str:
+    """取 ``key = "值"  # 注释`` 里的那个值（**行尾注释必须丢掉**）。
+
+    配置模板每一行都带行内注释，而"只解析这两行"的朴素写法会把注释一起当成路径：
+    实测（2026-10-07）`clients/windbot/WindBot.exe"  # WindBot.exe 路径（…）` 被判成
+    "文件不存在"，于是每次都报"编译产物还没同步"。
+    """
+
+    text = raw.strip()
+    for quote in ('"', "'"):
+        if text.startswith(quote) and text.count(quote) >= 2:
+            return text[1:text.rindex(quote)]
+    return text.split("#", 1)[0].strip()
+
+
 def _read_paths(config: Path) -> Tuple[str, str]:
     """从配置文件里取出 ``windbot_executable`` 与 ``windbot_src_dir``（只解析这两行）。"""
 
@@ -54,9 +69,9 @@ def _read_paths(config: Path) -> Tuple[str, str]:
     for line in config.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line.startswith("windbot_executable"):
-            executable = line.partition("=")[2].strip().strip('"').replace("\\\\", "\\")
+            executable = _config_value(line.partition("=")[2]).replace("\\\\", "\\")
         elif line.startswith("windbot_src_dir"):
-            source_dir = line.partition("=")[2].strip().strip('"').replace("\\\\", "\\")
+            source_dir = _config_value(line.partition("=")[2]).replace("\\\\", "\\")
     if not executable or not source_dir:
         raise SystemExit(f"{config} 里缺 windbot_executable 或 windbot_src_dir")
     return executable, source_dir

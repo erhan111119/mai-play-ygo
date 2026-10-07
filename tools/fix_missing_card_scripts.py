@@ -62,10 +62,22 @@ def _read_paths(plugin_root: Path) -> Path:
         line = line.strip()
         if line.startswith("ygopro_dir"):
             _, _, value = line.partition("=")
-            path = value.strip().strip('"').strip("'").replace("\\\\", "\\")
+            # ⚠ 模板每一行都带行内注释（`ygopro_dir = "…"  # 引擎目录`），注释必须丢掉，
+            # 否则路径里会带上 `"  # 引擎目录` 这段字（实测 2026-10-07）。
+            path = _config_value(value).replace("\\\\", "\\")
             if path:
                 return Path(path)
     raise SystemExit(f"{config} 里没有 ygopro_dir")
+
+
+def _config_value(raw: str) -> str:
+    """取 ``key = "值"  # 注释`` 里的那个值（行尾注释丢掉；带引号就取引号里的）。"""
+
+    text = raw.strip()
+    for quote in ('"', "'"):
+        if text.startswith(quote) and text.count(quote) >= 2:
+            return text[1:text.rindex(quote)]
+    return text.split("#", 1)[0].strip()
 
 
 def similarity(left: str, right: str) -> float:

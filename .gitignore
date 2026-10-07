@@ -37,3 +37,6 @@ clients/art/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 工具同步/备份客户端时留下的 .bak（只在本地，仓库里不留备份）
+*.bak
