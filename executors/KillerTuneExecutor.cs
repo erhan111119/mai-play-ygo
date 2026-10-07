@@ -142,11 +142,20 @@ namespace WindBot.Game.AI.Decks
             //    * 其余额外怪：计划进行中一律先放一放（响度战争会吃「再混音手」）。
             //    这些规则只对**点名的卡**生效：基类那条笼统的 SpSummon（DefaultNoExecutor）会自动
             //    让位给点名规则，正好用来做"这一只先别出"；没有计划时全部放行，维持"能做就做"。
-            AddExecutor(ExecutorType.SpSummon, CardId.TrackMaker, AllowTrackMakerSummon);
-            AddExecutor(ExecutorType.SpSummon, CardId.Remixer, AllowRemixerSummon);
+            // ⑨ **手坑预算**（2026-10-07 群友实测口径："两只兔子做场拿一只当素材用是没有问题的，
+            //    但全用掉就有点难崩了"）：额外卡组这十只的召唤闸门都先过一遍
+            //    `AllowExtraSummonKeepingHandTrap()`——只剩最后一张手坑、而这次召唤只能靠它凑素材时
+            //    否掉这次召唤，把手坑留着打断对面（见那个方法的注释里有实测日志）。
+            //    ⚠ 必须**包在既有的点名闸门里**：基类那条笼统的 SpSummon 只对"没有点名规则的卡"生效，
+            //      而点名规则之间是"先注册的先说话"——另起一条预算规则会在既有闸门说 true 时被跳过。
+            AddExecutor(ExecutorType.SpSummon, CardId.TrackMaker,
+                () => AllowExtraSummonKeepingHandTrap() && AllowTrackMakerSummon());
+            AddExecutor(ExecutorType.SpSummon, CardId.Remixer,
+                () => AllowExtraSummonKeepingHandTrap() && AllowRemixerSummon());
             // 「锁缚龙」：两卡线的指定终端，但**素材到位之前先别出**（见 AllowLockDragonSummon）。
             // 它不在 OffPlanExtraMonsters 里（它不是"浪费素材"，是线的收尾），所以单独一条闸门。
-            AddExecutor(ExecutorType.SpSummon, CardId.LockDragonLock, AllowLockDragonSummon);
+            AddExecutor(ExecutorType.SpSummon, CardId.LockDragonLock,
+                () => AllowExtraSummonKeepingHandTrap() && AllowLockDragonSummon());
             // ⚠ 这张表**原来只声明了、没有注册**（2026-10-05 发现）：没有专属规则时，基类那条笼统的
             // SpSummon（谓词 `DefaultNoExecutor`）会对这些卡生效，而且它在 Executors 里排在前面
             // （基类构造函数先跑）——所以"计划进行中先放一放"从来没生效过。实测后果：走「提示员线」的
@@ -155,7 +164,8 @@ namespace WindBot.Game.AI.Decks
             // 这些规则只在**自己的回合+计划进行中**生效（`PlanActive()` 里判了 `Duel.Player == 0`），
             // 所以对手回合照样能做这些阻抗件。
             foreach (int cardId in OffPlanExtraMonsters)
-                AddExecutor(ExecutorType.SpSummon, cardId, AllowOtherExtraSummon);
+                AddExecutor(ExecutorType.SpSummon, cardId,
+                    () => AllowExtraSummonKeepingHandTrap() && AllowOtherExtraSummon());
             // ⚠ 按验收口径（**终端件数 + 一回合能对对面展开的阻抗次数**）修正：
             // 原来这里把"其余额外怪"整轮锁死，等于把**阻抗资源也锁掉了**——响度战争/红印鉴/B2B/鲜花
             // 本身就是场上的阻抗件（各带 1 次②的打断），而对面一动手它又出不来，纯亏。
@@ -623,6 +633,38 @@ namespace WindBot.Game.AI.Decks
         }
 
         /// <summary>
+        /// 「锁缚龙 锁镰」② 的选支顺序：**康对面的那个效果，永远别康自己的**（2026-10-07 群友实测问题）。
+        ///
+        /// 脚本 `c4891376.lua:58-60` 的两支分别指向链上相邻的两环：
+        /// * k2 → `Duel.NegateEffect(ev)`＝**锁缚龙连锁的那个效果**（链上倒数第 1 个）；
+        /// * k3 → `Duel.NegateEffect(ev-1)`＝**那个效果连锁的卡的效果**（链上倒数第 2 个）。
+        /// 哪一支是"对面的效果"取决于连锁怎么排：
+        /// * 锁缚龙**直接连锁对手**的效果（教程之外最常见的场面）→ 倒数第 1 个是对面的 → **k2**；
+        /// * 自己先用速攻「同调」垫了一环、锁缚龙再康链根（教程 §四 的 C2/C3）→ 倒数第 1 个是自己的、
+        ///   倒数第 2 个才是对面的 → **k3**。
+        ///
+        /// 归属从 `Duel.CurrentChainInfo` 逐环读（每一环都带 `ActivatePlayer`）。自己的那一环可能已经进链、
+        /// 也可能还没进，所以先按卡号把它认出来再往前数。两环都不是对面的（判不出来）就退回原来的口径
+        /// （先 k3）——那种局面本来就不该发锁缚龙，闸门见 :meth:`Activate` 里 `InterruptionCards` 那条。
+        /// </summary>
+        private int[] LockDragonOptionOrder()
+        {
+            IList<ChainInfo> chain = Duel.CurrentChainInfo;
+            int last = chain == null ? -1 : chain.Count - 1;
+            if (last >= 0 && IsSameCard(chain[last].RelatedCard, CardId.LockDragonLock))
+                last--;     // 自己已经进链：往前退一环，`last` 才是"锁缚龙连锁的那个效果"
+            bool topIsEnemy = last >= 0 && chain[last].ActivatePlayer == 1;
+            bool rootIsEnemy = last - 1 >= 0 && chain[last - 1].ActivatePlayer == 1;
+            if (_verbose)
+                Logger.WriteLine("[探针] 锁缚龙选支：链上倒数"
+                    + (topIsEnemy ? "第 1 个是对面的 → k2" : rootIsEnemy ? "第 2 个是对面的 → k3" : "两环都不是对面的 → 退回 k3")
+                    + "（链长 " + (chain == null ? 0 : chain.Count) + "）");
+            if (topIsEnemy)
+                return OptionValues(CardId.LockDragonLock, 2, 3);
+            return OptionValues(CardId.LockDragonLock, 3, 2);
+        }
+
+        /// <summary>
         /// 分支卡的"想要哪一支"——按**正在结算（认不出来时＝正在发动）的那张卡**认，
         /// 逐张对过 `ygopro/script` 下的卡脚本（2026-10-05 复核）。数组顺序＝优先级：先试第一个，
         /// 命中就用（某一支因为条件不成立被脚本压缩掉时会自动落到下一支——见 <see cref="OnSelectOption"/>）。
@@ -675,14 +717,19 @@ namespace WindBot.Game.AI.Decks
             // 结果一致，单独登记是为了不再依赖通用逻辑。
             if (IsSameCard(effect, CardId.BackToBack))
                 return new int[] { OptionSpecialSummon, OptionAddToHand };
-            // 「锁缚龙 锁镰」②：优先**无效"被连锁的效果"**（k3，`c4891376.lua:58-60` 的
-            // `{b2,aux.Stringid(id,3),2}`，判据是 `Duel.IsChainDisablable(ev-1)`＝链上更早的那个效果）。
-            // 教程 §四 的用法就是"C2 速攻「同调」、C3 锁缚龙康对手 C1"——康的是链的根源那张牌
-            // （无效并破坏＝对面少一张牌）；k2（`IsChainDisablable(ev)`＝链上最新发动的那个）当后备。
-            // ⚠ 两支只有在"最新两个连锁都是对面的、且都能无效"时才会同时列出来，那时选哪个更优
-            // **待探针/对局验证**（当前口径＝跟着教程康根源）。
+            // 「锁缚龙 锁镰」②：**按连锁归属选支**——康对面的那个效果，别康自己的（见 :meth:`LockDragonOptionOrder`）。
+            // 脚本 `c4891376.lua:58-60`：
+            //   k2＝`{b1,aux.Stringid(id,2),1}` → `NegateEffect(ev)`＝无效**锁缚龙连锁的那个效果**；
+            //   k3＝`{b2,aux.Stringid(id,3),2}` → `NegateEffect(ev-1)`＝无效**那个效果连锁的卡的效果**。
+            // ⚠ 原来这里写死 `OptionValues(…, 3, 2)`（先 k3）：那个顺序来自教程 §四 的"C2 速攻「同调」、
+            // C3 锁缚龙康对手 C1"——链根是**对手**的牌，所以 k3 对。但锁缚龙**直接连锁对手效果**时
+            // （链根是自己的牌）k3 就打到自己人身上了：2026-10-07 群友实测（日志
+            // `MaiBot/logs/app_20261007_211344.log.jsonl` 21:59:36）链是
+            // `[再混音手②(我方), 结晶魔术 光之泪(对手), 锁缚龙(我方)]`，两个选项都给全了
+            // `options=[78262018,78262019]`（k2,k3），执行器按登记顺序命中 k3 → 无效并破坏了自己的
+            // 「再混音手」，对手的「光之泪」照样结算（43 秒后拉出「魔女术师傅·玻璃女巫」）。
             if (IsSameCard(effect, CardId.LockDragonLock))
-                return OptionValues(CardId.LockDragonLock, 3, 2);
+                return LockDragonOptionOrder();
             // 「三战之才」①：先"抽 2"（k0）。`c25311006.lua:26-45` 的 ops 表是**动态拼**的
             // （`ops[off]=aux.Stringid(25311006,k)`，只把"这一支做得出来"的列进去），所以要按值逐支回落：
             // k0＝抽 2（唯一与对面场面无关、一定列得出来）、k1＝夺 1 只控制权到结束阶段、k2＝看对方手卡回卡组。
@@ -1881,8 +1928,18 @@ namespace WindBot.Game.AI.Decks
         public override IList<ClientCard> OnSelectSynchroMaterial(IList<ClientCard> cards,
             IList<ClientCard> mandatoryCards, int sum, int min, int max)
         {
-            if (cards == null || cards.Count == 0 || sum <= 0)
+            if (cards == null || cards.Count == 0)
                 return null;
+            if (sum <= 0)
+            {
+                // "等级和"已经由内核定死的那条提示（`HintMsg.SynchroMaterial` 走 `GameAI` 的 OnSelectCard
+                // 分支时 sum=0）：没有组合可枚举，按同一套打分挑最省心的 `min` 张。
+                // ⚠ 这条路径以前是**一律 return null 交给基类**——基类按内核给的顺序拿，
+                // 正好把「幽鬼兔 / 屋敷童」当 3 星素材垫进去：2026-10-07 群友实测的三次手坑被烧
+                // （`MaiBot/logs/app_20261007_211344.log.jsonl` 21:59:07 / 21:59:27 / 21:59:28）
+                // 就是从这儿走的，而 sum>0 那条路径的打分（下面的 -10）根本没机会跑。
+                return PickMaterialsByScore(cards, min);
+            }
 
             List<List<ClientCard>> combos = Util.GetSynchroMaterials(cards, sum, 1, 0, true, true);
             if (combos.Count == 0)
@@ -1894,29 +1951,7 @@ namespace WindBot.Game.AI.Decks
             {
                 int score = -combo.Count;               // 素材越少越省
                 foreach (ClientCard card in combo)
-                {
-                    if (card.Location == CardLocation.Hand)
-                    {
-                        // **手坑不能当同调素材**：教程里它们是留着（对手回合还能被「再混音手」回收）的阻抗，
-                        // 不是同调的肥料。原来一律给 +5，实测（提示员线第 1 回合）「场上的提示员 3★ +
-                        // 手牌幽鬼兔 3★」比「提示员 3★ + 场上的旋钮手 1★」高 2 分 → 烧掉幽鬼兔做了 6★
-                        // 响度战争，该出的 4★「音轨制作人」（① 检索场地，教程每条单卡线都从它开始）
-                        // 没了，整条线从第 2 步就断。
-                        score += IsHandTrap(card) ? -10 : 5;
-                    }
-                    if (IsArchetypeCard(card))
-                        score += 3;                     // 本家：送墓会触发效果
-                    // 走线时把"这条线要留的东西"也计进去：**场上的「唱片师」别当素材**（教程要的是
-                    // "混音手（场上）+ 3 星（手卡）"那一次，唱片师留着站场），**场上的「混音手」优先当素材**
-                    // （它是 5 星的指定素材）。不加这两条时两种组合同分，枚举顺序一偏就把唱片师吃掉。
-                    if (PlanActive() && card.Controller == 0 && card.Location == CardLocation.MonsterZone)
-                    {
-                        if (card.IsCode(CardId.Recordist) || card.IsOriginalCode(CardId.Recordist))
-                            score -= 4;
-                        if (card.IsCode(CardId.Mixer) || card.IsOriginalCode(CardId.Mixer))
-                            score += 3;
-                    }
-                }
+                    score += MaterialScore(card);
                 if (score > bestScore)
                 {
                     bestScore = score;
@@ -1929,10 +1964,160 @@ namespace WindBot.Game.AI.Decks
             return best;
         }
 
+        /// <summary>
+        /// 单张素材的"省心分"（越高越优先）：场上的本家件优先、手坑垫底，走线时还要避开该留的牌。
+        ///
+        /// **手坑的罚分分两档**（2026-10-07 群友实测口径："拿一只当素材没问题，全用掉就难崩"）：
+        /// * 用掉它**不会**让手牌清空 → ‑10（原来只有这一档）；
+        /// * 用完就**一张手坑都不剩** → ‑10000（实战意义上是"别的素材都能凑就别动它"）。
+        /// </summary>
+        private int MaterialScore(ClientCard card)
+        {
+            int score = 0;
+            if (card.Location == CardLocation.Hand)
+            {
+                // **手坑不能当同调素材**：教程里它们是留着（对手回合还能被「再混音手」回收）的阻抗，
+                // 不是同调的肥料。原来一律给 +5，实测（提示员线第 1 回合）「场上的提示员 3★ +
+                // 手牌幽鬼兔 3★」比「提示员 3★ + 场上的旋钮手 1★」高 2 分 → 烧掉幽鬼兔做了 6★
+                // 响度战争，该出的 4★「音轨制作人」（① 检索场地，教程每条单卡线都从它开始）
+                // 没了，整条线从第 2 步就断。
+                if (IsHandTrap(card))
+                    score += HandTrapsInHand() <= 1 ? -10000 : -10;
+                else
+                    score += 5;
+            }
+            if (IsArchetypeCard(card))
+                score += 3;                     // 本家：送墓会触发效果
+            // 走线时把"这条线要留的东西"也计进去：**场上的「唱片师」别当素材**（教程要的是
+            // "混音手（场上）+ 3 星（手卡）"那一次，唱片师留着站场），**场上的「混音手」优先当素材**
+            // （它是 5 星的指定素材）。不加这两条时两种组合同分，枚举顺序一偏就把唱片师吃掉。
+            if (PlanActive() && card.Controller == 0 && card.Location == CardLocation.MonsterZone)
+            {
+                if (card.IsCode(CardId.Recordist) || card.IsOriginalCode(CardId.Recordist))
+                    score -= 4;
+                if (card.IsCode(CardId.Mixer) || card.IsOriginalCode(CardId.Mixer))
+                    score += 3;
+            }
+            return score;
+        }
+
+        /// <summary>
+        /// 从候选里按"省心分"挑 `count` 张（`sum<=0` 那条提示用：内核只给了候选与张数）。
+        /// **以内核给的顺序为基线**（越靠前越优先）——候选里没有手坑时，结果与基类
+        /// `GetSelectedCards()` 完全一致，只有"手坑垫在后面"这一处差别，改动面最小。
+        /// </summary>
+        private IList<ClientCard> PickMaterialsByScore(IList<ClientCard> cards, int count)
+        {
+            if (count <= 0 || cards.Count < count)
+                return null;
+            List<KeyValuePair<int, ClientCard>> pool = new List<KeyValuePair<int, ClientCard>>();
+            for (int i = 0; i < cards.Count; ++i)
+                pool.Add(new KeyValuePair<int, ClientCard>(-i + MaterialScore(cards[i]), cards[i]));
+            pool.Sort((left, right) => right.Key.CompareTo(left.Key));
+            List<ClientCard> picked = new List<ClientCard>();
+            for (int i = 0; i < count; ++i)
+                picked.Add(pool[i].Value);
+            return picked;
+        }
+
         /// <summary>这张卡是不是手坑（<see cref="HandTraps"/> 里那些）——它们不做同调素材。</summary>
         private static bool IsHandTrap(ClientCard card)
         {
             return IsAny(card, HandTraps);
+        }
+
+        /// <summary>手牌里还剩几张手坑——这是对手回合的阻抗，不是同调肥料。</summary>
+        private int HandTrapsInHand()
+        {
+            int count = 0;
+            foreach (ClientCard card in Bot.Hand)
+            {
+                if (IsHandTrap(card))
+                    count++;
+            }
+            return count;
+        }
+
+        /// <summary>这批素材里会烧掉几张手坑（只数**手卡里**的，场上的手坑已经不算阻抗了）。</summary>
+        private static int HandTrapsUsed(IEnumerable<ClientCard> materials)
+        {
+            int count = 0;
+            foreach (ClientCard card in materials)
+            {
+                if (card != null && card.Location == CardLocation.Hand && IsHandTrap(card))
+                    count++;
+            }
+            return count;
+        }
+
+        /// <summary>
+        /// 不烧手坑的话，这个等级凑得出来吗？
+        ///
+        /// 只看"等级和"，**不校验调整 / 同调素材那些具体条件**——判不准时宁可回答"凑得出来"：
+        /// 那样只是维持原来"能做就做"的行为，不会凭空少做场（宁放过、不误杀）。
+        /// 素材池＝我方场上的怪 + 手卡里**不是手坑**的调整（卡文写着"场上的这张卡为素材作同调召唤的场合，
+        /// 手卡 1 只调整也能作为同调素材"，所以手卡调整要算；手坑不算——它们正是不想动的那批）。
+        /// </summary>
+        private bool CanReachLevelWithoutHandTrap(int level)
+        {
+            List<int> pool = new List<int>();
+            foreach (ClientCard card in Bot.GetMonsters())
+            {
+                if (card.Controller == 0 && card.Level > 0)
+                    pool.Add(card.Level);
+            }
+            foreach (ClientCard card in Bot.Hand)
+            {
+                if (card.HasType(CardType.Tuner) && !IsHandTrap(card) && card.Level > 0)
+                    pool.Add(card.Level);
+            }
+            int count = pool.Count;
+            if (count > 16)
+                return true;        // 素材太多就不枚举了（这副牌不可能出现）
+            for (int mask = 1; mask < (1 << count); ++mask)
+            {
+                int total = 0;
+                for (int i = 0; i < count; ++i)
+                {
+                    if ((mask & (1 << i)) != 0)
+                        total += pool[i];
+                }
+                if (total == level)
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 额外卡组召唤的"手坑预算"闸门：**别把最后一张手坑做没**。
+        ///
+        /// 用户口径（2026-10-07）："两只兔子做场拿一只当素材用是没有问题的，但全用掉就有点难崩了。"
+        /// 判据（只在**自己回合**、且**不是斩杀回**时生效）：
+        /// * 手上 ≥2 张手坑 → 放行（用掉一张还剩得下）；
+        /// * 手上 0 张手坑 → 放行（没得保）；
+        /// * 只剩 1 张、而这次召唤**只能**靠手坑凑等级 → 否掉，留着它打断对面；
+        /// * 只剩 1 张、但有别的素材凑得出来 → 放行（<see cref="OnSelectSynchroMaterial"/> 的打分会挑别的）。
+        ///
+        /// 为什么要它（实测日志 `MaiBot/logs/app_20261007_211344.log.jsonl` 21:58-21:59）：起手
+        /// 幽鬼兔×2 + 屋敷童，一回合连做 音轨制作人 → 再混音手 → 锁缚龙 三次同调，把三张手坑
+        /// **全部**当素材烧掉（`(0 's 幽鬼兔 from Hand move to Grave)` ×2、`(0 's 屋敷童 …)`），
+        /// 场上只剩锁缚龙、手里一张阻抗都没有，对面下一回合直接斩杀。
+        /// </summary>
+        private bool AllowExtraSummonKeepingHandTrap()
+        {
+            if (Card == null || Card.Location != CardLocation.Extra || Card.Level <= 0)
+                return true;
+            if (Duel.Player != 0)
+                return true;                    // 对手回合的加速同调不在这里省（那是阻抗本身）
+            if (HandTrapsInHand() != 1)
+                return true;                    // 0 张没得保；≥2 张用掉一张还剩得下
+            if (LethalAvailable())
+                return true;                    // 能斩杀就别省了
+            bool blocked = !CanReachLevelWithoutHandTrap(Card.Level);
+            if (blocked && _verbose)
+                Logger.WriteLine("[手坑预算] 不放行「" + Card.Name + "」（Lv" + Card.Level
+                    + "）：只能用最后一张手坑凑素材，留着打断对面");
+            return !blocked;
         }
 
         /// <summary>是不是这副牌的本家怪（用执行器里登记过的卡号判断）。</summary>

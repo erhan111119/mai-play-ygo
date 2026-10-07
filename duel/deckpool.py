@@ -157,6 +157,19 @@ class DeckPool:
         self._connection.commit()
         self._default_windbot_deck = default_windbot_deck
 
+    @staticmethod
+    def canonical_group(group_id: str) -> str:
+        """把群号归一到**库里存的那份**（＝目录名用的白名单形式，见 :func:`_group_dir_name`）。
+
+        ⚠ 库里 `decks.group_id` 存的是归一后的值（`add` 写的就是它），所以任何"拿调用方的群号
+        去跟库里的行比"的地方都必须先过一次这里。不过这一关的话：群号里带 `/`、`:`、`..`
+        这类字符时，`/清空卡组` 会一副都匹配不到（静默报"已清空 0 副"，看着像没人投过稿），
+        `/删卡组` 的回执会把本群的投稿说成"来自别的群"（2026-10-07 评审指出）。
+        删文件那侧只会少删、不会多删，但两边的口径必须一致。
+        """
+
+        return _group_dir_name(group_id)
+
     def add(
         self,
         *,
@@ -506,9 +519,12 @@ class DeckPool:
 
         语义上选"只清本群"而不是"清空整个池子"：清空是破坏性操作，别群辛苦投的牌不该被
         不相干的管理员一键清掉；卡组池共享只影响"看得到、用得上"，删除范围仍然按来源群。
+
+        ⚠ 群号要先过 :meth:`canonical_group`：库里存的是归一后的值，拿原始群号去比会一副都匹配不到
+        （群号带 `/`、`:`、`..` 时），于是静默返回 0——看着像"本群没人投过稿"（2026-10-07 评审指出）。
         """
 
-        group_key = str(group_id)
+        group_key = self.canonical_group(group_id)
         decks = [deck for deck in self.own_decks(group_key) if deck.group_id == group_key]
         if not decks:
             return 0

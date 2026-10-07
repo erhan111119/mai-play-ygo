@@ -852,8 +852,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             f"投稿人 {stored.contributor_name}",
             style_note,
             unknown_note,
-            f"本群现在有 {self._deck_pool.count(group_id)} 副投稿卡组，"
-            f"卡组池里还有 {len(self._deck_pool.list_decks(group_id))} 副可选（含 WindBot 内置卡组）",
+            # ⚠ 别再写"本群现在有 N 副"：`count()` 数的是**全局投稿**（卡组池共享，见 DeckPool.count），
+            # 那样写会让人以为数的是本群（2026-10-07 评审指出）。
+            f"卡组池现在有 {self._deck_pool.count(group_id)} 副投稿（共享池，含别群的），"
+            f"可选 {len(self._deck_pool.list_decks(group_id))} 副（含 WindBot 内置卡组）",
         ]
         if deck.ambiguous:
             lines.append("（这段码是按萌卡格式解析的；如果不对，请把完整分享链接再发一次）")
@@ -1363,10 +1365,14 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         if not removed:
             await self.ctx.send.text("删除失败，这副卡组可能已经被删掉了。", stream_id)
             return True, "删除失败", 1
-        # 投稿来自别的群时说明一句：删的是共享池里的牌，不是"本群那副"
-        source = "" if deck.group_id == group_key else f"（投稿人 {deck.contributor_name}，来自别的群）"
+        # 投稿来自别的群时说明一句：删的是共享池里的牌，不是"本群那副"。
+        # ⚠ 比较前要把调用方的群号**归一**（库里存的是归一后的值，见 `DeckPool.canonical_group`）：
+        # 群号里带 `/`、`:`、`..` 这类字符时，不归一就会把本群的投稿说成"来自别的群"。
+        own_group = self._deck_pool.canonical_group(group_key)
+        source = "" if deck.group_id == own_group else f"（投稿人 {deck.contributor_name}，来自别的群）"
         await self.ctx.send.text(
-            f"已删除「{deck.display_name}」{source}。卡组池还剩 {self._deck_pool.count(group_key)} 副。",
+            f"已删除「{deck.display_name}」{source}。"
+            f"卡组池现在还有 {self._deck_pool.count(group_key)} 副投稿（共享池，含别群的）。",
             stream_id,
         )
         return True, f"已删除 {deck.display_name}", 1

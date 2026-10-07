@@ -49,7 +49,15 @@ python tools/setup_clients.py --check-only
 | `expansions/*.ypk` | 上游未声明许可 | https://github.com/ElderLich/TransSuperpre |
 | `WindBot.exe`、`Decks/` | MIT | https://github.com/IceYGO/windbot （见 `windbot/LICENSE`） |
 
-GPL-2.0 的两个组件再分发时需要随附许可文本与对应源码的获取方式；`cards.cdb` 这类卡牌数据
-上游没有写明许可，**如果你要公开发布这个插件，请自行判断是否把 `cards.cdb` / `expansions/`
-也放进仓库**（把它们从版本库里排除、让使用者用 `tools/setup_clients.py` 或
-`tools/update_card_data.py` 自己补，同样能跑）。
+GPL-2.0 的两个组件再分发时需要随附许可文本与对应源码的获取方式：
+
+* `ygopro.exe` 是**上游 `mycard/ygopro` 源码、用「服务端模式」开关编译的构建，源码本身没有改动**——
+  对应源码与许可文本见上表链接（`mycard/ygopro` 仓库内即含 GPL-2.0 文本）。
+* `script/` 下的卡牌脚本逐文件来自 `mycard/ygopro-scripts` 与 `ElderLich/TransSuperpre`
+  （后者见 `expansions/`），同样按 GPL-2.0 分发。
+* `WindBot.exe` 与 `Decks/` 是 MIT：许可文本随包放在 `windbot/LICENSE`；本插件在这份构建里加的
+  各卡组执行器（`executors/`）与宿主侧补丁也一并公开在同一个仓库里。
+
+`cards.cdb` 这类卡牌数据上游没有写明许可，**如果你要公开发布这个插件，请自行判断是否把
+`cards.cdb` / `expansions/` 也放进仓库**（把它们从版本库里排除、让使用者用
+`tools/setup_clients.py` 或 `tools/update_card_data.py` 自己补，同样能跑）。

@@ -371,6 +371,31 @@ def test_group_dir_name_is_sanitised() -> None:
             pool.close()
 
 
+def test_delete_all_matches_sanitised_group_id() -> None:
+    """`/清空卡组` 要用**归一后**的群号去匹配：群号带 `/`、`..` 时不能一副都删不到。
+
+    回归（2026-10-07 评审指出）：`add()` 存库的是归一后的群号（目录名白名单，
+    `_group_dir_name`），而 `delete_all()` 原来拿**原始**群号去比 → 带特殊字符的群号会静默返回 0
+    （回执"已清空 0 副"，看着像本群没人投过稿），`/删卡组` 的回执还会把本群的投稿说成"来自别的群"。
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        pool = DeckPool(Path(directory))
+        try:
+            weird = "a/b..c"
+            mine = submit(pool, weird, "怪群号的牌")
+            other = submit(pool, "111", "正常群")
+            assert pool.delete_all(weird) == 1, "归一后的群号才匹配得上库里的行"
+            assert not mine.ydk_path.exists()
+            assert other.ydk_path.is_file(), "别群的投稿不能跟着被删"
+            assert [deck.display_name for deck in pool.own_decks("111")] == ["正常群"]
+            # 归一函数本身也要稳定：同一个群号反复归一结果一致，且不会把路径分隔符带进来
+            assert pool.canonical_group(weird) == pool.canonical_group(weird)
+            assert "/" not in pool.canonical_group(weird)
+        finally:
+            pool.close()
+
+
 def test_default_windbot_deck_applied() -> None:
     """未显式指定风格卡组时应当套用配置里的默认值。"""
 

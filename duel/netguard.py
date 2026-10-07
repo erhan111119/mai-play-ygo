@@ -98,9 +98,10 @@ def validate_url(url: str, *, allow_private_host: bool = False) -> str:
     if not parts.hostname:
         raise UnsafeUrlError("地址里没有主机名")
     if not allow_private_host and not is_public_host(parts.hostname):
+        # ⚠ 文案里**不要**再提"去打开某个配置开关"：那个开关（`search_allow_private_host`）是自动写脚本
+        # 那条链路时代的东西，早就随功能删掉了，照着提示去配置页只会更懵（2026-10-07 评审指出）。
         raise UnsafeUrlError(
-            f"{parts.hostname} 解析到内网/本机地址；确实要连自建服务，"
-            "请在配置里打开 search_allow_private_host"
+            f"{parts.hostname} 解析到内网/本机地址，已拒绝这次请求（出网只允许公网地址）"
         )
     return url
 
