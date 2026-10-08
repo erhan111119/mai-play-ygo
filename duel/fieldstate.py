@@ -22,6 +22,10 @@ from .protocol import CardLocation, DuelEvent
 # 统计里关心的区域：怪兽区、魔陷区（灵摆刻度也算在魔陷区里）
 MONSTER_ZONE = int(CardLocation.MONSTER_ZONE)
 SPELL_ZONES = (int(CardLocation.SPELL_ZONE), int(CardLocation.PENDULUM_ZONE))
+# 堆叠计数关心的三个区域（查房出图上那些"牌堆"上的数字）
+GRAVE_ZONE = int(CardLocation.GRAVE)
+REMOVED_ZONE = int(CardLocation.REMOVED)
+EXTRA_ZONE = int(CardLocation.EXTRA)
 
 # 场地格位键：控制者、区域、序号
 ZoneKey = Tuple[int, int, int]
@@ -63,6 +67,12 @@ class PlayerField:
     lp: int = 0
     monsters: int = 0
     spells: int = 0
+    #: 堆叠计数（查房出图上的"牌堆"数字）：**当前**在这一区域里的卡数。
+    #: 由 `FieldState._move` 逐次移动维护（进、出都算），所以是"现在几张"而不是"进过几张"；
+    #: ⚠ 额外卡组的**初始**张数不在里面（那是构筑信息，报文里没有），只统计"这一局里被送去额外/从额外出来"的卡。
+    grave: int = 0
+    banished: int = 0
+    extra: int = 0
 
     def label_lp(self) -> str:
         """生命值的显示文本。"""
@@ -85,6 +95,8 @@ class FieldState:
     )
     # (控制者, 区域, 序号) -> 卡 ID；只放怪兽区与魔陷区
     zones: Dict[ZoneKey, int] = field(default_factory=dict)
+    #: (座位, 区域) -> 现在有几张卡；只有墓地/除外/额外三个区域（`PlayerField` 的三个计数字段读它）
+    _stacks: Dict[Tuple[int, int], int] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         """把初始生命值填进两个座位。"""
@@ -140,7 +152,23 @@ class FieldState:
             self.zones[(new_controller, new_location, new_sequence)] = ZoneCard(
                 event.card_id, new_position
             )
+        # 堆叠计数：从旧区域扣、往新区域加——进出都算，所以"墓地现在几张"始终是当前值
+        # （只记墓地/除外/额外三个区域，见 PlayerField.grave/banished/extra）
+        self._stack_delta(int(old_controller), int(old_location), -1)
+        self._stack_delta(int(new_controller), int(new_location), +1)
         self._recount()
+
+    def _stack_delta(self, seat: int, location: int, delta: int) -> None:
+        """堆叠计数的一次增减；数量归零就把这个键删掉（不会留下 0 或负数的残留）。"""
+
+        if location not in (GRAVE_ZONE, REMOVED_ZONE, EXTRA_ZONE):
+            return
+        key = (seat, location)
+        current = self._stacks.get(key, 0) + delta
+        if current <= 0:
+            self._stacks.pop(key, None)
+        else:
+            self._stacks[key] = current
 
     def _pos_change(self, event: DuelEvent) -> None:
         """翻开盖牌 / 改成守备：把那一格的表示形式换成新值（区域与序号以报文为准）。"""
@@ -153,11 +181,14 @@ class FieldState:
             card.position = new_position
 
     def _recount(self) -> None:
-        """按格位表重算双方的怪兽与魔陷数量。"""
+        """按格位表重算双方的怪兽与魔陷数量，并把堆叠计数抄进各自的面板。"""
 
         for player in self.players.values():
             player.monsters = 0
             player.spells = 0
+            player.grave = self._stacks.get((player.seat, GRAVE_ZONE), 0)
+            player.banished = self._stacks.get((player.seat, REMOVED_ZONE), 0)
+            player.extra = self._stacks.get((player.seat, EXTRA_ZONE), 0)
         for (controller, location, _sequence) in self.zones:
             player = self.players.get(controller)
             if player is None:

@@ -140,6 +140,53 @@ def test_zones_are_mapped_to_slots() -> None:
     assert view.bottom.lp == 6200 and view.top.lp == 3100
 
 
+def test_card_face_shows_chinese_name_type_and_effect() -> None:
+    """**卡面是自绘的标准卡框**：中文卡名、类型行、卡文都要画出来（卡图缺了也一样画）。"""
+
+    html = build_html(
+        FieldView(
+            title="t",
+            turn=2,
+            bottom=SideView(
+                label="我方",
+                lp=8000,
+                monsters=[
+                    CardView(
+                        1,
+                        "救援少女·卡尔麦尔",
+                        atk=2600,
+                        def_=1800,
+                        level=4,
+                        type_line="怪兽/超量/效果",
+                        effect="①：这张卡超量召唤的场合才能发动。",
+                        art="",
+                    )
+                ],
+            ),
+        )
+    )
+    for needle in ("救援少女·卡尔麦尔", "怪兽/超量/效果", "①：这张卡超量召唤的场合才能发动。", "2600 / 1800"):
+        assert needle in html, needle
+    assert "rank" in html, "超量的星星要按阶级星画（黑底金星）"
+
+
+def test_stack_counts_are_rendered() -> None:
+    """堆叠计数（墓地/除外/额外）要画在牌堆上——数据来自 fieldstate 的三个计数。"""
+
+    html = build_html(
+        FieldView(
+            title="t",
+            turn=5,
+            top=SideView(label="对手", lp=3000, grave=7, banished=2, extra_count=1),
+            bottom=SideView(label="我方", lp=8000, grave=4, banished=1, extra_count=2),
+        )
+    )
+    for label in ("墓地", "除外", "额外"):
+        assert label in html, label
+    for count in ("7", "2", "1", "4"):
+        assert f'<div class="pnum">{count}</div>' in html, count
+
+
 def test_html_contains_lp_turn_and_phase() -> None:
     """整张图上要有双方 LP、回合与阶段（查房图自带这些信息，群里不用再看文字）。"""
 
@@ -166,6 +213,8 @@ def _run_all() -> int:
         test_missing_art_falls_back_to_name_frame,
         test_link_monster_shows_attack_only,
         test_zones_are_mapped_to_slots,
+        test_card_face_shows_chinese_name_type_and_effect,
+        test_stack_counts_are_rendered,
         test_html_contains_lp_turn_and_phase,
     ]
     failed = 0

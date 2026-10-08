@@ -1,9 +1,14 @@
 """把"当前局面"画成一张对局棋盘图（HTML → 宿主的 `render.html2png` 渲染成 PNG）。
 
-**为什么要出图**：`/查房` 原来报的是文字（LP / 怪兽数 / 魔陷数），而群友想看的正是"场上到底什么局面"。
-这张图按 MD 那种棋盘排版：双方各 5 个怪兽区 + 5 个魔陷区 + 场地区 + 额外怪兽区，卡面用**本机客户端的
-卡图**（默认插件自带的 `clients/art/`，可用配置 `paths.card_art_dir` 指到 MDPro3 的
-`Picture/Art/<卡号>.jpg`，缺了退 `Closeup/<卡号>.png`），表侧怪带攻守数值。
+**为什么出图**：`/查房` 原来报的是文字（LP / 怪兽数 / 魔陷数），而群友想看的正是"场上到底什么局面"。
+这张图按 **MD 局内**的样子排：深色场地 + 圆角格位，双方各 5 怪兽区 + 5 魔陷区 + 场地区，
+**额外怪兽区两格在中间共享**（规则上它本来就不属于某一方），两侧角上是 LP 条（名字 + LP + 条），
+右侧一个六边形「第 N 回合 / 阶段」徽章，每侧边上还有牌堆（墓地 / 除外 / 额外，带数字）。
+
+**卡面是"标准游戏王卡框"自绘的**（2026-10-08 起）：本机没有整卡图（只有 624×624 的立绘），
+所以卡框我们按卡种上色自己画——名字条（中文卡名）、等级/阶级星、立绘框、类型行、
+**中文卡文**（`cards.cdb` 的 desc）、右下攻守；怪兽格下面再压一行 MDPro3 那种大号 `2800/2100`。
+卡种配色：怪兽土黄、魔法绿、陷阱紫红；融合紫、同调白、超量黑、连接深蓝（按类型行认）。
 
 四条实现约束（改这个文件时别越过）：
 
@@ -15,8 +20,9 @@
 4. **不碰对局**：本模块只读 recorder 的快照与卡图文件；渲染交给宿主的渲染能力，
    失败由调用方退回文字（见 `plugin.py` 的 `/查房`）。
 
-数据来源：`duel/fieldstate.py` 的 `FieldState`（`zones_of(seat)`：每格的卡号 + 表示形式）、
-`duel/cards.py` 的 `CardDatabase`（卡号 → 中文名 / 卡种 / 攻守）。
+数据来源：`duel/fieldstate.py` 的 `FieldState`（`zones_of(seat)`：每格的卡号 + 表示形式；
+`PlayerField.grave/banished/extra`：牌堆计数）、`duel/cards.py` 的 `CardDatabase`
+（卡号 → 中文名 / 卡种 / 种族类型 / 攻守 / 等级 / 卡文）。
 """
 
 from __future__ import annotations
@@ -39,6 +45,14 @@ BOARD_HEIGHT = 720
 #: 主怪兽区/魔陷区的格数
 MAIN_ZONES = 5
 
+#: 格位与卡面的尺寸（卡面比例按真卡 59:86；格子 106×123 = 卡面 72×105 + 下面那行大号攻守）
+ZONE_WIDTH = 106
+ZONE_HEIGHT = 123
+CARD_WIDTH = 72
+CARD_HEIGHT = 105
+#: 魔陷行/场地区的格位高度（那些卡不显示大号攻守，矮一截，整张图才排得下）
+SPELL_ZONE_HEIGHT = 105
+
 #: 区域号（与 `duel/protocol.py` 的 CardLocation 一致）
 MONSTER_ZONE = 4
 SPELL_ZONE = 8
@@ -50,14 +64,33 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ART_DIR = _PLUGIN_ROOT / "clients" / "art" / "Art"
 DEFAULT_ART_FALLBACK = _PLUGIN_ROOT / "clients" / "art" / "Closeup"
 
-#: 卡种 → 卡框配色（MD 里怪兽偏橙、魔法绿、陷阱紫红）
+#: 卡种 → 卡框配色（MD 里怪兽偏橙、魔法绿、陷阱紫红）。**测试钉着这三个色**，改值要同步改测试。
 _KIND_COLORS = {
     "monster": ("#7a4a18", "rgba(255,190,110,.55)"),
     "spell": ("#14503a", "rgba(120,255,200,.5)"),
     "trap": ("#5a1750", "rgba(255,150,235,.5)"),
 }
 
-_STATS_RE = re.compile(r"攻(\d+).*?守(\d+)")
+#: 怪兽里更细的卡框（按卡面的"类型行"认）：连接深蓝、超量黑、同调白、融合紫、仪式靛
+_FRAME_BY_MARK = (
+    ("连接", ("#123a5e", "rgba(150,220,255,.60)")),
+    ("超量", ("#1b1d24", "rgba(255,215,130,.62)")),
+    ("同调", ("#3d3a2e", "rgba(255,246,210,.65)")),
+    ("融合", ("#4a1f44", "rgba(255,170,240,.60)")),
+    ("仪式", ("#243a63", "rgba(170,200,255,.60)")),
+)
+
+_STATS_RE = re.compile(r"攻(\d+).*?守(\d+)(?:/星(\d+))?")
+
+
+def _frame_of(card: "CardView") -> Tuple[str, str]:
+    """这张卡的卡框配色（先按超量/同调/融合/连接这些"特殊召唤种类"，再按卡种兜底）。"""
+
+    if card.kind == "monster":
+        for mark, colors in _FRAME_BY_MARK:
+            if mark in card.type_line:
+                return colors
+    return _KIND_COLORS.get(card.kind, _KIND_COLORS["monster"])
 
 
 @dataclass
@@ -69,9 +102,13 @@ class CardView:
     face_up: bool = True
     attack: bool = True
     kind: str = "monster"          # monster / spell / trap（决定卡框配色）
-    link: bool = False             # 连接怪：没有守备，攻守角标只报攻击力
+    link: bool = False             # 连接怪：没有守备，角标只报攻击力
     atk: Optional[int] = None      # 表侧怪兽才有
     def_: Optional[int] = None
+    level: int = 0                 # 等级 / 阶级 / LINK 数（超量是阶级、连接是 LINK 数）
+    rank: bool = False             # 超量：星星画成"黑底金星"的阶级星
+    type_line: str = ""            # 卡面第二行（"怪兽 超量 效果" 这种，来自 cards.cdb 的类型位）
+    effect: str = ""               # 中文卡文（卡面下半段那框小字）
     art: str = ""                  # 卡图的 data URI；空 = 没有卡图，画卡名框
 
     @property
@@ -83,6 +120,18 @@ class CardView:
         if self.link or self.def_ is None:
             return f"ATK {self.atk}"
         return f"{self.atk} / {self.def_}"
+
+    @property
+    def field_text(self) -> str:
+        """格位下方那行大号数字：MDPro3 是 `2800/2100`，连接怪写 `2000/LINK-2`。"""
+
+        if self.atk is None:
+            return ""
+        if self.link:
+            return f"{self.atk}/LINK-{self.level}" if self.level else f"{self.atk}"
+        if self.def_ is None:
+            return f"{self.atk}"
+        return f"{self.atk}/{self.def_}"
 
 
 @dataclass
@@ -97,6 +146,10 @@ class SideView:
     spells: List[Optional[CardView]] = field(default_factory=lambda: [None] * MAIN_ZONES)
     extra: Optional[CardView] = None          # 额外怪兽区
     field_zone: Optional[CardView] = None     # 场地区
+    #: 牌堆计数（魔法陷阱区外侧那几个小堆；卡组张数内核不给，只有这三样能数）
+    grave: int = 0
+    banished: int = 0
+    extra_count: int = 0
 
 
 @dataclass
@@ -219,149 +272,320 @@ def _kind_of(type_text: str) -> str:
     return "monster"
 
 
-def _card_html(card: Optional[CardView]) -> str:
-    """一格：空位 / 卡背 / 表侧卡。"""
+def _stars_html(card: CardView) -> str:
+    """卡面第二行的等级/阶级星；连接怪显示 `LINK-n`（连接数就是 `level` 字段）。"""
 
+    if card.kind != "monster":
+        return ""
+    if card.link:
+        return f'<div class="stars link">LINK-{card.level}</div>' if card.level else ""
+    if card.level <= 0:
+        return ""
+    marks = "★" * min(card.level, 12)
+    return f'<div class="stars{" rank" if card.rank else ""}">{marks}</div>'
+
+
+def _card_html(card: Optional[CardView], *, flat: bool = False) -> str:
+    """一格：空位 / 卡背 / **标准卡框的卡面**（名字条 + 星 + 立绘 + 类型行 + 卡文 + 攻守）。
+
+    `flat=True` 用在魔陷行/场地区：那些格位不显示下面那行大号攻守，所以矮一截，整张图才排得下。
+    """
+
+    plate = "plate flat" if flat else "plate"
     if card is None:
-        return '<div class="slot"></div>'
+        return f'<div class="{plate}"><div class="hole"></div></div>'
     if not card.face_up:
         # 里侧：只画卡背（硬约束，别改成画卡面）
-        return '<div class="slot"><div class="card back"><span>卡背</span></div></div>'
-    bg, border = _KIND_COLORS.get(card.kind, _KIND_COLORS["monster"])
+        return f'<div class="{plate}"><div class="card back"><span>卡背</span></div></div>'
+    frame, line = _frame_of(card)
     # ⚠ 卡面用真 `<img>` 而不是 CSS 背景图：宿主渲染时等的是页面的 load 事件，
     # 背景图**不保证**在截屏前已经解码画好（实测发到群里的棋盘常有空卡面），
     # `<img>` 的加载与解码是 load 的一部分，配 contract 里那个 wait_until="networkidle" 才稳。
-    art = (
-        f'<img class="art{" turned" if not card.attack else ""}" '
-        f'src="{card.art}" alt="">'
-        if card.art
-        else ""
-    )
+    art = f'<img class="art" src="{card.art}" alt="">' if card.art else ""
+    type_line = f'<div class="tline">{_escape(card.type_line)}</div>' if card.type_line else ""
+    effect = f'<div class="text">{_escape(card.effect)}</div>' if card.effect else ""
     stats = (
-        f'<div class="stats">{_escape(card.stats_text)}</div>'
-        if card.stats_text and card.kind == "monster"
+        f'<div class="stat">{_escape(card.stats_text)}</div>'
+        if card.kind == "monster" and card.stats_text
         else ""
     )
     position = "" if card.attack else '<div class="pos">守</div>'
+    numbers = (
+        f'<div class="fnum">{_escape(card.field_text)}</div>'
+        if card.kind == "monster" and card.field_text
+        else ""
+    )
     return (
-        f'<div class="slot"><div class="card face{" noart" if not card.art else ""}" '
-        f'style="--frame:{bg};--line:{border}">{art}{position}'
-        f'<div class="cname">{_escape(card.name or card.card_id)}</div>{stats}</div></div>'
+        f'<div class="{plate}"><div class="card face{" noart" if not card.art else ""}" '
+        f'style="--frame:{frame};--line:{line}">'
+        f'<div class="cname">{_escape(card.name or card.card_id)}</div>'
+        f"{_stars_html(card)}"
+        f'<div class="artbox">{art}</div>'
+        f"{type_line}{effect}{stats}{position}</div>{numbers}</div>"
     )
 
 
-def _side_html(side: Optional[SideView], *, mirrored: bool) -> str:
-    """一侧的整块。
+def _piles_html(side: SideView) -> str:
+    """一侧的牌堆（墓地 / 除外 / 额外的数字，MD 图右边那几个小堆）。
 
-    排版与客户端一致：**怪兽行 = 5 个怪兽区 + 额外怪兽区**（额外在最外端），
-    魔陷行 = **场地区 + 5 个魔陷区**；对手镜像朝上（它的魔陷行在上、怪兽行在下）。
+    ⚠ 卡组张数内核不告诉我们（对手的构筑是隐藏信息），所以**不画卡组堆的数字**，只画能数出来的三个。
     """
 
-    if side is None:
-        return ""
-    monsters = "".join(_card_html(card) for card in side.monsters)
-    spells = "".join(_card_html(card) for card in side.spells)
-    extra = f'<div class="zone-tag">{_card_html(side.extra)}<div class="zlabel">额外</div></div>'
-    field_zone = f'<div class="zone-tag">{_card_html(side.field_zone)}<div class="zlabel">场地</div></div>'
-    monster_row = f'<div class="row">{monsters}{extra}</div>'
-    spell_row = f'<div class="row">{field_zone}{spells}</div>'
-    rows = f"{spell_row}{monster_row}" if mirrored else f"{monster_row}{spell_row}"
-    sidebar = (
-        f'<div class="sidebar"><div class="lp">{side.lp}</div>'
-        f'<div class="who">{_escape(side.label)}</div>'
-        + (f'<div class="deck">{_escape(side.deck)}</div>' if side.deck else "")
-        + ('<div class="turnchip">行动中</div>' if side.is_turn else "")
+    def pile(label: str, count: int, *, kind: str) -> str:
+        return (
+            f'<div class="pile {kind}"><div class="pnum">{count}</div>'
+            f'<div class="plabel">{label}</div></div>'
+        )
+
+    return (
+        '<div class="piles">'
+        + pile("墓地", side.grave, kind="grave")
+        + pile("除外", side.banished, kind="out")
+        + pile("额外", side.extra_count, kind="extra")
         + "</div>"
     )
-    board = f'<div class="board"><div class="rows">{rows}</div></div>'
-    # 对手的 LP 面板放右边、我们的放左边（镜像，和客户端里的相对位置一致）
-    inner = board + sidebar if mirrored else sidebar + board
-    return f'<div class="side {"top" if mirrored else "bottom"}">{inner}</div>'
+
+
+def _lp_html(side: SideView, *, side_tag: str) -> str:
+    """LP 条：头像位（画个圆，用名字首字）＋ 名字 ＋ LP 数字 ＋ 血条（相对 8000）。"""
+
+    ratio = max(0.0, min(1.0, side.lp / 8000.0))
+    deck = f'<div class="deck">{_escape(side.deck)}</div>' if side.deck else ""
+    turn = '<div class="turnchip">行动中</div>' if side.is_turn else ""
+    return (
+        f'<div class="lpbar {side_tag}">'
+        f'<div class="avatar">{_escape(side.label[:1])}</div>'
+        f'<div class="lpinfo">'
+        f'<div class="who"><span class="name">{_escape(side.label)}</span>{deck}{turn}</div>'
+        f'<div class="lpnum">LP {side.lp}</div>'
+        f'<div class="lptrack"><div class="lpfill" style="width:{ratio * 100:.1f}%"></div></div>'
+        f"</div></div>"
+    )
+
+
+def _row_html(cards: List[Optional[CardView]], *, flat: bool = False) -> str:
+    """一行格位（5 格）。"""
+
+    return '<div class="row">' + "".join(_card_html(card, flat=flat) for card in cards) + "</div>"
+
+
+def _arena_html(view: FieldView) -> str:
+    """场地主体：对手魔陷行/怪兽行 → **共享额外怪兽区** → 我方怪兽行/魔陷行。
+
+    额外怪兽区放在**两排怪兽行之间**（规则上它是双方共用的两格，MD 局内也是这么摆的）；
+    谁把怪放在那里，卡就朝谁（上面的朝下画、下面的朝上画）。
+    """
+
+    top = view.top
+    bottom = view.bottom
+    empty_row = [None] * MAIN_ZONES
+
+    def side_row(side: Optional[SideView], *, spells: bool, mirrored: bool) -> str:
+        cards = empty_row if side is None else (side.spells if spells else side.monsters)
+        cells = "".join(_card_html(card, flat=spells) for card in (reversed(cards) if mirrored else cards))
+        # 场地区贴在魔陷行的**右端**（双方都一样，和客户端里那格的位置一致）
+        zone_html = (
+            '<div class="zone-tag">'
+            + _card_html(side.field_zone, flat=True)
+            + '<div class="zlabel">场地</div></div>'
+            if side is not None and spells
+            else ""
+        )
+        return f'<div class="row{" toprow" if mirrored else ""}">{cells}{zone_html}</div>'
+
+    emz = (
+        '<div class="row emz">'
+        + _card_html(top.extra if top else None)
+        + _card_html(bottom.extra if bottom else None)
+        + "</div>"
+    )
+    return (
+        '<div class="arena">'
+        + side_row(top, spells=True, mirrored=True)
+        + side_row(top, spells=False, mirrored=True)
+        + emz
+        + side_row(bottom, spells=False, mirrored=False)
+        + side_row(bottom, spells=True, mirrored=False)
+        + "</div>"
+    )
+
+
+def _side_panel_html(side: Optional[SideView], *, tag: str) -> str:
+    """一侧的边栏（LP 条 + 牌堆）；空的那侧只留位置，别让版面塌掉。"""
+
+    if side is None:
+        return f'<div class="panel {tag}"></div>'
+    return f'<div class="panel {tag}">{_lp_html(side, side_tag=tag)}{_piles_html(side)}</div>'
 
 
 _CSS = """
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
-    width: {width}px; height: {height}px; overflow: hidden;
-    font-family: "Microsoft YaHei", "SimHei", sans-serif; color: #eef3ff;
+    width: {width}px; height: {height}px; overflow: hidden; color: #f2f6ff;
+    font-family: "Microsoft YaHei", "Segoe UI", "SimHei", sans-serif;
     background:
-      radial-gradient(900px 420px at 50% 46%, rgba(90,140,255,.20) 0%, rgba(10,13,30,0) 70%),
-      linear-gradient(180deg, #121a3e 0%, #0b1024 55%, #0a0d1e 100%);
+      radial-gradient(760px 360px at 50% 50%, rgba(120,175,255,.16) 0%, rgba(8,10,22,0) 72%),
+      linear-gradient(180deg, #0d1738 0%, #0a1027 45%, #080c1c 100%);
   }}
-  .wrap {{ display: flex; flex-direction: column; height: 100%; padding: 8px 18px 6px;
-    justify-content: center; gap: 14px; }}
-  header {{ display: flex; align-items: center; gap: 10px; }}
-  .title {{ font-size: 20px; font-weight: 700; letter-spacing: .4px;
-    text-shadow: 0 0 12px rgba(120,170,255,.5); }}
-  .subtitle {{ font-size: 13px; opacity: .78; }}
-  header .right {{ margin-left: auto; display: flex; gap: 8px; align-items: center; }}
-  .chip {{ font-size: 12px; padding: 3px 10px; border-radius: 999px;
-    background: rgba(120,170,255,.16); border: 1px solid rgba(150,190,255,.45); }}
-  .chip.phase {{ background: rgba(255,208,120,.16); border-color: rgba(255,208,120,.5); }}
-  .side {{ display: flex; align-items: center; gap: 14px; height: 246px; }}
-  .sidebar {{ width: 132px; display: flex; flex-direction: column; gap: 3px; }}
-  .side.top .sidebar {{ align-items: flex-end; text-align: right; }}
-  .lp {{ font-size: 34px; font-weight: 800; color: #ffe89a; line-height: 1;
-    text-shadow: 0 0 16px rgba(255,210,90,.45); }}
-  .who {{ font-size: 14px; opacity: .92; }}
-  .deck {{ font-size: 12px; opacity: .68; }}
-  .turnchip {{ margin-top: 3px; font-size: 11px; padding: 1px 8px; border-radius: 999px;
-    background: rgba(120,255,190,.16); border: 1px solid rgba(120,255,190,.55); color: #b6ffdd; }}
-  .board {{ flex: 1; display: flex; align-items: center; gap: 10px; }}
-  .rows {{ display: flex; flex-direction: column; gap: 8px; }}
-  .row {{ display: flex; justify-content: center; }}
+  /* 场地："石板"底纹（斜向菱形格），加一层中心柔光 */
+  .wrap {{ display: flex; flex-direction: column; height: 100%; padding: 8px 14px 10px; gap: 6px; }}
+  header {{ display: flex; align-items: baseline; gap: 10px; }}
+  .title {{ font-size: 18px; font-weight: 700; letter-spacing: .5px;
+    text-shadow: 0 0 12px rgba(120,170,255,.45); }}
+  .subtitle {{ font-size: 12px; opacity: .75; }}
+  .tourn {{ margin-left: auto; font-size: 12px; opacity: .8; }}
+
+  .stage {{ flex: 1; display: flex; align-items: center; gap: 10px; min-height: 0; }}
+  .board {{ flex: 1; height: 100%; border-radius: 18px; padding: 10px 12px; position: relative;
+    background:
+      repeating-linear-gradient(45deg, rgba(255,255,255,.022) 0 10px, rgba(0,0,0,0) 10px 20px),
+      repeating-linear-gradient(-45deg, rgba(255,255,255,.018) 0 10px, rgba(0,0,0,0) 10px 20px),
+      radial-gradient(600px 300px at 50% 50%, rgba(90,140,255,.12) 0%, rgba(6,9,20,0) 75%),
+      linear-gradient(180deg, #101a3d 0%, #0c1330 60%, #0a1028 100%);
+    border: 1px solid rgba(150,190,255,.18);
+    box-shadow: inset 0 0 60px rgba(0,0,0,.55), 0 10px 30px rgba(0,0,0,.45); }}
+  .arena {{ height: 100%; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 6px; }}
+
+  .row {{ display: flex; align-items: flex-start; gap: 6px; }}
+  .row.emz {{ gap: 132px; }}                 /* 中央那两格额外怪兽区拉开，像 MD 的中缝 */
   .zone-tag {{ display: flex; flex-direction: column; align-items: center; gap: 2px;
-    margin-left: 10px; }}
-  .row:last-child .zone-tag:first-child {{ margin-left: 0; margin-right: 10px; }}
-  .zlabel {{ font-size: 10px; opacity: .48; }}
-  .slot {{ width: 88px; height: 88px; border-radius: 9px;
-    background: linear-gradient(180deg, rgba(140,180,255,.09), rgba(18,26,60,.42));
-    border: 1px solid rgba(140,180,255,.20); display: flex; align-items: center;
-    justify-content: center; box-shadow: inset 0 0 16px rgba(90,140,255,.10); }}
-  .card {{ position: relative; width: 88px; height: 88px; border-radius: 9px; overflow: hidden;
-    background: linear-gradient(170deg, var(--frame, #2b3a6e), #131a38 78%);
-    border: 1px solid var(--line, rgba(200,225,255,.55));
-    box-shadow: 0 3px 10px rgba(0,0,0,.5); }}
-  .card .art {{ position: absolute; inset: 0 0 18px 0; width: 100%; height: calc(100% - 18px);
-    object-fit: cover; object-position: 50% 12%; }}
-  .card .art.turned {{ transform: rotate(90deg) scale(.74); }}
-  .card .cname {{ position: absolute; left: 0; right: 0; bottom: 0; font-size: 10px; line-height: 1.2;
-    padding: 2px 3px 3px; text-align: center; max-height: 34px; overflow: hidden;
-    background: linear-gradient(180deg, rgba(6,10,24,0), rgba(6,10,24,.94) 50%); }}
-  .card .stats {{ position: absolute; top: 3px; right: 3px; font-size: 10px; font-weight: 700;
-    padding: 0 5px; border-radius: 6px; background: rgba(6,10,24,.72);
-    border: 1px solid rgba(255,255,255,.22); }}
-  .card .pos {{ position: absolute; top: 3px; left: 3px; font-size: 10px; padding: 0 5px;
-    border-radius: 6px; background: rgba(6,10,24,.72); border: 1px solid rgba(150,190,255,.45); }}
-  .card.noart {{ display: flex; align-items: center; justify-content: center; }}
-  .card.noart .cname {{ position: static; background: none; font-size: 12px; max-height: none;
-    padding: 4px 5px; }}
-  .card.back {{ background:
-      repeating-linear-gradient(45deg, rgba(255,255,255,.05) 0 7px, rgba(0,0,0,0) 7px 14px),
-      linear-gradient(160deg, #26325f, #101736); display: flex; align-items: center;
-    justify-content: center; }}
-  .card.back span {{ font-size: 11px; opacity: .55; letter-spacing: 3px; }}
-  .footer {{ font-size: 11px; opacity: .6; text-align: center; padding-top: 2px; }}
+    margin: 0 8px; }}
+  .zlabel {{ font-size: 10px; opacity: .45; }}
+  .plate {{ width: {zone_w}px; height: {zone_h}px; position: relative; display: flex;
+    align-items: flex-start; justify-content: center; }}
+  .plate.flat {{ height: {spell_h}px; }}      /* 魔陷行/场地区：矮一截（没有大号攻守那行） */
+  /* 空格位：凹槽（MD 那种场地刻线） */
+  .plate .hole {{ width: 100%; height: {card_h}px; border-radius: 10px;
+    background: linear-gradient(180deg, rgba(150,190,255,.05), rgba(10,16,36,.35));
+    border: 1px solid rgba(150,190,255,.16);
+    box-shadow: inset 0 2px 10px rgba(0,0,0,.45); }}
+  .plate .hole::after {{ content: ""; display: block; margin: 9px auto 0; width: 60%; height: 60%;
+    border: 1px dashed rgba(150,190,255,.18); border-radius: 8px; }}
+
+  /* ── 卡面：自绘的标准卡框 ───────────────────────────────── */
+  .card {{ position: relative; width: {card_w}px; height: {card_h}px; border-radius: 5px;
+    overflow: hidden; padding: 3px 3px 0;
+    background: linear-gradient(180deg, var(--frame, #7a4a18), #1b1206 92%);
+    border: 1px solid var(--line, rgba(255,220,160,.6));
+    box-shadow: 0 4px 10px rgba(0,0,0,.55); }}
+  .card .cname {{ height: 13px; line-height: 13px; font-size: 9.5px; text-align: left;
+    padding: 0 4px; color: #241505; font-weight: 700; white-space: nowrap; overflow: hidden;
+    border-radius: 2px; background: linear-gradient(180deg, #f6e6c2, #d9c294); }}
+  .card .stars {{ height: 11px; line-height: 11px; font-size: 8.5px; color: #ffd76a;
+    text-align: right; text-shadow: 0 0 3px rgba(0,0,0,.9); padding-right: 3px; }}
+  .card .stars.rank {{ color: #17171a; text-shadow: 0 0 1px #ffd76a, 0 0 4px #ffd76a; }}
+  .card .stars.link {{ font-size: 8px; color: #cfe9ff; }}
+  .card .artbox {{ height: 42px; margin: 0 1px; overflow: hidden; border: 1px solid rgba(0,0,0,.6);
+    background: linear-gradient(160deg, #2b2417, #0c0a06); }}
+  .card .art {{ width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }}
+  .card .tline {{ margin-top: 2px; font-size: 7px; line-height: 10px; height: 10px; overflow: hidden;
+    color: #ffe9bd; text-align: left; padding: 0 3px; background: rgba(0,0,0,.3);
+    white-space: nowrap; }}
+  .card .text {{ margin: 2px 1px; height: 20px; overflow: hidden; font-size: 6.4px; line-height: 8px;
+    padding: 1px 3px; text-align: left;
+    background: rgba(246,240,224,.94); color: #1d1608; border-radius: 1px; }}
+  .card .stat {{ position: absolute; right: 4px; bottom: 3px; font-size: 7.5px; font-weight: 700;
+    color: #ffe9bd; text-shadow: 0 1px 2px #000; }}
+  .card .pos {{ position: absolute; left: 4px; bottom: 3px; font-size: 7.5px; color: #cfe9ff;
+    text-shadow: 0 1px 2px #000; }}
+  /* 缺卡图：只画卡名框（不留白）——卡位里给一层斜纹 + 类型行，不能是个黑块 */
+  .card.noart {{ display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background:
+      repeating-linear-gradient(45deg, rgba(255,255,255,.07) 0 5px, rgba(0,0,0,0) 5px 10px),
+      linear-gradient(180deg, var(--frame, #7a4a18), #140e05 92%); }}
+  .card.noart .cname {{ width: 100%; height: auto; font-size: 10px; line-height: 13px;
+    background: none; color: #ffeccd; text-align: center; padding: 3px 2px;
+    white-space: normal; }}
+  .card.noart .artbox {{ height: 34px; width: 100%; display: flex; align-items: center;
+    justify-content: center; border-color: rgba(255,220,160,.35); }}
+  .card.noart .artbox::after {{ content: "无卡图"; font-size: 7px; color: rgba(255,235,200,.55); }}
+  .card.noart .tline {{ width: 100%; text-align: center; }}
+  /* 里侧：只画卡背 */
+  .card.back {{ display: flex; align-items: center; justify-content: center;
+    background:
+      radial-gradient(60% 55% at 50% 45%, rgba(255,214,140,.22), rgba(0,0,0,0) 70%),
+      repeating-conic-gradient(from 0deg, rgba(255,205,120,.16) 0deg 12deg, rgba(0,0,0,0) 12deg 24deg),
+      linear-gradient(160deg, #3a2a12, #14100a 80%);
+    border-color: rgba(255,210,140,.5); }}
+  .card.back span {{ font-size: 8px; letter-spacing: 2px; color: rgba(255,235,200,.72); }}
+  /* 格位下方的大号攻守（MDPro3 那种）*/
+  .plate .fnum {{ position: absolute; bottom: 2px; left: 0; right: 0; text-align: center;
+    font-size: 15px; font-weight: 800; letter-spacing: .3px; color: #fff; white-space: nowrap;
+    text-shadow: 0 2px 3px #000, 0 0 6px rgba(0,0,0,.9); }}
+
+  /* ── 边栏：LP 条 + 牌堆 ───────────────────────────────── */
+  .panel {{ width: 158px; display: flex; flex-direction: column; gap: 8px; }}
+  .panel.top {{ order: 2; }}                    /* 对手在右、我们在左（MD 那种左右分栏） */
+  .panel.bottom {{ order: 0; }}
+  .lpbar {{ display: flex; align-items: center; gap: 7px; padding: 6px 8px; border-radius: 12px;
+    background: linear-gradient(180deg, rgba(20,30,64,.92), rgba(10,15,34,.92));
+    border: 1px solid rgba(150,190,255,.28); box-shadow: 0 4px 14px rgba(0,0,0,.45); }}
+  .avatar {{ width: 30px; height: 30px; border-radius: 50%; flex: none; display: flex;
+    align-items: center; justify-content: center; font-size: 13px; font-weight: 700;
+    color: #08101f; background: linear-gradient(160deg, #ffe6a8, #e0a94c);
+    border: 2px solid rgba(255,235,180,.75); }}
+  .lpinfo {{ flex: 1; min-width: 0; }}
+  .who {{ display: flex; align-items: center; gap: 5px; font-size: 11px; }}
+  .who .name {{ font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .deck {{ font-size: 9px; opacity: .62; white-space: nowrap; }}
+  .lpnum {{ font-size: 19px; font-weight: 800; color: #ffe89a; line-height: 1.05;
+    text-shadow: 0 0 10px rgba(255,205,90,.4); }}
+  .lptrack {{ height: 5px; border-radius: 999px; background: rgba(255,255,255,.14); overflow: hidden; }}
+  .lpfill {{ height: 100%; border-radius: 999px;
+    background: linear-gradient(90deg, #7ce0b0, #ffe08a); }}
+  .turnchip {{ font-size: 9px; padding: 0 5px; border-radius: 999px; white-space: nowrap;
+    background: rgba(120,255,190,.16); border: 1px solid rgba(120,255,190,.55); color: #b6ffdd; }}
+  .piles {{ display: flex; gap: 6px; justify-content: space-between; }}
+  .pile {{ flex: 1; border-radius: 8px; padding: 4px 2px 3px; text-align: center;
+    background: rgba(255,255,255,.04); border: 1px solid rgba(150,190,255,.18); }}
+  .pile .pnum {{ font-size: 14px; font-weight: 800; color: #dce9ff; line-height: 1.05; }}
+  .pile .plabel {{ font-size: 8px; opacity: .6; }}
+  .pile.grave {{ background: radial-gradient(circle at 50% 30%, rgba(160,120,255,.28), rgba(0,0,0,.4)); }}
+  .pile.out {{ background: radial-gradient(circle at 50% 30%, rgba(255,180,120,.22), rgba(0,0,0,.4)); }}
+  .pile.extra {{ background: radial-gradient(circle at 50% 30%, rgba(120,220,255,.22), rgba(0,0,0,.4)); }}
+
+  /* 回合 / 阶段：右侧六边形徽章（MD 局内那个 Turn/Main 牌） */
+  .turnbadge {{ width: 62px; flex: none; align-self: center; text-align: center; padding: 9px 4px;
+    font-size: 10px; font-weight: 700; line-height: 1.25; color: #fff6dd;
+    background: linear-gradient(180deg, #7d1f2a, #4a0f18);
+    border: 2px solid rgba(255,210,150,.75);
+    clip-path: polygon(50% 0, 100% 25%, 100% 75%, 50% 100%, 0 75%, 0 25%);
+    text-shadow: 0 1px 2px #000; }}
+  .footer {{ font-size: 10px; opacity: .55; text-align: center; }}
 """
 
 
 def build_html(view: FieldView) -> str:
     """整张图的 HTML（纯函数，方便单测）。"""
 
-    turn = f'<span class="chip">第 {view.turn} 回合</span>' if view.turn else ""
-    phase = f'<span class="chip phase">{_escape(view.phase)}</span>' if view.phase else ""
+    turn = f"第 {view.turn} 回合" if view.turn else "—"
+    phase = f"{_escape(view.phase)}" if view.phase else "—"
     subtitle = f'<span class="subtitle">{_escape(view.subtitle)}</span>' if view.subtitle else ""
     footer = f'<div class="footer">{_escape(view.footer)}</div>' if view.footer else ""
-    css = _CSS.format(width=BOARD_WIDTH, height=BOARD_HEIGHT)
+    css = _CSS.format(
+        width=BOARD_WIDTH,
+        height=BOARD_HEIGHT,
+        zone_w=ZONE_WIDTH,
+        zone_h=ZONE_HEIGHT,
+        spell_h=SPELL_ZONE_HEIGHT,
+        card_w=CARD_WIDTH,
+        card_h=CARD_HEIGHT,
+    )
+    badge = f'<div class="turnbadge">Turn {view.turn or "?"}<br>{phase}</div>'
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><style>{css}</style></head><body><div class="wrap">
   <header>
     <div class="title">{_escape(view.title)}</div>
     {subtitle}
-    <div class="right">{turn}{phase}</div>
+    <div class="tourn">第 {turn} · {phase}</div>
   </header>
-  {_side_html(view.top, mirrored=True)}
-  {_side_html(view.bottom, mirrored=False)}
+  <div class="stage">
+    {_side_panel_html(view.bottom, tag="bottom")}
+    <div class="board">{_arena_html(view)}</div>
+    {badge}
+    {_side_panel_html(view.top, tag="top")}
+  </div>
   {footer}
 </div></body></html>"""
 
@@ -399,6 +623,10 @@ def view_from_state(
             lp=int(getattr(player, "lp", 0) or 0),
             deck=deck,
             is_turn=current_seat == target_seat,
+            # 牌堆计数（墓地/除外/额外）：`fieldstate` 逐次移动维护的那三个数
+            grave=int(getattr(player, "grave", 0) or 0),
+            banished=int(getattr(player, "banished", 0) or 0),
+            extra_count=int(getattr(player, "extra", 0) or 0),
         )
         for index in range(MAIN_ZONES):
             view.monsters[index] = to_card_view(
@@ -442,6 +670,7 @@ def to_card_view(
     card_id = int(getattr(card, "card_id", 0) or 0)
     face_up = bool(getattr(card, "face_up", True))
     name, kind, atk, def_, link = str(card_id), "monster", None, None, False
+    level, rank, type_line, effect = 0, False, "", ""
     if details_of is not None:
         try:
             detail = details_of(card_id)
@@ -452,9 +681,15 @@ def to_card_view(
             name = str(getattr(detail, "name", "") or name)
             kind = _kind_of(type_text)
             link = "连接" in type_text
+            rank = "超量" in type_text
+            type_line = type_text.replace(" ", "/")
             match = _STATS_RE.search(str(getattr(detail, "stats", "")))
             if match:
                 atk, def_ = int(match.group(1)), int(match.group(2))
+                level = int(match.group(3) or 0)
+            # 卡文只给表侧的卡（里侧的不读，免得哪天顺手画出来）
+            if face_up:
+                effect = str(getattr(detail, "effect", "") or "")
     return CardView(
         card_id=card_id,
         name=name,
@@ -464,5 +699,9 @@ def to_card_view(
         link=link,
         atk=atk if face_up else None,
         def_=def_ if face_up else None,
+        level=level if face_up else 0,
+        rank=rank,
+        type_line=type_line,
+        effect=effect if face_up else "",
         art=card_art_uri(card_id, art_dir=art_dir, fallback_dir=art_fallback_dir) if face_up else "",
     )
