@@ -610,15 +610,17 @@ class DuelConfig(PluginConfigBase):
         ),
     )
     brain_negate_gate: bool = Field(
-        default=True,
+        default=False,
         description=(
             "【阻抗决策层·决策本身】是否让模型决定「对面发动效果时，我方能发的这几张里发哪张 / "
-            "都不发」。**默认开**——这一层就是干这个的：`chain_choice` 那一问同时回答了"
-            "「要不要发」与「该发谁的效果」；选中的若是无效系，还会再问一次"
-            "「该去针对谁」（那一问由 `brain_enabled` 控制）。"
+            "都不发」。`chain_choice` 那一问同时回答了「要不要发」与「该发谁的效果」；"
+            "选中的若是无效系，还会再问一次「该去针对谁」（那一问由 `brain_enabled` 控制）。"
             "关掉＝完全按出牌脚本的注册顺序决定谁先上（改动前的老口径：第一条说 yes 的规则获胜）。"
-            "⚠ 这一半有前科（2026-10-07「逐步问 AI」三次实测没收益、86% 否决）；2026-10-08 的镜像 A/B"
-            "在「通用脚本 + 手坑重的合成牌组」上量到 170 局 61.8%（区间 54~69%），但那套牌组不代表真实卡组"
+            "⚠ **默认关，是量出来的**（2026-10-08 镜像 A/B）：合成手坑牌组上 300 局 62.3%"
+            "（区间 56.7~67.6），但**真实卡组「全盛俱舍」上 160 局只有 44.4%**"
+            "（区间 36.9~52.1；把它真动过手的那 97 局单看是 39.2%）——合成那副牌是"
+            "「20 手坑 + 20 白板大怪」，「留着不交」在那里天然占便宜，不代表真实卡组。"
+            "要开就按牌组分别量（`tools/brain_ab.py`），只在对它有利的牌组上打开"
         ),
     )
     # ⚠ 这里原来有 `brain_model` / `brain_timeout_ms` 两项（决策层用哪只模型、等多久）。
@@ -742,6 +744,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         # 训练功能是"把 tools/ 下那批命令行脚本接进面板"的那一层，两个都在 on_load 起、
         # on_unload 同步关（卸载只有 5 秒预算，见 on_unload 的说明）。
         self._webui: Optional[WebUIServer] = None
+        #: 当前面板是按哪份 webui 配置起的（配置热更新时用来判断"要不要重启面板"）
+        self._webui_settings: Dict[str, Any] = {}
         self._train_store: Optional[TrainingStore] = None
         self._train_runner: Optional[TrainingRunner] = None
         # 面板的 HTTP 线程要把"起任务/停任务"送回插件自己的事件循环执行，所以这里记下它。
@@ -825,6 +829,47 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             return False
         return bool(self._run_on_plugin_loop(runner.stop()))
 
+    def schedule_deck_action(
+        self, action: str, deck_id: int, *, in_random: bool = False, group_id: str = ""
+    ) -> Any:
+        """面板线程改卡组用的入口（加入/移出随机池、删除）。
+
+        为什么要绕回事件循环：卡组池的 sqlite 连接是 `on_load` 里在插件循环上建的，
+        **面板线程不能直接用它**（跨线程共用一个 sqlite 连接是未定义行为，Windows 上
+        表现为随机报错或直接崩）。所以这里包成协程丢回去执行，并同步等结果。
+        """
+
+        return self._run_on_plugin_loop(
+            self._deck_action(action, deck_id, in_random=in_random, group_id=group_id)
+        )
+
+    async def _deck_action(
+        self, action: str, deck_id: int, *, in_random: bool = False, group_id: str = ""
+    ) -> str:
+        """在插件循环里执行一次卡组操作，返回给用户看的一句话。"""
+
+        pool = self._deck_pool
+        if pool is None:
+            raise TrainingError("卡组池没准备好（插件正在重载？稍后再试）")
+        if action == "random":
+            if not pool.set_in_random(deck_id, in_random):
+                raise TrainingError(f"卡组池里没有编号 {deck_id} 的卡组")
+            if self._logger is not None:
+                self._logger.info("面板把 #%s %s了随机池", deck_id, "加入" if in_random else "移出")
+            return f"#{deck_id} 已{'加入' if in_random else '移出'}随机池"
+        if action == "delete":
+            try:
+                removed = pool.remove(group_id, deck_id)
+            except DeckPoolError as exc:
+                # 内置卡组的 .ydk 是 WindBot 自己的文件，删不得——把原因原样抛给面板
+                raise TrainingError(str(exc)) from exc
+            if not removed:
+                raise TrainingError(f"卡组池里没有编号 {deck_id} 的卡组")
+            if self._logger is not None:
+                self._logger.info("面板删除了卡组 #%s", deck_id)
+            return f"已删除 #{deck_id}"
+        raise TrainingError(f"不认识的卡组操作：{action}")
+
     def _run_on_plugin_loop(self, coro: Any) -> Any:
         """把协程送回插件的事件循环执行并等结果（面板线程调用）。"""
 
@@ -849,6 +894,30 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             return Path(self.ctx.paths.data_dir) / "train"
         path = Path(raw)
         return path if path.is_absolute() else (Path(self.ctx.paths.data_dir) / path)
+
+    def _windbot_dirs_for_training(self) -> Tuple[Optional[Path], Optional[Path]]:
+        """写脚本要用的两个目录：``(WindBot 源码树, WindBot 运行目录)``。
+
+        源码树没配就返回 ``(None, None)``——训练层会据此把"写脚本"标成不可用并说清原因，
+        而不是等用户点了才报一个看不懂的错。
+        """
+
+        paths = self.config.paths
+        return paths.resolved_windbot_src_dir(), paths.resolved_windbot_dir()
+
+    def _record_generated_script(self, deck_id: int, style_name: str) -> None:
+        """把"这副牌该用哪个出牌脚本"写回卡组池。
+
+        这一步不能省：写好并编译通过的脚本，只有在卡组记录里被记成 `generated_script`
+        才会真的被对局用上（`generated_script` 优先于 `picked_style` 与 `windbot_deck`）。
+        不写回池子，就是"写了一份谁都不用的脚本"。
+        """
+
+        if self._deck_pool is None or not deck_id:
+            return
+        self._deck_pool.set_generated_script(deck_id, style_name)
+        if self._logger is not None:
+            self._logger.info("卡组 #%s 的出牌脚本已设为 %s", deck_id, style_name)
 
     async def _training_generate(self, prompt: str, model: str, max_tokens: int) -> str:
         """训练功能要用模型时的统一出口：带上配置里的超时，返回纯文本。
@@ -914,6 +983,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             active_rooms=lambda: len(self._rooms),
             logger=self._logger,
             max_duels=int(self.config.training.max_duels_per_run),
+            windbot_dirs=self._windbot_dirs_for_training,
+            record_script=self._record_generated_script,
         )
         self._train_runner.set_training_model(self.config.llm.training_model)
         self._logger.info(
@@ -924,33 +995,45 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         )
 
     def _restart_webui(self) -> None:
-        """（重）起面板。端口被占用只在日志里说一声，不影响插件其余部分。"""
+        """（重）起面板。端口被占用只在日志里说一声，不影响插件其余部分。
 
+        **只在面板自己的配置变了才重建**（host / port / 密钥 / 开关）：现在配置可以在
+        面板里改，而宿主每次保存配置都会推一次热更新——每改一项就把面板重启一次，
+        用户那边看到的就是"点保存 → 页面打不开一下"，很难受。别的配置（模型、挑衅台词……）
+        对面板没影响，原样留着就行。
+        """
+
+        webui = self.config.webui
+        wanted = {
+            "enabled": bool(webui.enabled),
+            "host": str(webui.host or "127.0.0.1").strip(),
+            "port": int(webui.port),
+            "api_key": str(webui.api_key or "").strip(),
+        }
+        if self._webui is not None and self._webui_settings == wanted:
+            if self._logger is not None:
+                self._logger.debug("面板配置没变，保留正在服务的那一个")
+            return
         if self._webui is not None:
             self._webui.stop_now()
             self._webui = None
-        webui = self.config.webui
         if not webui.enabled:
+            self._webui_settings = wanted
             self._logger.info("面板已在配置里关闭（webui.enabled = false）")
             return
         api_key, key_source = resolve_api_key(webui.api_key, Path(self.ctx.paths.data_dir))
         server = WebUIServer(
             self,
-            host=str(webui.host or "127.0.0.1").strip(),
-            port=int(webui.port),
+            host=wanted["host"],
+            port=wanted["port"],
             api_key=api_key,
             key_source=key_source,
             logger=self._logger,
+            config_path=Path(__file__).resolve().parent / "config.toml",
         )
         if server.start():
             self._webui = server
-        else:
-            self._logger.warning(
-                "面板没能启动（%s:%s 可能被别的程序占着）。对局与训练功能不受影响；"
-                "想用面板就改 webui.port。",
-                webui.host,
-                webui.port,
-            )
+        self._webui_settings = wanted
 
     def _log_effective_config(self) -> None:
         """把生效中的关键配置写进日志。

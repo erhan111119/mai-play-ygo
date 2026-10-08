@@ -28,18 +28,26 @@ KIND_ARENA = "arena"
 KIND_SCRIPT = "script"
 """卡表 × 执行器登记的静态体检（`tools/check_card_coverage.py`，不打牌）。"""
 
+KIND_WRITE_SCRIPT = "write_script"
+"""给一副卡组**写**出牌脚本：模型读卡文 + combo 写 C#，再 `dotnet build`（会写源码树）。"""
+
+KIND_ITERATE = "iterate"
+"""自动迭代：combo → 写脚本 → 编译 → 擂台实测 → 把结论回喂下一轮（**会真打牌**）。"""
+
 KIND_REPLAY = "replay"
 """录像复盘（`tools/analyze_replay.py`：卡表、双方差异、导出 .ydk，不打牌）。"""
 
 KIND_TITLES: Dict[str, str] = {
     KIND_COMBO: "combo 推演",
+    KIND_WRITE_SCRIPT: "写脚本",
+    KIND_ITERATE: "自动迭代",
     KIND_ARENA: "擂台 A/B",
     KIND_SCRIPT: "脚本预校验",
     KIND_REPLAY: "录像复盘",
 }
 
 #: 会真的开对局的种类——房间里有人时不许起（见 `train.runner`）。
-KINDS_USING_ENGINE = frozenset({KIND_ARENA})
+KINDS_USING_ENGINE = frozenset({KIND_ARENA, KIND_ITERATE})
 
 # ---- 任务状态 ---------------------------------------------------------------
 

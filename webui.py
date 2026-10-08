@@ -40,7 +40,9 @@ import threading
 import time
 
 from .duel.card_images import cache_dir_for
+from .duel.fieldstate import MONSTER_ZONE, SPELL_ZONES
 from .train.analysis import tail_lines
+from .configedit import ConfigEditError, apply_values, missing_keys
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -82,6 +84,9 @@ _DECK_COLUMNS = (
 
 #: 推演笔记在详情页里给多少行（整份推演可能很长，详情页只要够读个大概）。
 _GUIDE_PREVIEW_LINES = 200
+
+#: 插件根目录（配置文件就在它下面：宿主盯着的就是插件目录里的 `config.toml`）。
+_PLUGIN_ROOT = Path(__file__).resolve().parent
 
 #: 日志里的 ANSI 颜色码（训练日志来自命令行工具，带颜色码时面板里会花屏）。
 _ANSI_PATTERN = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -463,6 +468,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             if path == "/api/config/schema":
                 self._send_json(self._api_config_schema())
                 return
+            if path == "/api/rooms":
+                self._send_json(self._api_rooms())
+                return
             if path == "/api/training":
                 self._send_json(self._api_training())
                 return
@@ -499,6 +507,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/training/stop":
                 self._send_json(self._post_training_stop(_json_body(raw)))
+                return
+            if path == "/api/config":
+                self._send_json(self._post_config(_json_body(raw)))
+                return
+            if path.startswith("/api/deck/"):
+                self._send_json(self._post_deck(path, _json_body(raw)))
                 return
         except Exception as exc:  # noqa: BLE001
             self._send_json({"ok": False, "error": f"服务端异常：{exc}"}, status=500)
@@ -541,6 +555,64 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "stopped": bool(stopped)}
+
+    def _post_config(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """把面板上改的配置写回 `config.toml`（宿主会热更新，不需要重启插件）。
+
+        **校验不过就一个字都不写**：先拿配置模型验一遍（`configedit.apply_values`），
+        任何一项不合法整批放弃——写一半比不写更糟，用户看到的是"有些项改了有些没改"。
+        """
+
+        panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
+        values = body.get("values")
+        if not isinstance(values, dict):
+            return {"ok": False, "error": "要提交的内容格式不对（应给 values: {节: {键: 值}}）"}
+        config_path = panel.config_path
+        try:
+            changed = apply_values(config_path, values, panel.plugin.config)
+        except ConfigEditError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception as exc:  # noqa: BLE001  写文件失败也要说清楚，不能默默吞掉
+            return {"ok": False, "error": f"写配置失败：{exc}"}
+        if panel.logger is not None:
+            panel.logger.info("面板改了配置：%s", "；".join(changed))
+        return {
+            "ok": True,
+            "changed": changed,
+            "config_path": str(config_path),
+            "message": "已写入 config.toml，宿主会热更新（面板端口/密钥若被改动，面板会重启一次）",
+        }
+
+    def _post_deck(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        """卡组操作：加入/移出随机池、删除。
+
+        走插件的公开入口（`plugin.schedule_deck_action`），因为卡组池的 sqlite 连接
+        是在插件的事件循环里建的——**面板线程不能直接碰它**（跨线程用同一个连接是未定义行为）。
+        """
+
+        panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
+        tail = path[len("/api/deck/"):]
+        if "/" not in tail:
+            return {"ok": False, "error": f"未知接口：{path}"}
+        deck_id, action = tail.split("/", 1)
+        if not deck_id.isdigit():
+            return {"ok": False, "error": "卡组编号必须是数字"}
+        action = action.strip("/")
+        group_id = str(body.get("group_id") or "")
+        try:
+            if action == "random":
+                message = panel.plugin.schedule_deck_action(
+                    "random", int(deck_id), in_random=bool(body.get("in_random")), group_id=group_id
+                )
+            elif action == "delete":
+                if not body.get("confirm"):
+                    return {"ok": False, "error": "删除卡组要带 confirm: true（这个动作不可撤销）"}
+                message = panel.plugin.schedule_deck_action("delete", int(deck_id), group_id=group_id)
+            else:
+                return {"ok": False, "error": f"未知的卡组操作：{action}"}
+        except Exception as exc:  # noqa: BLE001  失败原因（内置卡组不能删等）要原样给用户看
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "message": str(message)}
 
     # ---- 各接口实现 ----
 
@@ -671,6 +743,52 @@ class _PanelHandler(BaseHTTPRequestHandler):
             payload["summary"]["guide_text"] = tail_lines(guide_path, _GUIDE_PREVIEW_LINES)
         return {"ok": True, "run": payload}
 
+    def _api_rooms(self) -> Dict[str, Any]:
+        """实时对局监控：每个进行中的房间一份局面快照。
+
+        数据来自房间自己的会话（`DuelSession.recorder()` → 记录器里的 `FieldState`）：
+        谁在打、第几回合、什么阶段、双方 LP、场上每格是什么（里侧不公开卡号，与出图同一口径）。
+        面板线程读这些字段是**只读**的、且都在同一进程里，某一帧读到不一致可以接受
+        （每 2 秒刷新一次，下一帧就对上了）——要做成严格一致就得让出牌循环给面板让路，
+        那会拖慢对局。
+        """
+
+        panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
+        plugin = panel.plugin
+        rooms: List[Dict[str, Any]] = []
+        for stream_id, room in list(dict(getattr(plugin, "_rooms", {})).items()):
+            entry: Dict[str, Any] = {
+                "stream_id": stream_id,
+                "group_id": str(getattr(room, "group_id", "") or ""),
+                "deck_name": str(getattr(room, "deck_name", "") or ""),
+                "started": False,
+                "finished": False,
+                "turn": 0,
+                "phase": "",
+                "sides": [],
+                "error": "",
+            }
+            try:
+                session = room.session
+                entry["started"] = bool(getattr(session, "started", False))
+                entry["finished"] = bool(getattr(session, "finished", False))
+                recorder = session.recorder()
+                entry["turn"] = int(getattr(recorder, "turn_count", 0) or 0)
+                entry["phase"] = str(getattr(recorder, "phase", "") or "")
+                names = {
+                    int(seat): str(getattr(stats, "name", "") or "")
+                    for seat, stats in dict(getattr(recorder, "players", {}) or {}).items()
+                }
+                entry["sides"] = _sides_from_state(
+                    getattr(recorder, "field_state", None),
+                    names=names,
+                    self_seat=int(getattr(recorder, "self_seat", 0) or 0),
+                )
+            except Exception as exc:  # noqa: BLE001  单个房间读失败不该让整页没数据
+                entry["error"] = f"{type(exc).__name__}: {exc}"
+            rooms.append(entry)
+        return {"ok": True, "rooms": rooms, "note": "里侧的卡不公开卡号（与出图同一口径）"}
+
     def _api_decks(self) -> Dict[str, Any]:
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
         rows = _read_deck_rows(panel.deck_db_path)
@@ -792,7 +910,14 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return {"ok": False, "error": f"读取配置失败：{exc}"}
         if isinstance(raw.get("webui"), dict):
             raw["webui"]["api_key"] = "（已隐去）" if raw["webui"].get("api_key") else ""
-        return {"ok": True, "config": raw}
+        # 哪些项还没写进 config.toml（面板上标成「默认值」，免得用户以为改动没生效）
+        try:
+            missing = missing_keys(
+                panel.config_path, [name for name in raw if isinstance(raw[name], dict)], plugin.config
+            )
+        except Exception:  # noqa: BLE001  读不到就算了，不影响看配置
+            missing = {}
+        return {"ok": True, "config": raw, "missing": missing, "config_path": str(panel.config_path)}
 
     def _api_config_schema(self) -> Dict[str, Any]:
         """每个配置项的说明（面板拿它把"这一项是干什么的"写在值下面）。
@@ -868,6 +993,56 @@ def _card_names(card_db: Any, card_ids: List[int]) -> Dict[int, str]:
     return names
 
 
+def _sides_from_state(state: Any, *, names: Dict[int, str], self_seat: int) -> List[Dict[str, Any]]:
+    """把 `FieldState` 摊成面板画牌桌要的形状：两边各自的路区与魔陷区 + 墓地/除外/额外计数。
+
+    * 里侧的卡**只报"有卡"不报卡号**（与出图同一口径：面板不该比对手本人知道得更多）。
+    * 顺序固定用 1~5 号位；空位给 ``None``，前端才画得出"空场"的样子。
+    """
+
+    if state is None:
+        return []
+    zones = dict(getattr(state, "zones", {}) or {})
+    players = dict(getattr(state, "players", {}) or {})
+    sides: List[Dict[str, Any]] = []
+    for seat in (self_seat, 1 - self_seat):
+        player = players.get(seat)
+        monsters: List[Any] = []
+        spells: List[Any] = []
+        for sequence in range(1, 6):
+            monsters.append(_zone_card(zones.get((seat, MONSTER_ZONE, sequence))))
+            # 魔陷区要把灵摆刻度一起找（刻度上放的是灵摆怪，玩家看到的就是"魔陷区有卡"）
+            card = None
+            for zone in SPELL_ZONES:
+                card = zones.get((seat, zone, sequence))
+                if card is not None:
+                    break
+            spells.append(_zone_card(card))
+        sides.append(
+            {
+                "seat": seat,
+                "is_self": seat == self_seat,
+                "name": names.get(seat, ""),
+                "lp": int(getattr(player, "lp", 0) or 0),
+                "graveyard": int(getattr(player, "grave", 0) or 0),
+                "banished": int(getattr(player, "banished", 0) or 0),
+                "extra": int(getattr(player, "extra", 0) or 0),
+                "monsters": monsters,
+                "spells": spells,
+            }
+        )
+    return sides
+
+
+def _zone_card(card: Optional[int]) -> Optional[Dict[str, Any]]:
+    """场上一格 → 面板要的信息（``None`` 表示空格）。"""
+
+    if card is None:
+        return None
+    card_id = int(card)
+    return {"id": card_id, "face_up": card_id > 0, "art": abs(card_id)}
+
+
 class _ThreadingPanelServer(ThreadingHTTPServer):
     """带插件引用的 ThreadingHTTPServer。"""
 
@@ -915,6 +1090,7 @@ class WebUIServer:
         api_key: str,
         key_source: str,
         logger: Optional[logging.Logger] = None,
+        config_path: Optional[Path] = None,
     ) -> None:
         self.plugin = plugin
         self.host = host
@@ -922,6 +1098,8 @@ class WebUIServer:
         self.api_key = api_key
         self.key_source = key_source
         self.logger = logger
+        #: 要改的配置文件。默认就是插件目录下的 `config.toml`（宿主盯着的就是这一份）。
+        self.config_path = Path(config_path) if config_path else _PLUGIN_ROOT / "config.toml"
 
         self._server: Optional[_ThreadingPanelServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -1174,8 +1352,17 @@ label.field > span { display:flex; align-items:center; gap:6px; }
 label.field > span.info { color:var(--faint); font-size:11px; }
 .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
 .toolbar .grow { flex:1; min-width:200px; }
-.switch { display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--muted); cursor:pointer; user-select:none; }
+.switch { display:inline-flex; align-items:center; gap:8px; font-size:12.5px; color:var(--muted);
+  cursor:pointer; user-select:none; }
 .switch input { width:auto; }
+/* 开关做成滑块：配置页里一眼能看出"开/关"，比一个默认的方框勾选好认 */
+.switch input[type=checkbox] { appearance:none; -webkit-appearance:none; width:38px; height:21px;
+  border-radius:999px; background:#232c3d; border:1px solid var(--line); position:relative;
+  cursor:pointer; transition:background .18s var(--tap), border-color .18s var(--tap); flex:none; }
+.switch input[type=checkbox]::after { content:""; position:absolute; top:2px; left:2px; width:15px; height:15px;
+  border-radius:50%; background:#8a97b0; transition:transform .18s var(--tap), background .18s var(--tap); }
+.switch input[type=checkbox]:checked { background:rgba(124,108,246,.45); border-color:var(--brand); }
+.switch input[type=checkbox]:checked::after { transform:translateX(17px); background:#fff; }
 
 /* ---- 概览 ---- */
 .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(158px, 1fr)); gap:12px; }
@@ -1264,6 +1451,9 @@ label.field > span.info { color:var(--faint); font-size:11px; }
 .live { border-radius:var(--r-lg); border:1px solid rgba(124,108,246,.36);
   background:linear-gradient(180deg, rgba(124,108,246,.10), rgba(124,108,246,.03)); padding:15px 16px; margin-bottom:14px; }
 .live .hd { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+.round { border:1px solid var(--line-soft); border-radius:var(--r-md); padding:10px 12px; background:#111826; }
+.round + .round { margin-top:8px; }
+.round .rh { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:13px; }
 .spin { width:14px; height:14px; border-radius:50%; border:2px solid rgba(199,189,253,.35);
   border-top-color:#c7bdfd; animation:spin 1s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
@@ -1285,6 +1475,30 @@ pre.log .lv-debug { color:#6f7d95; } pre.log .lv-info { color:#9fe8c8; }
 .seg button { border:none; background:transparent; color:var(--muted); font-size:12.5px; padding:6px 12px;
   border-radius:999px; cursor:pointer; font-family:inherit; transition:background .16s var(--tap), color .16s var(--tap); }
 .seg button.on { background:rgba(124,108,246,.22); color:#fff; }
+
+/* ---- 对局监控：牌桌 ---- */
+.board-card { margin-bottom:14px; }
+.board-card .bd { display:flex; flex-direction:column; gap:8px; }
+.board-mid { text-align:center; font-size:11px; letter-spacing:3px; color:var(--faint); }
+.side-board { border:1px solid var(--line-soft); border-radius:var(--r-md); padding:10px 12px;
+  background:radial-gradient(600px 200px at 50% -40%, rgba(124,108,246,.10), transparent 70%), #101623;
+  max-width:640px; margin:0 auto; }
+.side-board.theirs { background:radial-gradient(600px 200px at 50% -40%, rgba(255,107,129,.10), transparent 70%), #101623; }
+.board-card .bd { align-items:center; }
+.side-hd { display:flex; align-items:center; gap:10px; margin-bottom:8px; font-size:12.5px; }
+.side-hd .who { color:var(--muted); }
+.side-hd .lp { display:inline-flex; align-items:center; gap:5px; font-weight:650; font-variant-numeric:tabular-nums;
+  color:#ffd9a6; }
+.side-hd .lp svg.i { width:14px; height:14px; color:var(--danger); }
+.rowzones { display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:6px; margin-bottom:6px; }
+.slot { position:relative; aspect-ratio:59/86; border-radius:8px; overflow:hidden;
+  border:1px dashed #2a3346; background:rgba(255,255,255,.015); display:grid; place-items:center; }
+.slot img { width:100%; height:100%; object-fit:cover; display:block; }
+.slot.up { border-style:solid; border-color:#33405f; box-shadow:0 6px 16px -12px #000; }
+.slot.back { border-style:solid; border-color:#2f3a52; background:linear-gradient(150deg,#1b2233,#141a27); }
+.slot.back .backface { color:#4a5670; } .slot.back svg.i { width:22px; height:22px; }
+.slot.noart::after { content:"无图"; font-size:10px; color:var(--faint); }
+.side-ft { display:flex; gap:6px; flex-wrap:wrap; }
 
 /* ---- 配置 ---- */
 .cfgsec { margin-bottom:14px; }
@@ -1387,15 +1601,18 @@ function tab(name){
   document.querySelectorAll(".navlink").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll("section.view").forEach(s => s.classList.toggle("active", s.id === "view-" + name));
   const titles = {overview:["总览","卡组池、房间与训练状态"],decks:["卡组","群友投稿与内置卡组"],
-                  training:["训练功能","推演 / 擂台 / 体检 / 复盘"],logs:["日志","宿主日志（可按关键词过滤）"],
-                  config:["配置","当前生效的插件配置（只读）"]};
+                  duel:["对局监控","进行中的牌桌（每 2 秒刷新）"],
+                  training:["训练功能","推演 / 写脚本 / 擂台 / 体检 / 复盘"],
+                  logs:["日志","宿主日志（可按关键词过滤）"],config:["配置","改完写回 config.toml，宿主自动热更新"]};
   const pair = titles[name] || ["面板",""];
   $("page-title").textContent = pair[0]; $("page-sub").textContent = pair[1];
   if (name === "overview") loadOverview();
   if (name === "decks") loadDecks();
+  if (name === "duel") { loadDuel(); startDuelLive(); }
   if (name === "training") loadTraining();
   if (name === "logs") loadLogs();
   if (name === "config") loadConfig();
+  if (name !== "duel" && DUEL_TIMER) { clearInterval(DUEL_TIMER); DUEL_TIMER = null; }
 }
 function stopTimers(){
   if (State.logTimer) { clearInterval(State.logTimer); State.logTimer = null; }
@@ -1532,8 +1749,93 @@ async function showDeck(deckId, group){
     <div class="hero">${art(deck.head_card, "art")}
       <div style="min-width:0"><div class="ln" style="display:flex;gap:6px;flex-wrap:wrap">${chips}</div>
         <div class="faint mono ell" style="margin-top:8px;font-size:11.5px" title="${esc(deck.ydk_path)}">#${esc(deck.deck_id)}　${esc(deck.ydk_path)}</div></div></div>
+    <div class="toolbar" style="margin-top:4px">
+      <button class="btn sm" onclick="deckRandom('${esc(deck.deck_id)}','${esc(deck.group_id)}',${deck.in_random ? "false" : "true"})">
+        ${deck.in_random ? "移出随机池" : "加入随机池"}</button>
+      <button class="btn danger sm" onclick="deckDelete('${esc(deck.deck_id)}','${esc(deck.group_id)}','${esc(deck.name)}')">删除卡组</button>
+    </div>
     ${deck.error ? `<div class="banner warn">${ICON.warn}${esc(deck.error)}</div>` : ""}
     ${zone("主卡组", "main")}${zone("额外卡组", "extra")}${zone("副卡组", "side")}`;
+}
+async function deckRandom(deckId, group, want){
+  const d = await postApi(`/api/deck/${deckId}/random`, { in_random: want, group_id: group });
+  if (!d.ok) { toast(d.error || "操作失败", "err"); return; }
+  toast(d.message, "ok");
+  loadDecks();
+  showDeck(deckId, group);
+}
+async function deckDelete(deckId, group, name){
+  if (!confirm(`删除卡组「${name}」#${deckId}？\\n\\n它的 .ydk 文件会一起删掉，这个动作不可撤销。\\n（内置卡组删不掉，只能移出随机池）`)) return;
+  const d = await postApi(`/api/deck/${deckId}/delete`, { confirm: true, group_id: group });
+  if (!d.ok) { toast(d.error || "删除失败", "err"); return; }
+  toast(d.message, "ok");
+  closeSheet();
+  loadDecks();
+}
+
+/* ------------------------------ 对局监控 ------------------------------ */
+let DUEL_TIMER = null;
+function startDuelLive(){
+  const box = $("duel-live");
+  if (DUEL_TIMER) { clearInterval(DUEL_TIMER); DUEL_TIMER = null; }
+  if (box && box.checked) DUEL_TIMER = setInterval(() => { if (State.tab === "duel") loadDuel(); }, 2000);
+}
+async function loadDuel(){
+  const d = await api("/api/rooms");
+  if (!d.ok) { $("duel-body").innerHTML = `<div class="banner err">${ICON.warn}${esc(d.error)}</div>`; return; }
+  const rooms = d.rooms || [];
+  if (!rooms.length) {
+    $("duel-body").innerHTML = `<div class="empty">${ICON.play}<div>现在没有进行中的对局</div>
+      <div class="faint" style="font-size:12px">群里有人说想打牌（或 <span class="mono">/开房</span>）之后，这里会实时显示牌桌</div></div>`;
+    return;
+  }
+  $("duel-body").innerHTML = rooms.map(roomBoard).join("");
+}
+function zoneSlot(card, isMonster){
+  if (!card) return `<div class="slot empty"></div>`;
+  if (!card.face_up) {
+    // 里侧：不公开卡号，画卡背（与 /查房 出图同一口径）
+    return `<div class="slot back" title="里侧表示"><div class="backface">${ICON.back}</div></div>`;
+  }
+  return `<div class="slot up" title="卡号 ${esc(card.id)}">
+    <img loading="lazy" src="/api/art/${esc(card.art)}" alt=""
+      onerror="this.parentNode.classList.add('noart');this.remove()"></div>`;
+}
+function sideBoard(side){
+  return `<div class="side-board ${side.is_self ? "ours" : "theirs"}">
+    <div class="side-hd">
+      <span class="who">${side.is_self ? "我方" : "对手"}${side.name ? " · " + esc(side.name) : ""}</span>
+      <span class="lp"><svg class="i" viewBox="0 0 24 24"><path d="M12 20s-7-4.4-7-9.3A4 4 0 0 1 12 8a4 4 0 0 1 7 2.7C19 15.6 12 20 12 20z"/></svg>${esc(side.lp)}</span>
+    </div>
+    <div class="rowzones">${(side.monsters || []).map(c => zoneSlot(c, true)).join("")}</div>
+    <div class="rowzones">${(side.spells || []).map(c => zoneSlot(c, false)).join("")}</div>
+    <div class="side-ft">
+      <span class="chip dim">墓地 ${esc(side.graveyard ?? 0)}</span>
+      <span class="chip dim">除外 ${esc(side.banished ?? 0)}</span>
+      <span class="chip dim">额外 ${esc(side.extra ?? 0)}</span>
+    </div>
+  </div>`;
+}
+function roomBoard(room){
+  const state = room.started ? (room.finished ? '<span class="chip warn">已结束</span>' : '<span class="chip ok">对局中</span>')
+    : '<span class="chip run">等人进房</span>';
+  const sides = room.sides || [];
+  const ours = sides.find(s => s.is_self) || sides[0];
+  const theirs = sides.find(s => !s.is_self) || sides[1];
+  return `<div class="panel board-card"><div class="hd">
+      <h3>${esc(room.deck_name || "未记录卡组")}</h3>
+      <span class="chip dim">群 ${esc(room.group_id || "-")}</span>
+      ${state}
+      <span class="chip">第 ${esc(room.turn || 0)} 回合${room.phase ? " · " + esc(room.phase) : ""}</span>
+      <span style="flex:1"></span>
+      <span class="faint mono" style="font-size:11px">${esc(room.stream_id)}</span>
+    </div>
+    <div class="bd">
+      ${room.error ? `<div class="banner warn">${ICON.warn}${esc(room.error)}</div>` : ""}
+      ${theirs ? sideBoard(theirs) : ""}
+      <div class="board-mid">VS</div>
+      ${ours ? sideBoard(ours) : ""}
+    </div></div>`;
 }
 
 /* ------------------------------ 训练 ------------------------------ */
@@ -1580,6 +1882,16 @@ async function loadTraining(){
       fields.push(`<label class="field"><span>取最近几份</span><input id="f-${k.kind}-latest" type="number" value="5" min="1" max="50"></label>`);
       fields.push(`<label class="field"><span>对比卡组编号</span><input id="f-${k.kind}-deck" placeholder="可留空"></label>`);
     }
+    if (k.fields.includes("extra_prompt")) {
+      fields.push(`<label class="field" style="grid-column:1/-1"><span>额外提示词（可选）</span>
+        <textarea id="f-${k.kind}-extra" rows="2" placeholder="想强调的打法、必须避免的行为，例如：先手优先做鲜花女男爵；不要去踩对面的神宣"></textarea>
+        <span class="info">写什么都会原样进提示词：combo 按它推、脚本也按它写</span></label>`);
+    }
+    if (k.fields.includes("rounds")) {
+      const isWrite = k.kind === "write_script";
+      fields.push(`<label class="field"><span>${isWrite ? "生成→编译轮数" : "迭代轮数"}</span>
+        <input id="f-${k.kind}-rounds" type="number" value="${isWrite ? 3 : 2}" min="1" max="${isWrite ? 6 : 5}"></label>`);
+    }
     return `<div class="kind">
       <h4>${ICON.train}${esc(k.title)}${k.needs_engine ? '<span class="chip warn">会起对局</span>' : '<span class="chip dim">只读</span>'}</h4>
       <p class="note">${esc(k.note || "")}${k.needs_engine ? "　房间里有人在打时不能跑（会抢内核与端口）" : ""}</p>
@@ -1612,7 +1924,32 @@ async function showRun(runId){
   const run = d.run, summary = run.summary || {};
   const parts = [];
   if (run.error) parts.push(`<div class="banner err">${ICON.warn}${esc(run.error)}</div>`);
-  if (summary.conclusion) parts.push(`<h4 style="margin:6px 0 6px;font-size:13.5px">结论</h4><p style="margin:0">${esc(summary.conclusion)}</p>`);
+  if (summary.style_name) parts.push(`<dl class="kv" style="margin-bottom:10px">
+      <dt>出牌脚本</dt><dd><span class="chip brand">${esc(summary.style_name)}</span>
+        ${summary.attempts ? `<span class="chip dim">第 ${esc(summary.attempts)} 轮编译通过</span>` : ""}</dd>
+      <dt>源文件</dt><dd class="faint mono ell" title="${esc(summary.file_path || "")}">${esc(summary.file_path || "")}</dd>
+      ${summary.exe ? `<dt>编译产物</dt><dd class="faint mono ell" title="${esc(summary.exe)}">${esc(summary.exe)}</dd>` : ""}
+      <dt>用了 combo</dt><dd>${summary.combo_used ? "是（按推演的顺序写脚本）" : "没有（直接按卡文写）"}</dd>
+    </dl>`);
+  if (summary.baseline) parts.push(`<p class="faint" style="font-size:12px">对照脚本：<span class="mono">${esc(summary.baseline)}</span>　共 ${esc(summary.rounds || 0)} 轮</p>`);
+  const history = summary.history || [];
+  if (history.length) {
+    parts.push(`<h4 style="margin:8px 0 6px;font-size:13.5px">逐轮记录</h4>`);
+    parts.push(history.map(item => `<div class="round">
+        <div class="rh"><b>第 ${esc(item.round)} 轮</b>
+          ${item.style_name ? `<span class="chip brand">${esc(item.style_name)}</span>` : ""}
+          ${item.arena_exit_code != null ? `<span class="chip ${item.arena_exit_code === 0 ? "ok" : "err"}">擂台退出码 ${esc(item.arena_exit_code)}</span>` : ""}
+          ${item.compared === false ? '<span class="chip dim">本轮无对照</span>' : ""}
+        </div>
+        <div class="faint" style="font-size:11.5px">combo 主线 ${esc(item.combo_lines ?? 0)} 条
+          ${item.guide_path ? `　推演 ${esc(String(item.guide_path).split("\\\\").pop())}` : ""}
+          ${item.arena_log ? `　擂台日志 ${esc(String(item.arena_log).split("\\\\").pop())}` : ""}</div>
+        ${item.conclusion ? `<p style="margin:6px 0 0;font-size:12.5px">${esc(item.conclusion)}</p>` : ""}
+        ${item.conclusion_error ? `<div class="banner warn" style="margin:6px 0 0">${ICON.info}结论没生成：${esc(item.conclusion_error)}</div>` : ""}
+        ${(item.combo_warnings || []).length ? `<ul style="margin:6px 0 0;padding-left:20px;font-size:12px">${item.combo_warnings.map(w => `<li>${esc(w)}</li>`).join("")}</ul>` : ""}
+      </div>`).join(""));
+  }
+  if (summary.conclusion) parts.push(`<h4 style="margin:14px 0 6px;font-size:13.5px">结论</h4><p style="margin:0">${esc(summary.conclusion)}</p>`);
   if (summary.conclusion_error) parts.push(`<div class="banner warn">${ICON.info}结论没生成：${esc(summary.conclusion_error)}</div>`);
   const warnings = summary.warnings || [];
   if (warnings.length) parts.push(`<h4 style="margin:14px 0 6px;font-size:13.5px">校验疑点</h4>
@@ -1631,10 +1968,17 @@ async function startTraining(kind){
   const payload = { kind };
   const deck = fieldValue(kind, "deck");
   if (deck) payload.deck_id = Number(deck);
+  const extra = fieldValue(kind, "extra");
+  if (extra) payload.extra_prompt = extra;
+  const rounds = fieldValue(kind, "rounds");
+  if (rounds) payload.rounds = Number(rounds);
   if (kind === "arena") {
     payload.duels = Number(fieldValue(kind, "duels") || 60);
     payload.style_a = fieldValue(kind, "style-a");
     payload.style_b = fieldValue(kind, "style-b");
+  }
+  if (kind === "iterate") {
+    payload.duels = Number(fieldValue(kind, "duels") || 20);
   }
   if (kind === "script") {
     payload.style = fieldValue(kind, "style");
@@ -1691,32 +2035,92 @@ function setLevel(level){
   loadLogs();
 }
 
-/* ------------------------------ 配置 ------------------------------ */
+/* ------------------------------ 配置（可改） ------------------------------ */
 const CFG_ICON = {plugin:ICON.info, paths:ICON.deck, duel:ICON.play, llm:ICON.spark, wiki:ICON.search,
                   training:ICON.train, webui:ICON.gear};
+const CFG_LABEL = {plugin:"插件", paths:"运行环境", duel:"对局", llm:"模型", wiki:"百科检索",
+                   training:"训练功能", webui:"面板"};
+/* 这几项在面板里只读：路径列的是相对插件目录的写法、密钥给输入框容易被旁观看到，
+   想改去麦麦的插件配置页（那里有完整说明）。其余项都能在这里改。 */
+const CFG_READONLY = new Set(["plugin.config_version", "webui.api_key"]);
+let CFG_DIRTY = {};
+
 async function loadConfig(){
   const d = await api("/api/config");
   if (!d.ok) { $("config-body").innerHTML = `<div class="banner err">${ICON.warn}${esc(d.error)}</div>`; return; }
   const cfg = d.config || {};
-  const sections = Object.keys(cfg);
-  $("config-body").innerHTML = sections.map(name => {
+  const missing = d.missing || {};
+  CFG_DIRTY = {};
+  $("config-body").innerHTML = Object.keys(cfg).map(name => {
     const block = cfg[name];
-    let rows = "";
-    if (block && typeof block === "object" && !Array.isArray(block)) {
-      const descs = (State.schema && State.schema[name]) || {};
-      rows = Object.entries(block).map(([key, value]) => {
-        const shown = Array.isArray(value) ? (value.length ? value.join("、") : "（空）")
-          : (value === "" ? "（空）" : (value === true ? "开" : (value === false ? "关" : value)));
-        const desc = descs[key] ? `<div class="d">${esc(descs[key])}</div>` : "";
-        return `<div class="cfgrow"><div class="k">${esc(key)}</div>
-          <div class="v">${esc(shown)}</div>${desc}</div>`;
-      }).join("");
-    } else {
-      rows = `<div class="cfgrow"><div class="v">${esc(JSON.stringify(block))}</div></div>`;
-    }
-    return `<div class="panel cfgsec"><div class="hd"><h3>${CFG_ICON[name] || ICON.info}${esc(name)}</h3></div>
+    if (!block || typeof block !== "object" || Array.isArray(block)) return "";
+    const descs = (State.schema && State.schema[name]) || {};
+    const rows = Object.entries(block).map(([key, value]) => {
+      const path = `${name}.${key}`;
+      const desc = descs[key] ? `<div class="d">${esc(descs[key])}</div>` : "";
+      const notWritten = (missing[name] || []).includes(key)
+        ? '<span class="chip dim" title="这一项还没写进 config.toml，显示的是代码里的默认值">默认值</span>' : "";
+      if (CFG_READONLY.has(path)) {
+        return `<div class="cfgrow"><div class="k">${esc(key)}${notWritten}</div>
+          <div class="v">${esc(Array.isArray(value) ? value.join("、") : value)}</div>${desc}</div>`;
+      }
+      return `<div class="cfgrow"><div class="k">${esc(key)}${notWritten}</div>
+        ${renderControl(path, value)}${desc}</div>`;
+    }).join("");
+    return `<div class="panel cfgsec"><div class="hd"><h3>${CFG_ICON[name] || ICON.info}${esc(CFG_LABEL[name] || name)}</h3>
+      <span class="sp"></span><span class="faint mono" style="font-size:11.5px">[${esc(name)}]</span></div>
       <div class="bd"><div class="cfggrid">${rows}</div></div></div>`;
   }).join("");
+  updateSaveBar();
+}
+function renderControl(path, value){
+  const id = `cfg-${path.replace(/\\./g, "-")}`;
+  if (typeof value === "boolean") {
+    return `<label class="switch"><input type="checkbox" id="${esc(id)}" data-path="${esc(path)}"
+      ${value ? "checked" : ""} onchange="markDirty(this)"><span class="sw-text">${value ? "开" : "关"}</span></label>`;
+  }
+  if (typeof value === "number") {
+    return `<input type="number" id="${esc(id)}" data-path="${esc(path)}" value="${esc(value)}" step="any" oninput="markDirty(this)">`;
+  }
+  if (Array.isArray(value)) {
+    return `<textarea id="${esc(id)}" data-path="${esc(path)}" rows="2" data-list="1"
+      placeholder="一行一条" oninput="markDirty(this)">${esc(value.join("\\n"))}</textarea>`;
+  }
+  const text = String(value);
+  if (text.length > 40 || text.includes("\\n")) {
+    return `<textarea id="${esc(id)}" data-path="${esc(path)}" rows="3" oninput="markDirty(this)">${esc(text)}</textarea>`;
+  }
+  return `<input id="${esc(id)}" data-path="${esc(path)}" value="${esc(text)}" placeholder="（空）" oninput="markDirty(this)">`;
+}
+function markDirty(el){
+  const path = el.dataset.path;
+  if (!path) return;
+  if (el.type === "checkbox") {
+    CFG_DIRTY[path] = el.checked;
+    const label = el.parentNode.querySelector(".sw-text");
+    if (label) label.textContent = el.checked ? "开" : "关";
+  } else if (el.dataset.list) {
+    CFG_DIRTY[path] = el.value.split("\\n").map(s => s.trim()).filter(s => s !== "");
+  } else {
+    CFG_DIRTY[path] = el.value;
+  }
+  updateSaveBar();
+}
+function updateSaveBar(){
+  const count = Object.keys(CFG_DIRTY).length;
+  $("cfg-dirty").textContent = count ? `有 ${count} 项改动待保存` : "没有改动";
+  $("btn-config-save").disabled = count === 0;
+}
+async function saveConfig(){
+  const values = {};
+  for (const [path, value] of Object.entries(CFG_DIRTY)) {
+    const [section, key] = path.split(".");
+    (values[section] = values[section] || {})[key] = value;
+  }
+  const d = await postApi("/api/config", { values });
+  if (!d.ok) { toast(d.error || "保存失败", "err"); return; }
+  toast(`已写入 config.toml：${(d.changed || []).length} 项，宿主会自动热更新`, "ok");
+  loadSchema().then(loadConfig);
 }
 async function loadSchema(){
   try {
@@ -1737,6 +2141,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (event.target.checked) State.logTimer = setInterval(() => { if (State.tab === "logs") loadLogs(); }, 4000);
   };
   if ($("btn-training-refresh")) $("btn-training-refresh").onclick = loadTraining;
+  if ($("btn-duel-refresh")) $("btn-duel-refresh").onclick = loadDuel;
+  if ($("duel-live")) $("duel-live").onchange = startDuelLive;
   if ($("btn-overview-refresh")) $("btn-overview-refresh").onclick = loadOverview;
   if ($("log-filter")) $("log-filter").addEventListener("keydown", (e) => { if (e.key === "Enter") loadLogs(); });
   if ($("deck-search")) { /* 卡组页载入后再挂，见 loadDecks */ }
@@ -1801,6 +2207,7 @@ def _app_page() -> str:
     <nav>
       <div class="navlink active" data-tab="overview"><svg class="i" viewBox="0 0 24 24"><path d="M4 10.5 12 4l8 6.5V20H4z"/><path d="M10 20v-5h4v5"/></svg>总览</div>
       <div class="navlink" data-tab="decks"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="15" rx="2.2"/><path d="M8 3h10a2 2 0 0 1 2 2v13"/><path d="M7.5 11h4"/></svg>卡组</div>
+      <div class="navlink" data-tab="duel"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h16M4 18h16"/><rect x="5" y="8" width="6" height="8" rx="1.5"/><rect x="13" y="8" width="6" height="8" rx="1.5"/></svg>对局</div>
       <div class="navlink" data-tab="training"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v3M6.5 5.5l2 2M17.5 5.5l-2 2"/><rect x="4" y="10" width="16" height="10" rx="3"/><path d="M9 15h6"/></svg>训练</div>
       <div class="navlink" data-tab="logs"><svg class="i" viewBox="0 0 24 24"><path d="M5 4h14v16H5z"/><path d="M8.5 9h7M8.5 12.5h7M8.5 16h4"/></svg>日志</div>
       <div class="navlink" data-tab="config"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.2M12 18.8V21M4.2 7.5l1.9 1.1M17.9 15.4l1.9 1.1M4.2 16.5l1.9-1.1M17.9 8.6l1.9-1.1"/></svg>配置</div>
@@ -1842,6 +2249,15 @@ def _app_page() -> str:
         <div id="decks-body"><div class="empty">加载中…</div></div>
       </section>
 
+      <section class="view" id="view-duel">
+        <div class="toolbar">
+          <label class="switch"><input type="checkbox" id="duel-live" checked>每 2 秒刷新</label>
+          <span class="sp" style="flex:1"></span>
+          <button class="btn sm" id="btn-duel-refresh">刷新</button>
+        </div>
+        <div id="duel-body"><div class="empty">加载中…</div></div>
+      </section>
+
       <section class="view" id="view-training">
         <div id="training-banners"></div>
         <div id="training-active"></div>
@@ -1875,8 +2291,20 @@ def _app_page() -> str:
       </section>
 
       <section class="view" id="view-config">
-        <div class="banner"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8v.01"/></svg>
-          这一页只读：要改配置请到麦麦的插件配置页（WebUI → 插件 → 本插件）。密钥已隐去。</div>
+        <div class="panel" style="margin-bottom:14px"><div class="hd">
+            <h3>配置</h3>
+            <span class="sp"></span>
+            <span class="faint" id="cfg-dirty">没有改动</span>
+            <button class="btn sm" onclick="loadConfig()">重新载入</button>
+            <button class="btn primary sm" id="btn-config-save" onclick="saveConfig()" disabled>保存</button>
+          </div>
+          <div class="bd" style="padding-top:0">
+            <div class="faint" style="font-size:12px">
+              改动会写进插件目录的 <span class="mono">config.toml</span>（<b>原有注释与排版保留</b>），
+              宿主会自动热更新——不用重启插件。校验不通过时一个字都不会写入。
+              <span id="cfg-path" class="mono"></span>
+            </div>
+          </div></div>
         <div id="config-body">加载中…</div>
       </section>
     </div>

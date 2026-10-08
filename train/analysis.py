@@ -307,6 +307,7 @@ async def derive_combo(
     digest: str,
     known_names: Set[str],
     model: str,
+    extra_prompt: str = "",
     logger: Optional[logging.Logger] = None,
 ) -> ComboResult:
     """让模型读卡表写推演笔记（**分两轮问**，每轮都小）。
@@ -328,7 +329,11 @@ async def derive_combo(
     """
 
     warnings: List[str] = []
-    main_prompt = f"{_COMBO_MAIN_SYSTEM}\n\n{digest}\n\n请按上面的 JSON 结构输出这副卡组的主线。"
+    extra = str(extra_prompt or "").strip()
+    extra_block = f"\n\n作者的额外要求（必须体现在推演里）：\n{extra[:2000]}" if extra else ""
+    main_prompt = (
+        f"{_COMBO_MAIN_SYSTEM}\n\n{digest}{extra_block}\n\n请按上面的 JSON 结构输出这副卡组的主线。"
+    )
     try:
         raw = await generate(main_prompt, model, COMBO_MAX_TOKENS)
     except Exception as exc:  # noqa: BLE001  统一成 AnalysisError，让调用方把它记成一次失败的任务
@@ -351,6 +356,7 @@ async def derive_combo(
         summary=str(guide.get("summary") or ""),
         lines=guide.get("lines") or [],
         model=model,
+        extra_prompt=extra,
     )
     if isinstance(notes, str):
         warnings.append(notes)
@@ -377,6 +383,7 @@ async def _derive_notes(
     summary: str,
     lines: Sequence[Any],
     model: str,
+    extra_prompt: str = "",
 ) -> Any:
     """第二轮：补要点与待确认项。
 
@@ -385,8 +392,11 @@ async def _derive_notes(
     """
 
     outline = json.dumps({"summary": summary, "lines": lines}, ensure_ascii=False)[:4000]
+    extra = str(extra_prompt or "").strip()
+    extra_block = f"\n\n作者的额外要求（要点里也要体现）：\n{extra[:1000]}" if extra else ""
     prompt = (
-        f"{_COMBO_NOTES_SYSTEM}\n\n{digest}\n\n已写好的主线：\n{outline}\n\n请补充要点与待确认项。"
+        f"{_COMBO_NOTES_SYSTEM}\n\n{digest}{extra_block}\n\n已写好的主线：\n{outline}"
+        "\n\n请补充要点与待确认项。"
     )
     try:
         raw = await generate(prompt, model, SUMMARY_MAX_TOKENS)
