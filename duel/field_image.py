@@ -275,17 +275,22 @@ def _kind_of(type_text: str) -> str:
     return "monster"
 
 
-def _stars_html(card: CardView) -> str:
-    """卡面第二行的等级/阶级星；连接怪显示 `LINK-n`（连接数就是 `level` 字段）。"""
+def _stars_html(card: CardView, *, overlay: bool = False) -> str:
+    """星级（等级/阶级星；连接怪写 `LINK-n`）。
+
+    `overlay=True` 时是**压在整卡图上方**的那条（用户口径 2026-10-09：
+    "卡图就直接用完整卡图……上面加上星级，下面直接写攻击力守备力"）。
+    """
 
     if card.kind != "monster":
         return ""
+    cls = "stars over" if overlay else "stars"
     if card.link:
-        return f'<div class="stars link">LINK-{card.level}</div>' if card.level else ""
+        return f'<div class="{cls} link">LINK-{card.level}</div>' if card.level else ""
     if card.level <= 0:
         return ""
     marks = "★" * min(card.level, 12)
-    return f'<div class="stars{" rank" if card.rank else ""}">{marks}</div>'
+    return f'<div class="{cls}{" rank" if card.rank else ""}">{marks}</div>'
 
 
 #: 名字条可用宽度（卡面 64 − 卡框左右各 3 − 名字条左右各 4）
@@ -312,8 +317,10 @@ def _name_box(name: str) -> Tuple[float, int, int]:
     for lines, minimum in ((1, _NAME_FONT_MIN_SINGLE), (2, _NAME_FONT_MIN_ANY), (3, _NAME_FONT_MIN_ANY)):
         size = min(_NAME_FONT_BASE, _NAME_BOX_WIDTH * lines / units)
         if size >= minimum or lines == 3:
-            size = max(size, _NAME_FONT_MIN_ANY)
-            return round(size, 1), lines, int(round(size * 1.28)) * lines
+            # ⚠ 向下取整到 0.1px：四舍五入会让人为算出的字号比"装得下"的临界值大一点点，
+            # 长名字就又会被切掉一个字（实测 8.0 × 12.55 字宽 = 100.4 > 可用 100）。
+            size = max(int(size * 10) / 10.0, _NAME_FONT_MIN_ANY)
+            return size, lines, int(round(size * 1.28)) * lines
     return _NAME_FONT_MIN_ANY, 3, int(round(_NAME_FONT_MIN_ANY * 1.28)) * 3
 
 
@@ -347,10 +354,15 @@ def card_full_uri(card_id: int, *, pic_dir: Optional[Path] = None) -> str:
 
 
 def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "") -> str:
-    """一格：空位 / 卡背 / **卡面**（整卡图优先 → 自绘标准卡框 → 卡名框）。
+    """一格：空位 / 卡背 / **完整卡图**（上面叠星级、下面写攻守）→ 没有图时画名字框。
 
     `flat=True` 用在魔陷行/场地区：那些格位不显示下面那行大号攻守，所以矮一截，整张图才排得下。
     `owner`（`opp` / `me`）只给**中央额外怪兽区**用——那两格在上下半场中间，要标清是谁的。
+
+    用户口径（2026-10-09）：**"卡图就直接用完整卡图，不用你做的立绘加卡框了，上面加上星级，
+    下面直接写攻击力守备力就行，另外注意一下朝向问题就可以了，不用写效果这类"**。
+    所以卡面一律用整卡图（`CardView.full`），我们自己只叠**星级**与**攻守**两个角标；
+    卡图自带的卡名/效果文字不再重画，守备表示整张卡转 90°。
     """
 
     plate = "plate flat" if flat else "plate"
@@ -366,44 +378,26 @@ def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "")
         if card.kind == "monster" and card.field_text
         else ""
     )
+    # 守备表示：整张卡转 90°（和 MD 局内一样；星级/攻守角标在卡内，跟着一起转）
+    posture = "" if card.attack else " def"
     if card.full:
-        # 整张卡图（本机缓存 / 在线补齐的萌卡中文卡图）：直接铺满卡位，不再叠自绘的名字条与卡文
         return (
-            f'<div class="{plate}"><div class="card fullcard">'
-            f'<img class="cardimg" src="{card.full}" alt=""></div>{numbers}</div>'
+            f'<div class="{plate}"><div class="card fullcard{posture}">'
+            f'<img class="cardimg" src="{card.full}" alt="">'
+            f"{_stars_html(card, overlay=True)}"
+            f"</div>{numbers}</div>"
         )
-    frame, line = _frame_of(card)
-    # 名字条按长度自适应（字号/行数都在这里定死，保证名字完整显示；顺带把立绘框高度让出来）
-    name_size, name_lines, name_height = _name_box(card.name or str(card.card_id))
-    name_style = f'font-size:{name_size}px;line-height:{round(name_size * 1.28, 1)}px;max-height:{name_height}px'
-    art_height = max(18, 38 - (name_lines - 1) * 10)
-    # ⚠ 卡面用真 `<img>` 而不是 CSS 背景图：宿主渲染时等的是页面的 load 事件，
-    # 背景图**不保证**在截屏前已经画好（实测发到群里的棋盘常有空卡面），
-    # `<img>` 的加载与解码是 load 的一部分，配 contract 里那个 wait_until="networkidle" 才稳。
-    art = f'<img class="art" src="{card.art}" alt="">' if card.art else ""
-    type_line = f'<div class="tline">{_escape(card.type_line)}</div>' if card.type_line else ""
-    effect = f'<div class="text">{_escape(card.effect)}</div>' if card.effect else ""
-    stats = (
-        f'<div class="stat">{_escape(card.stats_text)}</div>'
-        if card.kind == "monster" and card.stats_text
-        else ""
-    )
-    position = "" if card.attack else '<div class="pos">守</div>'
-    numbers = (
-        f'<div class="fnum">{_escape(card.field_text)}</div>'
-        if card.kind == "monster" and card.field_text
-        else ""
-    )
+    # 兜底（缓存里暂时没有：正在后台补 / 离线）：只画 名字 + 星级 + 攻守——**不画立绘、不写效果**
+    name_size, _lines, name_height = _name_box(card.name or str(card.card_id))
+    name_style = f"font-size:{name_size}px;line-height:{round(name_size * 1.28, 1)}px;max-height:{name_height}px"
+    frame, _line = _frame_of(card)
     return (
-        f'<div class="{plate}"><div class="card face{" noart" if not card.art else ""}" '
-        f'style="--frame:{frame};--line:{line}">'
+        f'<div class="{plate}"><div class="card bare{posture}" style="--frame:{frame}">'
         f'<div class="cname" style="{name_style}">{_escape(card.name or card.card_id)}</div>'
         f"{_stars_html(card)}"
-        f'<div class="artbox" style="height:{art_height}px">{art}</div>'
-        f"{type_line}{effect}{stats}{position}</div>{numbers}</div>"
+        f'<div class="barestat">{_escape(card.field_text)}</div>'
+        f"</div>{numbers}</div>"
     )
-
-
 def _piles_html(side: SideView) -> str:
     """一侧的牌堆（墓地 / 除外 / 额外的数字，MD 图右边那几个小堆）。
 
@@ -587,9 +581,24 @@ _CSS = """
   .card .artbox {{ height: 38px; margin: 0 1px; overflow: hidden; border: 1px solid rgba(0,0,0,.6);
     background: linear-gradient(160deg, #2b2417, #0c0a06); }}
   .card .art {{ width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }}
-  /* 整卡卡图：直接铺满卡位（卡图本身就是标准卡面，别再叠自绘的名字条与卡文） */
+  /* 完整卡图：直接铺满卡位（就是真卡面）；守备表示整张卡转 90° */
   .card.fullcard {{ padding: 0; background: #0b0e18; }}
   .card.fullcard .cardimg {{ width: 100%; height: 100%; object-fit: fill; display: block; }}
+  .card.def {{ transform: rotate(90deg) scale(.94); }}
+  /* 叠在卡图上方的星级条（用户口径：卡图上面加星级） */
+  .card .stars.over {{ position: absolute; top: 1px; left: 0; right: 0; text-align: right;
+    padding-right: 3px; font-size: 9px; line-height: 10px; color: #ffd76a;
+    text-shadow: 0 1px 2px #000, 0 0 5px #000; }}
+  .card .stars.over.rank {{ color: #1b1b1b; text-shadow: 0 0 2px #ffd76a, 0 0 5px #ffd76a; }}
+  .card .stars.over.link {{ font-size: 8px; color: #cfe9ff; }}
+  /* 兜底（暂时没整卡图）：名字 + 星级 + 攻守，不画立绘/效果 */
+  .card.bare {{ display: flex; flex-direction: column; align-items: stretch; justify-content: center;
+    gap: 2px; background:
+      repeating-linear-gradient(45deg, rgba(255,255,255,.06) 0 5px, rgba(0,0,0,0) 5px 10px),
+      linear-gradient(180deg, var(--frame, #7a4a18), #140e05 92%); }}
+  .card.bare .cname {{ background: none; color: #ffeccd; padding: 0 3px; }}
+  .card.bare .barestat {{ font-size: 10px; font-weight: 800; color: #ffe9bd; text-align: center;
+    text-shadow: 0 1px 2px #000; }}
   .card .tline {{ margin-top: 2px; font-size: 7px; line-height: 10px; height: 10px; overflow: hidden;
     color: #ffe9bd; text-align: left; padding: 0 3px; background: rgba(0,0,0,.3);
     white-space: nowrap; }}

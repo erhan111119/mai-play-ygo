@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import importlib.util
+import os
 import sys
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -34,3 +35,8 @@ _SDK_ONLY = ("test_manifest.py", "test_plugin_lifecycle.py")
 collect_ignore: list[str] = (
     [] if importlib.util.find_spec("maibot_sdk") is not None else list(_SDK_ONLY)
 )
+
+# 测试里**不要联网补卡图**：`duel/recorder.py` 会在卡出现在场上时把整卡图排进后台线程
+# （自动预热，见 `duel/card_images.py`），而用例里用的多是假卡号——联网只会拖慢测试、
+# 顺便往 `temp/card_pics/` 塞垃圾文件。关掉之后只读缓存（出图退化成兜底卡面）。
+os.environ.setdefault("MAIPLAYYGO_NO_PIC_FETCH", "1")

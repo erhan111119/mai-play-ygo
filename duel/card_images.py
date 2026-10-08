@@ -51,6 +51,10 @@ DEFAULT_CACHE_DIR = _PLUGIN_ROOT / "temp" / "card_pics"
 
 _DIGITS = re.compile(r"^\d{1,10}$")
 
+#: 关掉联网补齐（环境变量 `MAIPLAYYGO_NO_PIC_FETCH=1`）：测试与离线部署用，
+#: 关掉之后只读缓存（出图会退化成"名字 + 星级 + 攻守"的兜底卡面）。
+_disabled = os.environ.get("MAIPLAYYGO_NO_PIC_FETCH") == "1"
+
 
 def cache_dir_for(root: Optional[Path] = None) -> Path:
     """缓存目录（不存在就建出来）；`root` 只在测试里传，正常用默认那份。"""
@@ -78,6 +82,8 @@ def fetch_pic(card_id: int, cache: Path) -> Optional[Path]:
     existing = cached_pic(card_id, cache)
     if existing is not None:
         return existing
+    if _disabled:
+        return None
     key = str(int(card_id))
     if not _DIGITS.match(key):
         logger.warning("卡号不合法，跳过补图：%r", card_id)
@@ -163,7 +169,7 @@ def request_async(card_id: int, cache: Path) -> None:
         key = int(card_id)
     except (TypeError, ValueError):
         return
-    if key <= 0 or cached_pic(key, cache) is not None:
+    if _disabled or key <= 0 or cached_pic(key, cache) is not None:
         return
     with _executor_lock:
         if key in _pending:

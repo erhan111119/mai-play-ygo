@@ -67,8 +67,12 @@ def test_face_down_card_never_reveals_art_or_name() -> None:
     assert "AAAA" not in html, "里侧的卡不能带上卡图（即使视图对象里塞了图）"
 
 
-def test_missing_art_falls_back_to_name_frame() -> None:
-    """没有卡图时画卡名框（`noart`），并且带上卡种配色。"""
+def test_fallback_card_shows_name_and_stats_only() -> None:
+    """暂时没有整卡图（正在后台补 / 离线）时的兜底：**只画名字 + 星级 + 攻守**。
+
+    用户口径（2026-10-09）："不用你做的立绘加卡框了……不用写效果这类"——
+    所以兜底里不该出现立绘框、类型行或效果文案。
+    """
 
     html = build_html(
         FieldView(
@@ -77,13 +81,40 @@ def test_missing_art_falls_back_to_name_frame() -> None:
             bottom=SideView(
                 label="我方",
                 lp=8000,
-                monsters=[CardView(1, "无图怪", art="")],
-                spells=[CardView(2, "无图魔法", kind="spell", art="")],
+                monsters=[CardView(1, "无图怪", atk=1700, def_=400, level=4, art="",
+                                   type_line="怪兽/效果", effect="①：这段效果不该被画出来。")],
+                spells=[CardView(2, "无图魔法", kind="spell", art="", type_line="魔法/速攻")],
             ),
         )
     )
-    assert "noart" in html and "无图怪" in html and "无图魔法" in html
-    assert "--frame:#14503a" in html, "魔法卡要用绿色卡框"
+    assert "无图怪" in html and "1700/400" in html, "兜底要写名字与攻守"
+    assert "这段效果不该被画出来" not in html, "兜底不该画效果文案"
+    assert "怪兽/效果" not in html, "兜底不该画类型行"
+    assert "--frame:#14503a" in html, "魔法卡兜底要用绿色卡框"
+
+
+def test_full_image_card_gets_stars_and_stats_overlays() -> None:
+    """**完整卡图** + 我们的两个角标：上面星级、下面攻守；守备表示整张卡转 90°。
+
+    用户口径（2026-10-09）："卡图就直接用完整卡图……上面加上星级，下面直接写攻击力守备力就行，
+    另外注意一下朝向问题就可以了，不用写效果这类"。
+    """
+
+    attack_card = CardView(1, "闪刀姬-燎里", full="data:image/jpeg;base64,AAAA",
+                           atk=1500, def_=1000, level=4, type_line="怪兽/效果",
+                           effect="①：这段效果不该被画出来。")
+    defend_card = CardView(2, "守备怪", full="data:image/jpeg;base64,BBBB",
+                           atk=2000, def_=2100, level=8, attack=False)
+    html = build_html(
+        FieldView(title="t", turn=1, bottom=SideView(label="我方", lp=8000,
+                                                     monsters=[attack_card, defend_card]))
+    )
+    assert html.count('class="cardimg"') == 2, "两张都要用整卡图"
+    assert 'class="stars over"' in html, "卡图上方要有星级条"
+    assert 'class="card fullcard def"' in html, "守备表示要旋转（朝向问题）"
+    assert "1500/1000" in html and "2000/2100" in html, "下面要写攻守"
+    assert 'class="cname"' not in html, "有整卡图就不该再叠自绘的名字条"
+    assert "这段效果不该被画出来" not in html, "不写效果文案"
 
 
 def test_link_monster_shows_attack_only() -> None:
@@ -140,8 +171,8 @@ def test_zones_are_mapped_to_slots() -> None:
     assert view.bottom.lp == 6200 and view.top.lp == 3100
 
 
-def test_card_face_shows_chinese_name_type_and_effect() -> None:
-    """**卡面是自绘的标准卡框**：中文卡名、类型行、卡文都要画出来（卡图缺了也一样画）。"""
+def test_fallback_keeps_rank_and_link_marks_readable() -> None:
+    """兜底卡面（没有整卡图）也要把**阶级星**与 **LINK 数**标对——超量黑底金星、连接写 LINK-n。"""
 
     html = build_html(
         FieldView(
@@ -151,23 +182,16 @@ def test_card_face_shows_chinese_name_type_and_effect() -> None:
                 label="我方",
                 lp=8000,
                 monsters=[
-                    CardView(
-                        1,
-                        "救援少女·卡尔麦尔",
-                        atk=2600,
-                        def_=1800,
-                        level=4,
-                        type_line="怪兽/超量/效果",
-                        effect="①：这张卡超量召唤的场合才能发动。",
-                        art="",
-                    )
+                    CardView(1, "救援少女·卡尔麦尔", atk=2600, def_=1800, level=4, rank=True),
+                    CardView(2, "闪刀姬=零露", atk=2000, level=2, link=True),
                 ],
             ),
         )
     )
-    for needle in ("救援少女·卡尔麦尔", "怪兽/超量/效果", "①：这张卡超量召唤的场合才能发动。", "2600 / 1800"):
-        assert needle in html, needle
-    assert "rank" in html, "超量的星星要按阶级星画（黑底金星）"
+    assert "救援少女·卡尔麦尔" in html and "闪刀姬=零露" in html
+    assert "stars rank" in html, "超量要按阶级星画（黑底金星）"
+    assert "LINK-2" in html, "连接怪要写 LINK 数"
+    assert "2600/1800" in html and "2000/LINK-2" in html, "下面写攻守"
 
 
 def test_stack_counts_are_rendered() -> None:
@@ -222,15 +246,26 @@ def test_long_card_name_shrinks_instead_of_being_cut() -> None:
     原来名字条固定一行 + overflow:hidden，长名字直接被切掉。
     """
 
-    from duel.field_image import _NAME_FONT_BASE, _name_box
+    from duel.field_image import _NAME_BOX_WIDTH, _NAME_FONT_BASE, _name_box
 
-    short_size, short_lines, short_h = _name_box("无限泡影")
-    long_size, long_lines, long_h = _name_box("超魔导龙骑士-真红眼龙骑士")
-    longer_size, longer_lines, _ = _name_box("真红眼暗钢龙-真红眼黑龙剑士·究极形态")
+    def units(name: str) -> float:
+        return sum(1.0 if ord(ch) > 0x2E80 else 0.55 for ch in name)
+
+    short_size, short_lines, _ = _name_box("无限泡影")
     assert short_lines == 1 and abs(short_size - _NAME_FONT_BASE) < 0.01, (short_size, short_lines)
-    assert long_lines >= 2 and long_size < short_size, (long_size, long_lines)
-    assert long_h >= long_lines * long_size, (long_h, long_size, long_lines)
-    assert longer_lines >= long_lines and longer_size <= long_size, (longer_size, longer_lines)
+
+    # 不变量：**算出来的字号与行数一定装得下这个名字**（每行放得下 size×字宽 个字符）
+    for name in ("闪刀姬=零露", "异解△领域-瓦尔涡罗斯", "超魔导龙骑士-真红眼龙骑士",
+                 "杀手级调整曲·红印鉴唱片师", "真红眼暗钢龙-真红眼黑龙剑士·究极形态",
+                 "Kozmo Dark Destroyer", "D/D/D 超死伟王 白地狱终末神"):
+        size, lines, height = _name_box(name)
+        assert size * units(name) <= lines * _NAME_BOX_WIDTH + 0.01, (name, size, lines)
+        assert height >= lines * size, (name, height, size, lines)
+        assert 1 <= lines <= 3, (name, lines)
+
+    # 长名字会退到多行、字号也随之变小（不再是"一行截断"）
+    long_size, long_lines, _ = _name_box("超魔导龙骑士-真红眼龙骑士")
+    assert long_lines >= 2 and long_size < _NAME_FONT_BASE, (long_size, long_lines)
     # 端到端：长名字原样出现在 HTML 里，并带上算出来的字号
     html = build_html(
         FieldView(
@@ -267,11 +302,13 @@ def _run_all() -> int:
     """不装 pytest 时的自跑入口（与其它测试文件一致）。"""
 
     tests: List = [
+        # 不装 pytest 时的自跑入口：与上面定义的用例保持一致（新增用例记得加到这里）
         test_face_down_card_never_reveals_art_or_name,
-        test_missing_art_falls_back_to_name_frame,
+        test_fallback_card_shows_name_and_stats_only,
         test_link_monster_shows_attack_only,
         test_zones_are_mapped_to_slots,
-        test_card_face_shows_chinese_name_type_and_effect,
+        test_fallback_keeps_rank_and_link_marks_readable,
+        test_full_image_card_gets_stars_and_stats_overlays,
         test_stack_counts_are_rendered,
         test_full_card_image_wins_over_drawn_frame,
         test_long_card_name_shrinks_instead_of_being_cut,
