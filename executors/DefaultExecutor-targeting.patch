@@ -1,7 +1,9 @@
 diff --git a/Game/AI/DefaultExecutor.cs b/Game/AI/DefaultExecutor.cs
+index ab31e2d..83261cb 100644
 --- a/Game/AI/DefaultExecutor.cs
 +++ b/Game/AI/DefaultExecutor.cs
-@@ -1082,16 +1144,33 @@ namespace WindBot.Game.AI
+@@ -1081,26 +1143,115 @@ namespace WindBot.Game.AI
+             return true;
          }
  
 +        /// <summary>
@@ -14,6 +16,27 @@ diff --git a/Game/AI/DefaultExecutor.cs b/Game/AI/DefaultExecutor.cs
 +        protected static IList<ClientCard> PickEnemyRemovalTarget(IList<ClientCard> cards, int hint, int max)
 +        {
 +            return EnemyTargeting.PickEnemyRemovalTarget(cards, hint, max);
++        }
++
++        /// <summary>
++        /// 把"这一张无效卡该指向对面哪只怪"交给决策层（开关/配额/熔断都在
++        /// <see cref="MaiBotBrain.PickDisableTarget"/> 里）；没问到就返回 null，**调用方沿用脚本口径**。
++        ///
++        /// 候选先用 <see cref="NegateDecision.CollectDisableCandidates"/> 过一遍：把"选它一定白费"
++        /// 的（效果已被无效过、不能被效果指定、通常怪兽、自己场上的）剔掉，再交给模型。
++        /// 候选不足两张时不问——纯选择题，一张就没得选，白等 0.6~2.5 秒不划算。
++        ///
++        /// 注意"能不能被陷阱指定"这条只在发动源是魔法/陷阱时生效：见
++        /// <see cref="DefaultGetDisableMonsterTarget"/> 的说明（「效果遮蒙者」是怪兽）。
++        /// </summary>
++        protected ClientCard PickDisableTargetByAI()
++        {
++            if (!MaiBotBrain.Enabled)
++                return null;
++            bool spellTrapSource = Card != null && (Card.IsSpell() || Card.IsTrap());
++            List<ClientCard> candidates =
++                NegateDecision.CollectDisableCandidates(Enemy.MonsterZone, spellTrapSource);
++            return MaiBotBrain.PickDisableTarget(candidates, Card, Duel);
 +        }
 +
          /// <summary>
@@ -30,6 +53,10 @@ diff --git a/Game/AI/DefaultExecutor.cs b/Game/AI/DefaultExecutor.cs
 +        /// 那只对方怪兽的效果直到回合结束时无效"——要无效的是**正在发效果的那只**，链上那一刻的目标
 +        /// 是确定的（不受"猜哪只更值钱"影响），所以先看它；它不合法（已经被无效过／不能被选为目标）时
 +        /// 才退回启发式，最后再看战斗相关与场上的特定卡。
++        ///
++        /// ⚠ 2026-10-08 第二处调整：**"能不能被陷阱指定"只在发动源是魔法/陷阱时才判**。
++        /// 上游这段把 `IsShouldNotBeSpellTrapTarget()` 无条件套上，而「效果遮蒙者」是**怪兽**——
++        /// 拿"不能被陷阱卡指定"去卡一个怪效的合法目标，等于把刚发效果的怪放过去（误杀）。
          /// </summary>
          protected ClientCard DefaultGetDisableMonsterTarget()
          {
@@ -41,9 +68,12 @@ diff --git a/Game/AI/DefaultExecutor.cs b/Game/AI/DefaultExecutor.cs
 -            }
 -
              ClientCard LastChainCard = Util.GetLastChainCard();
++            bool spellTrapSource = Card != null && (Card.IsSpell() || Card.IsTrap());
  
-@@ -1099,7 +1178,24 @@ namespace WindBot.Game.AI
-                 !LastChainCard.IsDisabled() && !LastChainCard.IsShouldNotBeTarget() && !LastChainCard.IsShouldNotBeSpellTrapTarget())
+             if (LastChainCard != null && LastChainCard.Controller == 1 && LastChainCard.Location == CardLocation.MonsterZone &&
+-                !LastChainCard.IsDisabled() && !LastChainCard.IsShouldNotBeTarget() && !LastChainCard.IsShouldNotBeSpellTrapTarget())
++                !LastChainCard.IsDisabled() && !LastChainCard.IsShouldNotBeTarget()
++                && !(spellTrapSource && LastChainCard.IsShouldNotBeSpellTrapTarget()))
              {
 +                // 只在这条**推翻了**旧口径（"最该被废的那只"是另一张）时打一行：下一局实录里
 +                // 出现 `[手坑]` 就说明新顺序生效了（群友实测那次就是把刚发效果的放了过去）。
@@ -55,15 +85,44 @@ diff --git a/Game/AI/DefaultExecutor.cs b/Game/AI/DefaultExecutor.cs
 +                    Logger.WriteLine("[手坑] 无效目标＝刚发效果的「" + EnemyTargeting.NameOf(LastChainCard)
 +                        + "」（旧口径会点「" + EnemyTargeting.NameOf(guessed) + "」）");
 +                }
++                // 决策层（2026-10-08 补齐）：**"该去针对谁"由模型定**，包括"要不要改点别的怪"。
++                // 默认口径（刚发效果的那只）仍是备胎：模型没答上来就按脚本走，跟开决策层之前一样。
++                // 候选里同时包含"正在发效果的那只"与场上其它可无效的怪（`CollectDisableCandidates`
++                // 已把"选了也白费"的剔掉），所以模型能权衡"拦这次发动"还是"废那只更大的威胁"。
++                ClientCard picked = PickDisableTargetByAI();
++                if (picked != null)
++                {
++                    if (picked != LastChainCard)
++                    {
++                        Logger.WriteLine("[决策] 无效目标：改点「" + EnemyTargeting.NameOf(picked)
++                            + "」，而不是刚发效果的「" + EnemyTargeting.NameOf(LastChainCard) + "」");
++                    }
++                    return picked;
++                }
                  return LastChainCard;
              }
  
 +            if (Duel.Player == 1)
 +            {
-+                ClientCard target = Enemy.MonsterZone.GetShouldBeDisabledBeforeItUseEffectMonster();
-+                if (target != null)
-+                    return target;
++                ClientCard guessed = Enemy.MonsterZone.GetShouldBeDisabledBeforeItUseEffectMonster();
++                // 决策层（2026-10-08）：这一支是"无效哪只怪"里**唯一有选择权**的地方——
++                // 上一支是链上确定的、下面两支是特定时点的战斗判据，都不是选择题。
++                // 没开决策层 / 没问到／候选不够 → 原样退回脚本口径，**绝不硬选**。
++                ClientCard chosen = PickDisableTargetByAI();
++                if (chosen != null)
++                {
++                    if (guessed != chosen)
++                    {
++                        Logger.WriteLine("[决策] 无效目标：跳过脚本口径「"
++                            + EnemyTargeting.NameOf(guessed) + "」，改无效「"
++                            + EnemyTargeting.NameOf(chosen) + "」");
++                    }
++                    return chosen;
++                }
++                if (guessed != null)
++                    return guessed;
 +            }
 +
              if (Bot.BattlingMonster != null && Enemy.BattlingMonster != null)
              {
+                 if (!Enemy.BattlingMonster.IsDisabled() && Enemy.BattlingMonster.IsCode(_CardId.EaterOfMillions))

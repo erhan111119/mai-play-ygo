@@ -21,6 +21,7 @@ import logging
 import os
 import time
 
+from .card_images import DEFAULT_CACHE_DIR, request_async as request_card_pic
 from .cards import CardDatabase
 from .fieldstate import FieldState, spell_zone_label, zone_label
 from .protocol import (
@@ -287,6 +288,13 @@ class DuelRecorder:
         # 实时局面（LP / 场地占用）与统计并行维护，供「查房」随时读取
         self.field_state.apply(event)
         self._note_placement(event)
+        # 卡图**自动预热**（用户口径 2026-10-09："预热也做了吧，自动预热"）：卡一有动静就把它的
+        # 整卡图排进后台单线程池（`duel/card_images.py`：缓存里有就跳过、没有才联网，重复卡号只排一次），
+        # 等群里问 /查房 时缓存里已经在了——出图不用等下载，也不会出现"这格没卡图"。
+        # 这里只排"可能出现在场上的卡"（召唤/放置/移动/改表示形式）；查房图也只画这些
+        #（里侧画卡背、墓地与除外不画卡），多下几张的代价远小于漏图。
+        if event.kind in ("summon", "sp_summon", "flip_summon", "set", "move", "pos_change"):
+            request_card_pic(event.card_id, DEFAULT_CACHE_DIR)
 
         if event.kind == "win":
             self.winner_seat = event.player if event.player in (0, 1) else None

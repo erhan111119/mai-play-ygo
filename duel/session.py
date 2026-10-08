@@ -96,6 +96,18 @@ class SessionConfig:
     # （卡组打法数据与它的文件路径）／`brain_file`（逐步问 AI 的问答前缀）。
     # 它们都服务于已删的"计划感知执行器 PlanAware"（AI 教练 / 打法数据 / 逐步问 AI），
     # 2026-10-07 用户口径把整条链路删掉了，写文件的代码（`_playbook_path`）也一起删除。
+    brain_file: Optional[Path] = None
+    """**阻抗决策层**的问答前缀（见 `duel/brain_bridge.py`）；None＝不起决策层。
+
+    ⚠ 与上面删掉的那个同名参数不是一回事：老的那个服务于"逐步问 AI / 展开每一步都问"，
+    这个只服务**阻抗时点**（对手回合 + 阻抗卡），展开期一步都不问。
+    """
+    brain_target_choice: bool = True
+    """决策层是否回答"无效哪只怪"（默认开）。"""
+    brain_negate_gate: bool = False
+    """决策层是否回答"要不要交这张阻抗"（默认关，先跑镜像 A/B）。"""
+    brain_timeout_ms: int = 2500
+    """WindBot 等答复的上限（毫秒）；必须大于 Python 侧等模型的上限。"""
     taunt_enabled: bool = True
     """是否在局内按概率说挑衅台词。"""
     taunt_chance_per_second: float = 0.03
@@ -270,6 +282,11 @@ class DuelSession:
             db_path=self._config.cards_cdb,
             debug=self._config.bot_debug,
             chat=self._config.in_game_chat,
+            # 阻抗决策层：只有给了前缀 WindBot 才会问（见 MaiBotBrain / brain_bridge）
+            brain_file=self._config.brain_file,
+            brain_target_choice=self._config.brain_target_choice,
+            brain_negate_gate=self._config.brain_negate_gate,
+            brain_timeout_ms=self._config.brain_timeout_ms,
         )
         self._windbot = WindBotProcess(
             self._config.windbot_executable,

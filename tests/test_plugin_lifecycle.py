@@ -23,6 +23,7 @@ import importlib.util
 import sqlite3
 import sys
 import tempfile
+import time
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
@@ -155,12 +156,18 @@ class FakeLlm:
         self.reply = "这局我赢啦，对面 8 回合就被我打没了。"
         self.fail = False
         self.prompts: List[str] = []
+        #: 每次调用收到的完整参数——断言"配置里的模型名真的传到调用点了"要靠它
+        self.calls: List[Dict[str, Any]] = []
+        #: 让替身"想一会儿"（测超时路径用）
+        self.delay = 0.0
 
     async def generate(self, prompt: str = "", **kwargs: Any) -> Dict[str, Any]:
-        """记录提示词并返回预设回复。"""
+        """记录提示词与参数并返回预设回复。"""
 
-        del kwargs
         self.prompts.append(prompt)
+        self.calls.append({"prompt": prompt, **kwargs})
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if self.fail:
             return {"success": False, "error": "模拟模型不可用"}
         return {"success": True, "response": self.reply}
@@ -663,6 +670,13 @@ async def test_on_unload_releases_data_dir() -> None:
         await instance.on_unload()
         (data_dir / "deck_pool.db").unlink()
         (data_dir / "decks").rmdir()
+        # 2026-10-08 加的两样东西也在这个目录里，逐个删干净才算"句柄都放开了"：
+        # 训练记录库（`train/training.db`，同样是一次连接都不能留着）与自动生成的面板密钥。
+        (data_dir / "train" / "training.db").unlink()
+        for sub in ("logs", "combos", "decks"):
+            (data_dir / "train" / sub).rmdir()
+        (data_dir / "train").rmdir()
+        (data_dir / "webui_key.txt").unlink()
         data_dir.rmdir()
 
 
@@ -1855,6 +1869,180 @@ async def test_submitted_deck_style_follows_config() -> None:
             assert "Blue-Eyes" in instance._describe_deck_choice(resolved, fixed=True)
         finally:
             await instance.on_unload()
+
+
+def test_llm_section_owns_the_models_and_the_decision_layer_reads_it() -> None:
+    """模型配置收在 `[llm]` 一节里，老配置里的 `duel.brain_model` 只被忽略、不会炸。
+
+    这条护栏针对的是"配置搬家"这类改动：字段挪了地方，老配置文件还在用户机器上，
+    搬完之后必须**读得进去、跑得起来**，而不是抛验证错误让插件加载失败。
+    """
+
+    if not _sdk_available():
+        print("      （跳过：未找到 maibot_sdk）")
+        return
+
+    module = load_plugin_module()
+    config = module.MaiPlayYgoConfig()
+    # 三处用途各有自己的模型与超时
+    assert hasattr(config.llm, "summary_model") and hasattr(config.llm, "summary_timeout_ms")
+    assert config.llm.decision_model == "deepseek-chat", config.llm.decision_model
+    assert config.llm.decision_timeout_ms == 2500, config.llm.decision_timeout_ms
+    assert hasattr(config.llm, "training_model") and hasattr(config.llm, "training_timeout_ms")
+    # 决策层的两项已经搬走：模型里不该再有旧键（否则就有两份真相）
+    assert "brain_model" not in module.DuelConfig.model_fields
+    assert "brain_timeout_ms" not in module.DuelConfig.model_fields
+    # 面板与训练两节的默认值
+    assert config.webui.enabled is True and config.webui.port == 17911
+    assert config.webui.host == "127.0.0.1", "面板默认不该对外监听"
+    assert config.training.enabled is True
+
+    # 老配置文件（带 duel.brain_model / duel.brain_timeout_ms）要能照常加载
+    with tempfile.TemporaryDirectory() as directory:
+        instance, _context = make_plugin(
+            Path(directory),
+            {
+                "plugin": {"enabled": True, "config_version": "1.0.0"},
+                "duel": {"brain_model": "old-model", "brain_timeout_ms": 3333, "brain_enabled": True},
+            },
+        )
+        assert instance.config.duel.brain_enabled is True
+        assert instance.config.llm.decision_model == "deepseek-chat", "老键不该盖住新节的默认值"
+
+
+async def test_llm_section_reaches_summary_and_decision_calls() -> None:
+    """配置里的模型名要真的传到调用点：总结用 `summary_model`，决策用 `decision_model`。"""
+
+    if not _sdk_available():
+        print("      （跳过：未找到 maibot_sdk）")
+        return
+
+    with tempfile.TemporaryDirectory() as directory:
+        instance, context = make_plugin(Path(directory))
+        await instance.on_load()
+        try:
+            instance.config.llm.summary_model = "总结专用"
+            instance.config.llm.decision_model = "决策专用"
+            instance.config.llm.decision_timeout_ms = 2000
+
+            summary = await instance._write_summary("回合数 3｜动作 5 比 4", {"winner_is_self": True, "turns": 3})
+            assert summary == context.llm.reply, summary
+            assert context.llm.calls[-1]["model"] == "总结专用", context.llm.calls[-1]
+
+            answer = await instance._brain_generate("要无效哪只？")
+            assert answer == context.llm.reply, answer
+            assert context.llm.calls[-1]["model"] == "决策专用", context.llm.calls[-1]
+            assert context.llm.calls[-1]["max_tokens"] == instance.config.duel.brain_max_tokens
+        finally:
+            await instance.on_unload()
+
+
+async def test_summary_times_out_instead_of_hanging_the_announcement() -> None:
+    """总结卡住时要按 `llm.summary_timeout_ms` 收手（返回空串让播报退化），不能一直挂着。"""
+
+    if not _sdk_available():
+        print("      （跳过：未找到 maibot_sdk）")
+        return
+
+    with tempfile.TemporaryDirectory() as directory:
+        instance, context = make_plugin(Path(directory))
+        await instance.on_load()
+        try:
+            instance.config.llm.summary_timeout_ms = 2000  # 毫秒：替身要睡 5 秒，必定超时
+            context.llm.delay = 5.0
+            started = time.monotonic()
+            summary = await instance._write_summary("复述", {"winner_is_self": False, "turns": 2})
+            elapsed = time.monotonic() - started
+            assert summary == "", summary
+            assert elapsed < 3.5, f"超时没生效，等了 {elapsed:.2f} 秒"
+        finally:
+            await instance.on_unload()
+
+
+async def test_panel_starts_with_the_plugin_and_stops_on_unload() -> None:
+    """面板随插件起、随插件停（且端口真的释放）。
+
+    这里用配置里的 `port = 0` 让系统分配：用例不该赌某个端口是空的。
+    """
+
+    if not _sdk_available():
+        print("      （跳过：未找到 maibot_sdk）")
+        return
+
+    import http.client
+
+    with tempfile.TemporaryDirectory() as directory:
+        instance, _context = make_plugin(
+            Path(directory),
+            {
+                "plugin": {"enabled": True, "config_version": "1.0.0"},
+                "webui": {"enabled": True, "host": "127.0.0.1", "port": 0, "api_key": "k" * 32},
+            },
+        )
+        await instance.on_load()
+        server = instance._webui
+        assert server is not None, "面板没有随插件启动"
+        port = server.bound_port
+        assert port > 0, port
+
+        def get(path: str) -> int:
+            """连本机面板的环回端口发一个请求，返回状态码。"""
+
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            try:
+                connection.request("GET", path, headers={"X-API-Key": "k" * 32})
+                return connection.getresponse().status
+            finally:
+                connection.close()
+
+        assert get("/api/status") == 200
+        assert get("/api/training") == 200
+
+        await instance.on_unload()
+        assert instance._webui is None, "卸载后面板句柄没清掉"
+        released = False
+        try:
+            get("/api/status")
+        except OSError:
+            released = True
+        assert released, "卸载后面板还在答话"
+
+
+def test_train_runner_is_built_with_the_configured_workspace() -> None:
+    """训练执行器要按配置建在工作目录上，模型名也要推给它（不是硬编码）。"""
+
+    if not _sdk_available():
+        print("      （跳过：未找到 maibot_sdk）")
+        return
+
+    import asyncio as asyncio_module
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instance, _context = make_plugin(
+            root / "data",
+            {
+                "plugin": {"enabled": True, "config_version": "1.0.0"},
+                "llm": {"training_model": "训练专用"},
+                "training": {"max_duels_per_run": 12},
+            },
+        )
+
+        async def run() -> None:
+            await instance.on_load()
+            try:
+                runner = instance.training_runner()
+                assert runner is not None, "训练执行器没建起来"
+                assert runner.workspace == root / "data" / "train", runner.workspace
+                assert runner.max_duels == 12, runner.max_duels
+                assert runner._model_name() == "训练专用", runner._model_name()
+                # 配了工作目录时要用配置那个
+                instance.config.training.workspace = str(root / "elsewhere")
+                assert instance._training_workspace() == root / "elsewhere"
+            finally:
+                await instance.on_unload()
+
+        asyncio_module.run(run())
 
 
 def main() -> int:

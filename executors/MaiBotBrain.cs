@@ -8,20 +8,30 @@ using WindBot.Game;
 namespace WindBot.Game.AI
 {
     /// <summary>
-    /// 逐步问 AI 的通道（**所有出牌脚本共用**）：把"要不要发动这张卡、有哪些选项"写进
-    /// ``&lt;BrainFile&gt;.q``，等外面的 Python 侧把答复写进 ``&lt;BrainFile&gt;.a``（带同一个 id）。
+    /// **阻抗决策层**的问答通道（所有出牌脚本共用）：把"这一张无效卡该指向对面哪只怪"
+    /// 写进 ``&lt;BrainFile&gt;.q``，等外面的 Python 侧把答复写进 ``&lt;BrainFile&gt;.a``（带同一个 id）。
+    ///
+    /// **范围（2026-10-08 定）**：只服务**阻抗时点**——对手回合里"要不要交这张阻抗"（`BrainNegateGate`，
+    /// 默认关）与"无效哪一只"（`BrainTargetChoice`，默认开）。**展开期一步都不问**，而且是结构性保证：
+    /// 钩子的入口就按"对手回合 + 这张是 <see cref="NegateDecision.IsNegateCard"/> 里的卡"卡住，
+    /// 再加上旧的两个展开期钩子（闲时选动作 / 改选攻击目标）由 `BrainIdleChoice` 默认关死。
+    ///
+    /// **为什么必须收窄**：老口径（2026-10-07 之前）钩子包裹**全部** `ExecutorType.Activate` 规则，
+    /// 于是模型在展开的每一步插一脚；三次实测都没收益，机制上 **86% 是在否决脚本本来想做对的事**——
+    /// 模型看得见场面，看不见脚本的整套计划。而实测 8 局真实对局后，"对手回合里我方发动的连锁"
+    /// 只有 **3~21 次/局（平均 10.8）**，收窄后一局十次左右的问答，延迟才谈得上可控。
     ///
     /// **为什么放在基类**：问答通道原先只做在通用执行器（PlanAware）里，于是"开 AI 就得换成通用
     /// 执行器"。实测这个代价值得警惕——同一副牌同一对手：专属脚本 13% 胜/16.0 动作，通用脚本
     /// 0%/8.7。把钩子提到基类之后，任何卡组自带的出牌脚本都能问 AI，不必再牺牲脚本。
     ///
-    /// 三条规矩，都是实测教训：
+    /// 四条规矩，都是实测教训：
     ///   * **没传 ``BrainFile=`` 就完全不起作用**（77 个自带执行器零影响）；
-    ///   * 等答复有上限（``BrainTimeoutMs``，默认 40000ms——一次"会思考的模型"答复要约 13 秒，
-    ///     30 秒的老上限会在负载高时把答复丢掉），超时按脚本自己的判断继续；
-    ///   * **每回合问 AI 的总等待有上限**（``BrainBudgetMs``，默认 8000ms）：一个回合的问与答
-    ///     都要落在内核的**单回合时限**里，问得太多会把时限吃光——实测整局一步没走、
-    ///     结局是"超时"（30 秒时限、问了 30 次的组合回合）。预算用完之后这一回合照脚本打；
+    ///   * 等答复有上限（``BrainTimeoutMs``），超时按脚本自己的判断继续；**连续 3 次没拿到答复就
+    ///     熔断本局的问答**（模型不可用时继续等只会把内核时限吃光）；
+    ///   * **每回合问 AI 的总等待有上限**（``BrainBudgetMs`` 自己回合 / ``BrainOppBudgetMs``
+    ///     对手回合）：一个回合的问与答都要落在内核的**单回合时限**里，问得太多会把时限吃光——
+    ///     实测整局一步没走、结局是"超时"，也实测过 40 局里 5 局因响应窗口等太久直接输掉；
     ///   * 任何异常都吞掉并回退脚本——问 AI 绝不能把一局打不出来。
     /// </summary>
     public static class MaiBotBrain
@@ -40,6 +50,54 @@ namespace WindBot.Game.AI
         private static int _idleTurn = -1;
         private static int _idleUsed;
         private static readonly bool _verbose = Config.GetBool("Debug", false);
+
+        /// <summary>
+        /// 「无效哪一只」（目标选择）开关，配置 `BrainTargetChoice`（默认开）。
+        ///
+        /// 这是决策层里**风险最低的一半**：它只在"脚本本来就要交这张无效卡"的前提下改目标，
+        /// 不会让脚本少交一张牌；而且模型在这里有真信息优势——脚本只认卡号与几张稀疏的静态表
+        /// （`ShouldNotBeTarget` 六十行、`ShouldNotBeSpellTrapTarget` 只有六条），模型认识卡文。
+        /// </summary>
+        private static bool _targetChoiceEnabled = true;
+
+        /// <summary>
+        /// 「要不要交这张阻抗」开关，配置 `BrainNegateGate`（**默认关**）。
+        ///
+        /// 为什么默认关：这一半就是 2026-10-07 之前逐决策问 AI 的老口径，实测三次都没收益，
+        /// 机制是 **86% 在否决脚本本来想做的事**——模型看得见场面，看不见脚本的整套计划
+        /// （"我这回合准备做什么、手里还剩几张阻抗、这套牌的资源循环转到哪一步了"）。
+        /// 按项目纪律：策略类改动先做成开关，跑 ≥80 局/腿的镜像 A/B 之后再谈默认值。
+        /// </summary>
+        private static bool _negateGateEnabled;
+
+        /// <summary>
+        /// 连续超时次数；连续 3 次就把这一整套问答**本局关掉**（一个 WindBot 进程一局）。
+        ///
+        /// 为什么要有熔断：对手回合的等待预算只有 15 秒（`BrainOppBudgetMs`），而当年
+        /// 40 局里有 5 局是"响应窗口等太久"直接被内核判超时输掉的。模型不可用时每次
+        /// 白等 2.5 秒、一回合两三次就把预算吃光——**这时候按脚本打，而不是继续等**。
+        /// 熔断只影响本局，不写盘、不带进下一局。
+        /// </summary>
+        private static int _consecutiveTimeouts;
+        private static bool _tripped;
+        private const int MaxConsecutiveTimeouts = 3;
+
+        /// <summary>
+        /// 旧的两个"展开期"钩子（闲时选动作 / 改选攻击目标）的开关，配置 `BrainIdleChoice`，
+        /// **默认关**。
+        ///
+        /// ⚠ 为什么必须显式关掉、而不是"反正不会调"：这两个钩子**只判 `_enabled`**，而 `_enabled`
+        /// 由"传没传 `BrainFile=`"决定。也就是说只要开了决策层，它们就一起活过来——而它们问的正是
+        /// **展开期的每一步**（"主要阶段这一步做什么""打哪只"），恰好是 2026-10-07 那次
+        /// 三次实测没收益、86% 否决的老口径。决策层的范围是"阻抗时点"，不能顺手把展开也交出去。
+        /// </summary>
+        private static bool _idleChoiceEnabled;
+
+        /// <summary>超时熔断是否已触发（供日志查询）。</summary>
+        public static bool Tripped
+        {
+            get { return _tripped; }
+        }
 
         /// <summary>这条路通不通（没传 BrainFile 就是不通）。</summary>
         public static bool Enabled
@@ -67,6 +125,19 @@ namespace WindBot.Game.AI
             _oppBudgetMs = Config.GetInt("BrainOppBudgetMs", 15000);
             _turnBudget = _budgetMs;
             _maxIdlePerTurn = Config.GetInt("BrainMaxIdlePerTurn", 8);
+            _targetChoiceEnabled = Config.GetBool("BrainTargetChoice", true);
+            _negateGateEnabled = Config.GetBool("BrainNegateGate", false);
+            _idleChoiceEnabled = Config.GetBool("BrainIdleChoice", false);
+
+            // 把"决策层这一局到底开没开、开了哪几半"打出来。**这行是排查"改了配置没反应"
+            // 的第一现场**：`BrainFile=` 一旦没传进来，整套问答就是静默空转（连错误都没有），
+            // 从外面看只会觉得"又变笨了"。所以这行无条件打，不放在 _verbose 里。
+            Logger.WriteLine("阻抗决策层：" + (_enabled
+                ? "开（前缀 " + _path + "）"
+                : "关（没收到 BrainFile= 参数）")
+                + "；无效目标 " + (_targetChoiceEnabled ? "问模型" : "按脚本")
+                + "；交不交 " + (_negateGateEnabled ? "问模型" : "按脚本")
+                + "；等答复上限 " + _timeoutMs + "ms");
         }
 
         /// <summary>
@@ -75,13 +146,130 @@ namespace WindBot.Game.AI
         public static string Ask(string kind, ClientCard card, IList<ClientCard> choices, Duel duel)
         {
             Init();
-            if (!_enabled || string.IsNullOrEmpty(_path) || duel == null)
+            if (!_enabled || _tripped || string.IsNullOrEmpty(_path) || duel == null)
                 return "";
+            if (kind == "activate")
+                kind = "negate_gate";
             int budgetLeft = BudgetLeft(duel);
             if (budgetLeft <= 0)
                 return "";
             _seq++;
             return AskRaw(_seq, BuildQuestion(_seq, kind, card, choices, duel), budgetLeft);
+        }
+
+        /// <summary>
+        /// 「这一张无效卡该指向对面哪只怪」——决策层的目标问题（配置 `BrainTargetChoice`，默认开）。
+        ///
+        /// 调用点：`DefaultExecutor.DefaultGetDisableMonsterTarget` 的**启发式兜底那一支**
+        /// （`Duel.Player == 1` 时按"会解放/除外自己去发效果"的静态名单猜一只）。那一支是这个方法里
+        /// **唯一有选择权**的地方——"刚发效果的那只"是链上确定的（2026-10-08 修过，不在这里动），
+        /// 战斗相关的两只（`EaterOfMillions` / `NumberS39`）是特定时点，也不是选择题。
+        ///
+        /// 三道闸都是"省延迟"，不是策略：
+        /// * 候选少于 2 张就没得选，直接不问（一次问答 0.6~2.5 秒，白问不如不问）；
+        /// * 只在对手回合问（`Duel.Player == 1`）——自己回合的无效系目标不是"该无效谁"的问题；
+        /// * 超时熔断后不再问。
+        ///
+        /// 返回 null 表示"没问到 / 不该问"，调用方**必须沿用脚本自己的口径**（不做兜底选择）。
+        /// </summary>
+        /// <param name="candidates">已按确定性口径过滤过的候选（见 <see cref="NegateDecision.CollectDisableCandidates"/>）。</param>
+        /// <param name="sourceCard">正在判定的这张无效卡（用来判定魔法/陷阱源，也写进问题）。</param>
+        /// <param name="duel">当前对局。</param>
+        public static ClientCard PickDisableTarget(
+            IList<ClientCard> candidates, ClientCard sourceCard, Duel duel)
+        {
+            Init();
+            if (!_enabled || _tripped || !_targetChoiceEnabled || duel == null)
+                return null;
+            if (candidates == null || candidates.Count < 2)
+                return null;
+            if (duel.Player != 1)
+                return null;
+            int budgetLeft = BudgetLeft(duel);
+            if (budgetLeft <= 0)
+                return null;
+
+            _seq++;
+            string answer = AskRaw(
+                _seq, BuildDisableQuestion(_seq, candidates, sourceCard, duel), budgetLeft);
+            int choice;
+            if (!int.TryParse(answer, out choice) || choice < 1 || choice > candidates.Count)
+                return null;
+            ClientCard picked = candidates[choice - 1];
+            if (picked == null)
+                return null;
+            // 日志不在这里打：调用方（DefaultExecutor）同时知道"脚本原本会选哪只"，
+            // 那才是复盘时要看的对照；这里再打一行就是同一件事说两遍。
+            return picked;
+        }
+
+        /// <summary>
+        /// 目标问题的正文：**只写判断"该无效谁"必须的东西**。
+        ///
+        /// 为什么不复用 <see cref="AppendContext"/>：那是给"这张卡要不要发动"写的，会把双方全场
+        /// 每张卡 + 对手已露过的 12 种都塞进去。目标问题只需要"这张无效卡 + 这几只候选 + 连锁上
+        /// 在发生什么"，输入越短答复越快——而对手回合的等待是要挤进内核时限的。
+        /// </summary>
+        private static List<string> BuildDisableQuestion(
+            int id, IList<ClientCard> candidates, ClientCard sourceCard, Duel duel)
+        {
+            List<string> lines = new List<string>();
+            lines.Add("id=" + id);
+            lines.Add("kind=disable_target");
+            lines.Add("source=" + (sourceCard != null ? sourceCard.Id : 0) + ";"
+                + (sourceCard != null ? sourceCard.Name : ""));
+            lines.Add("turn=" + duel.Turn);
+            lines.Add("my_phase=" + (duel.Player == 0 ? "1" : "0"));
+            lines.Add("phase=" + (int)duel.Phase);
+            lines.Add("my_lp=" + (duel.Fields[0] != null ? duel.Fields[0].LifePoints : 0));
+            lines.Add("opp_lp=" + (duel.Fields[1] != null ? duel.Fields[1].LifePoints : 0));
+            // 我方能打出的伤害（判断"现在要不要留牌防守"最直接的量）
+            int damage = 0;
+            if (duel.Fields[0] != null)
+            {
+                foreach (ClientCard card in duel.Fields[0].MonsterZone)
+                {
+                    if (card != null && card.IsFaceup() && card.IsAttack())
+                        damage += card.GetAttackPower();
+                }
+            }
+            lines.Add("my_damage=" + damage);
+            AppendSlimZone(lines, "mine", duel.Fields[0] != null ? duel.Fields[0].MonsterZone : null);
+            AppendSlimZone(lines, "my_spell", duel.Fields[0] != null ? duel.Fields[0].SpellZone : null);
+            AppendSlimZone(lines, "their_spell", duel.Fields[1] != null ? duel.Fields[1].SpellZone : null);
+            if (duel.CurrentChain != null)
+            {
+                foreach (ClientCard item in duel.CurrentChain)
+                {
+                    if (item != null)
+                        lines.Add("chain=" + item.Id + ";" + item.Name + ";" + item.Controller);
+                }
+            }
+            for (int i = 0; i < candidates.Count; ++i)
+            {
+                ClientCard card = candidates[i];
+                lines.Add("option=" + (i + 1) + ";" + card.Id + ";" + card.Name + ";"
+                    + card.Attack + ";" + card.Defense + ";"
+                    + NegateDecision.ThreatRank(card));
+            }
+            return lines;
+        }
+
+        /// <summary>精简区域：只写卡号/卡名/攻守，不写表示形式（目标问题用不上）。</summary>
+        private static void AppendSlimZone(List<string> lines, string prefix, IList<ClientCard> zone)
+        {
+            if (zone == null)
+                return;
+            int count = 0;
+            foreach (ClientCard item in zone)
+            {
+                if (item == null)
+                    continue;
+                count++;
+                lines.Add(prefix + "=" + item.Id + ";" + item.Name + ";" + item.Attack + ";" + item.Defense);
+            }
+            if (count == 0)
+                lines.Add(prefix + "=（空）");
         }
 
         /// <summary>
@@ -101,7 +289,8 @@ namespace WindBot.Game.AI
         public static int AskIdleChoice(IList<string> labels, bool hasCardOption)
         {
             Init();
-            if (!_enabled || string.IsNullOrEmpty(_path) || labels == null || labels.Count < 2)
+            if (!_enabled || _tripped || !_idleChoiceEnabled
+                || string.IsNullOrEmpty(_path) || labels == null || labels.Count < 2)
                 return 0;
             // 菜单里只有"进战斗/结束"时不要问：那种局面没有可做的展开，问一句只是白等一秒
             if (!hasCardOption)
@@ -186,6 +375,7 @@ namespace WindBot.Game.AI
                         {
                             try { File.Delete(answerPath); } catch { }
                             _spentMs += (int)watch.ElapsedMilliseconds;
+                            _consecutiveTimeouts = 0;
                             if (_verbose)
                                 Logger.WriteLine("AI 答复（" + lines[1] + "）：" + answer);
                             return answer;
@@ -194,14 +384,30 @@ namespace WindBot.Game.AI
                     System.Threading.Thread.Sleep(50);
                 }
                 _spentMs += (int)watch.ElapsedMilliseconds;
-                if (_verbose)
-                    Logger.WriteLine("等 AI 答复超时（" + waitLimit + "ms，按脚本自己的判断继续）");
+                NoteMiss("等 AI 答复超时（" + waitLimit + "ms，按脚本自己的判断继续）");
             }
             catch (Exception ex)
             {
-                Logger.WriteLine("问 AI 出错（按脚本自己的判断继续）：" + ex.Message);
+                NoteMiss("问 AI 出错（按脚本自己的判断继续）：" + ex.Message);
             }
             return "";
+        }
+
+        /// <summary>
+        /// 记一次"没拿到答复"；连续 <see cref="MaxConsecutiveTimeouts"/> 次就熔断本局的问答。
+        ///
+        /// 熔断时**必须打一行日志**：静默地变成"一直按脚本打"会让人以为决策层在工作，
+        /// 而这正是当年排查"改了配置没反应"最费时间的地方。
+        /// </summary>
+        private static void NoteMiss(string reason)
+        {
+            Logger.WriteLine(reason);
+            _consecutiveTimeouts++;
+            if (_tripped || _consecutiveTimeouts < MaxConsecutiveTimeouts)
+                return;
+            _tripped = true;
+            Logger.WriteLine("AI 决策层连续 " + _consecutiveTimeouts + " 次没拿到答复，"
+                + "本局不再问 AI（按出牌脚本打；检查网关是否可达 / 换更快的模型）");
         }
 
         /// <summary>
@@ -220,18 +426,35 @@ namespace WindBot.Game.AI
             return new CardExecutor(rule.Type, rule.CardId, () => Guard(original));
         }
 
-        /// <summary>装在执行器规则上的守卫：脚本愿意发动时问一次 AI。</summary>
+        /// <summary>
+        /// 装在执行器规则上的守卫：**只在"对手回合 + 这张卡是阻抗卡"时**问一次 AI 要不要交。
+        ///
+        /// ⚠ 2026-10-08 收窄过（见 <see cref="NegateDecision.IsNegateCard"/>）：原来这里对
+        /// **所有** `ExecutorType.Activate` 规则都问，等于在展开的每一步插一脚，实测三次没收益、
+        /// 86% 是否决。收窄之后"展开时不启用决策层"是**结构性保证**——自己回合、或者不是阻抗卡，
+        /// 连问答都不会发起。`BrainNegateGate` 默认关（这一半要先跑镜像 A/B）。
+        /// </summary>
         private static bool Guard(Func<bool> original)
         {
-            if (!_enabled)
+            if (!_enabled || _tripped || !_negateGateEnabled)
                 return original == null || original();
             bool own = original == null || original();
             if (!own)
                 return false;
-            string answer = Ask("activate", _currentCard, null, CurrentDuel());
-            if (answer == "no" || answer == "0")
-                return false;
-            return true;
+            Duel duel = CurrentDuel();
+            if (duel == null || duel.Player != 1 || !NegateDecision.IsNegateCard(_currentCard))
+                return true;
+            string answer = Ask("negate_gate", _currentCard, null, duel);
+            if (answer == null)
+                return true;
+            int split = answer.IndexOf(';');
+            string verdict = (split >= 0 ? answer.Substring(0, split) : answer).Trim().ToLowerInvariant();
+            if (verdict != "no" && verdict != "0")
+                return true;
+            string reason = split >= 0 ? answer.Substring(split + 1).Trim() : "";
+            Logger.WriteLine("[决策] 不交「" + NegateDecision.NameOf(_currentCard) + "」"
+                + (reason.Length > 0 ? "：理由＝" + reason : "（模型没给理由）"));
+            return false;
         }
 
         /// <summary>
@@ -251,7 +474,8 @@ namespace WindBot.Game.AI
             target = null;
             skip = false;
             Init();
-            if (!_enabled || attacker == null || defenders == null || defenders.Count == 0)
+            if (!_enabled || _tripped || !_idleChoiceEnabled
+                || attacker == null || defenders == null || defenders.Count == 0)
                 return false;
             string answer = Ask("attack_target", attacker, defenders, CurrentDuel());
             int choice;
@@ -341,6 +565,24 @@ namespace WindBot.Game.AI
                 }
                 lines.AddRange(chainLines);
             }
+            // 没有连锁时，这个窗口多半是**对手召唤**引出来的：把最近一次召唤写出来。
+            // 少了它模型只能从场面猜"到底是什么事件触发了我这次响应"——实测它猜"对手只是通常召唤"
+            // 并猜对了，但那是猜；而"要不要交阻抗"恰恰取决于触发它的是什么。
+            // 只在本阶段确实发生过召唤时才写（`LastSummonPlayer` 在阶段开始/连锁开始会被重置成 -1），
+            // 这样既新鲜又与"无连锁"这个前提自洽。
+            // ⚠ 实测局限（2026-10-08 真机一局 37 次提问）：**一次都没触发**——因为内核在"连锁开始"
+            // 就会把它重置成 -1，而大部分"无连锁窗口"其实是**连锁刚结算完**之后。所以它只在
+            // "对手召唤、且还没开过连锁"这个窄窗口里有值，**不要当成可靠信号**；留着是因为那种窗口
+            // 恰好是"模型只能猜"的场合，多一行不亏。
+            else if (duel.LastSummonPlayer != -1 && duel.LastSummonedCards != null)
+            {
+                lines.Add("last_summon_player=" + duel.LastSummonPlayer);
+                foreach (ClientCard item in duel.LastSummonedCards)
+                {
+                    if (item != null)
+                        lines.Add("last_summon=" + item.Id + ";" + item.Name);
+                }
+            }
             // 对手已经亮出来的卡：它用了哪些坑、露过哪些怪——判断"这张坑现在交值不值"要用
             AppendSeen(lines, "their_seen", duel.Fields[1].Graveyard);
             AppendSeen(lines, "their_seen", duel.Fields[1].Banished);
@@ -375,21 +617,28 @@ namespace WindBot.Game.AI
         ///
         /// 为什么每张一行、用分号分隔：卡名里可能有逗号，用逗号拼一行会被拆错——
         /// 拆错等于把"3000 攻"读成"0 攻"，AI 就会拿小怪去撞大怪（实测踩过）。
+        ///
+        /// ⚠ 空区域**必须写一行 ``=（空）``**：这里的 ``cards`` 数的是**真卡张数**，
+        /// 不是数组长度。2026-10-08 修过一次——原来数的是"遍历了多少格"，而怪兽区/魔陷区是
+        /// WindBot 的**定长数组**（7 / 8 格，空位是 null），于是"我方空场"这种局面**一行都不写**。
+        /// 后果是模型分不清"我方场上没怪"和"这一项没发过来"：真机抓到的 4 份问题里
+        /// `mine=` 一次都没出现过，而那种局面下"我要不要留牌防守"完全要看我方是不是空场。
+        /// （`hand` 是 List、空的时候原来就对，所以这个 bug 只影响定长的那几个区域。）
         /// </summary>
         private static void AppendZone(List<string> lines, string prefix, IList<ClientCard> zone)
         {
             if (zone == null)
                 return;
-            int index = 0;
+            int cards = 0;
             foreach (ClientCard item in zone)
             {
-                index++;
                 if (item == null)
                     continue;
+                cards++;
                 lines.Add(prefix + "=" + item.Id + ";" + item.Name + ";" + item.Attack + ";"
                     + item.Defense + ";" + (int)item.Position);
             }
-            if (index == 0)
+            if (cards == 0)
                 lines.Add(prefix + "=（空）");
         }
 

@@ -101,6 +101,13 @@ class WindBotSettings:
         debug: 打开后 WindBot 会把对局过程打到 stdout，排查问题时很有用。
         chat: 是否让 WindBot 发它自带的固化台词。``False`` 表示闭嘴，改由插件用模型生成台词；
             ``None`` 表示不传这个参数、用 WindBot 自己的默认值。
+        brain_file: **阻抗决策层**的问答前缀（不含扩展名）。给了它 WindBot 才会在阻抗时点
+            写下问题并等答复（见 `duel/brain_bridge.py` 与 WindBot 的 `Game/AI/MaiBotBrain.cs`）；
+            ``None`` 表示不起决策层，出牌完全由脚本决定。
+        brain_target_choice: 决策层是否回答"无效哪只怪"（默认开；风险最低的一半）。
+        brain_negate_gate: 决策层是否回答"要不要交这张阻抗"（默认关；要先跑镜像 A/B）。
+        brain_timeout_ms: WindBot 等答复的上限（毫秒）。**必须大于 Python 侧的等模型上限**，
+            否则"超时"只会由 WindBot 发现，Python 那边还在傻等。
     """
 
     name: str = "MaiBot"
@@ -113,10 +120,15 @@ class WindBotSettings:
     debug: bool = False
     hand: int = 0
     chat: Optional[bool] = None
-    # ⚠ 这里原来还有三个路径参数：`plan_file`（作战计划）／`playbook_file`（卡组打法数据）
-    # ／`brain_file`（逐步问 AI 的问答前缀）——它们只有计划感知执行器 ``PlanAware`` 会读。
-    # AI 教练 / 打法数据 / 逐步问 AI 已按 2026-10-07 用户口径整条删除（连带 `PlanAware`），
-    # 这三个字段与下面拼 ``PlanFile=`` / ``PlaybookFile=`` / ``BrainFile=`` 的代码一并去掉。
+    # ⚠ 这里原来还有两个路径参数：`plan_file`（作战计划）／`playbook_file`（卡组打法数据）
+    # ／以及老口径的 `brain_file`（逐步问 AI）——它们只有计划感知执行器 ``PlanAware`` 会读。
+    # AI 教练 / 打法数据 / 逐步问 AI 已按 2026-10-07 用户口径删除（连带 `PlanAware`）。
+    # 2026-10-08 的**阻抗决策层**重新用了 ``BrainFile=`` 这个名字，但范围完全不同：
+    # 只在"对手回合 + 这张是阻抗卡"时问，展开期一步都不问（见 `Game/AI/NegateDecision.cs`）。
+    brain_file: Optional[Path] = None
+    brain_target_choice: bool = True
+    brain_negate_gate: bool = False
+    brain_timeout_ms: int = 2500
 
     def to_args(self, host: str, port: int) -> List[str]:
         """生成 WindBot 的命令行参数（不含可执行文件本身）。
@@ -141,6 +153,11 @@ class WindBotSettings:
             args.append("Debug=true")
         if self.chat is not None:
             args.append(f"Chat={'true' if self.chat else 'false'}")
+        if self.brain_file is not None:
+            args.append(f"BrainFile={self.brain_file}")
+            args.append(f"BrainTargetChoice={'true' if self.brain_target_choice else 'false'}")
+            args.append(f"BrainNegateGate={'true' if self.brain_negate_gate else 'false'}")
+            args.append(f"BrainTimeoutMs={int(self.brain_timeout_ms)}")
         return args
 
 

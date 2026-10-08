@@ -39,10 +39,14 @@ from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase, Tool
 from maibot_sdk.types import ToolParameterInfo, ToolParamType
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import logging
 import sys
+import time
+import uuid
 
+from .duel.brain_bridge import BrainBridge
 from .duel.builtin_decks import builtin_decks
 from .duel.cards import CardDatabase, CardDatabaseError
 # ⚠ 这里原来还有 `from .duel.knowledge import ...`（AI 打牌的知识库/决策日志）。
@@ -66,6 +70,9 @@ from .duel.windbot_decks import (
     load_available_decks,
     pick_best_match,
 )
+from .train.runner import TrainingError, TrainingRunner
+from .train.store import TrainingStore
+from .webui import WebUIServer, resolve_api_key
 from .wiki import YugiohWikiTools
 from .duel.session import (
     OUTCOME_ABORTED,
@@ -105,6 +112,10 @@ DEFAULT_WINDBOT_DECK = "Blue-Eyes"
 # 值给得大是有实测原因的：宿主那只用于该任务的模型会先"想"一大段，额度给小了
 # 思考就把它吃光、正文空着回来，看起来像"模型不回话"（2026-10-06 群里就是这个问题）。
 SUMMARY_MAX_TOKENS = 16384
+
+# 面板线程等插件事件循环响应的上限（秒）。只用来等"参数校验 + 建记录 + 起后台任务"
+# 这种微秒级的活儿，所以给得宽是给人看的：真等超时说明事件循环被卡住了（看门狗会记日志）。
+_PANEL_LOOP_TIMEOUT_SECONDS = 10.0
 
 # 百科检索的默认查卡接口（ygocdb 的搜索接口；换自建/镜像时改配置 `wiki.endpoint`）
 WIKI_DEFAULT_ENDPOINT = "https://ygocdb.com/api/v0/"
@@ -148,7 +159,10 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.2.0", description="配置版本")
+    # 版本号提升是有意的：1.2.0 起新增 `[llm]`（三个用途的模型与超时）、`[training]`（训练功能）、
+    # `[webui]`（插件自带面板）三节，并把 `duel.brain_model` / `duel.brain_timeout_ms`
+    # 移成 `llm.decision_model` / `llm.decision_timeout_ms`（老键会被静默忽略）。
 
 
 class PathsConfig(PluginConfigBase):
@@ -290,6 +304,149 @@ class WikiConfig(PluginConfigBase):
     timeout: int = Field(default=15, description="在线接口超时时间（秒）：查卡、取卡图都用它")
 
 
+class LlmConfig(PluginConfigBase):
+    """模型配置：这一节**只写模型名**（填宿主 `model_config.toml` 里那只模型的名字）。
+
+    三个用途各管一件事，互不借用：
+
+    * **总结**——打完一局把机读复述写成一段人话（`duel.summarize_with_ai` 打开时才用）；
+    * **决策**——阻抗决策层在对手回合里问「这张无效卡该指哪只怪」；
+    * **训练**——训练功能里的 combo 推演、录像复盘、写结论。
+
+    模型名一律留空＝用宿主给插件配的那只（`model_config.toml` 里的 `plugin` 任务）。
+    超时时间由插件自己执行（宿主那侧没有超时参数），超时只影响这一次调用，不影响对局本身。
+    """
+
+    __ui_label__ = "模型"
+    __ui_icon__ = "sparkles"
+    __ui_order__ = 3
+
+    summary_model: str = Field(
+        default="",
+        description=(
+            "【对局总结】用哪只模型。留空＝用宿主给插件配的那只。"
+            "这活儿是「把字段列表写成一段人话」，对智力要求低——胜负那一行由插件自己写在"
+            "播报最前面，模型只负责润色，所以哪只都行"
+        ),
+    )
+    summary_timeout_ms: int = Field(
+        default=60000,
+        description=(
+            "【对局总结】等模型的上限（毫秒，默认 60000）。"
+            "为什么给这么宽：总结的额度是 16384 token，思考型模型会先想一大段，"
+            "给短了会稳定超时——超时的后果是播报退化成原始复述，群里看起来就是「没有 AI 总结」"
+        ),
+    )
+    decision_model: str = Field(
+        default="deepseek-chat",
+        description=(
+            "【AI 决策】用哪只模型。**推荐小体量、不思考的那种**（默认 deepseek-chat）。"
+            "实测对手回合的等待预算一共只有 15 秒，一次会思考的答复要 13 秒；"
+            "而 `deepseek-chat` 关掉思考后是 0.58~0.93 秒、零思考 token、答复就是干净的序号。"
+            "⚠ 换模型要同时看两件事：模型名，以及 `model_config.toml` 里那条"
+            "`extra_params = {thinking = {type = \"disabled\"}}`——思考型模型会把额度全花在"
+            "思考上、`response` 是空串（拉高额度解不了）。换完用 `tools/brain_model_probe.py` 量一遍"
+        ),
+    )
+    decision_timeout_ms: int = Field(
+        default=2500,
+        description=(
+            "【AI 决策】WindBot 等答复的上限（毫秒，默认 2500）。"
+            "Python 侧的等模型上限会自动取「这个值再减 400 毫秒」，好让超时由 Python 先发现并记账。"
+            "实测模型答复 0.6~0.9 秒，所以 2500 是「够用且不会拖住对局」的余量；"
+            "调大之前想清楚：对手回合的等待预算一共只有 15 秒"
+        ),
+    )
+    training_model: str = Field(
+        default="",
+        description=(
+            "【训练功能】用哪只模型。训练要它读卡文推 combo、复盘录像、写结论——"
+            "**建议用一只聪明点的**（和上面「决策」那只相反，那只要求快而不要求聪明）。"
+            "留空＝用宿主给插件配的那只"
+        ),
+    )
+    training_timeout_ms: int = Field(
+        default=120000,
+        description=(
+            "【训练功能】单次等模型的上限（毫秒，默认 120000）。"
+            "训练是后台任务、不占对局时间，所以给得比总结还宽；"
+            "给这个值是为了让「模型卡住」这件事能变成一条失败的训练记录，而不是让任务永远挂着"
+        ),
+    )
+
+
+class TrainingConfig(PluginConfigBase):
+    """训练功能（插件里的「研究台」）：推演 combo、复盘录像、预校验脚本、跑擂台 A/B。
+
+    这一节只放**开关与放东西的地方**——用哪只模型在上面的「模型」节里（`training_model`）。
+    """
+
+    __ui_label__ = "训练功能"
+    __ui_icon__ = "flask-conical"
+    __ui_order__ = 5
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "是否启用训练功能。关掉后面板里的训练页只展示历史记录，不受理新任务"
+            "（对局侧完全不受影响）"
+        ),
+    )
+    workspace: str = Field(
+        default="",
+        description=(
+            "训练工作目录：擂台数据库、训练日志、推演结果都放这儿。"
+            "留空＝插件数据目录下的 `train/`。想接着用旧插件的擂台数据，就把它指到那个目录"
+        ),
+    )
+    max_duels_per_run: int = Field(
+        default=60,
+        description=(
+            "一次擂台最多打多少局（逐局交替座位，最多 200）。"
+            "⚠ 这个数字是「一次任务的上限」，不是「判定强弱要多少局」——"
+            "实测同一套构筑重测会出现 0/60 与 8/20 并存的噪声，所以判强弱要 ≥80 局/腿，"
+            "局数不够时训练报告里只会说「机制有没有坏」，不会说谁强"
+        ),
+    )
+
+
+class WebUiConfig(PluginConfigBase):
+    """插件自带的控制面板（`webui.py`）。
+
+    面板是独立于麦麦 WebUI 的一个小 HTTP 服务，只为了把「群里说不清的东西」摊开看：
+    卡组池、日志、训练任务与结果。**新功能不往群里加命令**，都在这儿。
+    """
+
+    __ui_label__ = "面板"
+    __ui_icon__ = "monitor"
+    __ui_order__ = 6
+
+    enabled: bool = Field(default=True, description="是否随插件一起启动面板")
+    host: str = Field(
+        default="127.0.0.1",
+        description=(
+            "监听地址。默认只监听本机（面板能看到卡组池与日志，不该默认对外）。"
+            "想让手机或别的机器访问再改成 `0.0.0.0`——改之前先确认密钥足够长，并且"
+            "端口别直接暴露在公网上"
+        ),
+    )
+    port: int = Field(
+        default=17911,
+        description=(
+            "监听端口。被别的程序占用时面板启动失败并记一条 warning，对局功能不受影响；"
+            "换一个没被占用的端口即可"
+        ),
+    )
+    api_key: str = Field(
+        default="",
+        description=(
+            "面板密钥。留空＝按「环境变量 `YGO_WEBUI_KEY` → 自动生成」的顺序取："
+            "自动生成的密钥会写到插件数据目录的 `webui_key.txt`，登录页会告诉你去看那个文件。"
+            "**别把密钥提交进版本库**"
+        ),
+    )
+
+
 class DuelConfig(PluginConfigBase):
     """对局与网络配置。"""
 
@@ -419,8 +576,57 @@ class DuelConfig(PluginConfigBase):
     # `ai_brain`（逐步问 AI）、`brain_knowledge`（临场检索知识库）、`brain_scope`（问 AI 范围）、
     # `ai_deck_plan`（导入卡组后写展开流程）、`train_model`（训练用哪个模型）。
     # **2026-10-07 用户口径：只留核心（开房打牌 / 导卡组 / 随机池 / 查房 / 查卡发图）**，全删了。
-    # （更早还删过 `script_max_tokens` / `script_model`：对局总结的额度与模型现在写死在
-    # `_write_summary` 里——额度 `SUMMARY_MAX_TOKENS`，模型留空＝用宿主给该任务配的那只。）
+    # （更早还删过 `script_max_tokens` / `script_model`：对局总结的额度仍写死在
+    # `_write_summary` 里（`SUMMARY_MAX_TOKENS`），但**模型与超时已在 2026-10-08 移到 `[llm]` 节**：
+    # `llm.summary_model` / `llm.summary_timeout_ms`。）
+
+    # ---- 阻抗决策层（2026-10-08）--------------------------------------------------------
+    #
+    # 这一片不是上面那套"逐步问 AI"的回归，范围完全不同，**只在阻抗时点问**：
+    #   * 展开期一步都不问——C# 侧的入口按"对手回合 + 这张是阻抗卡表里的卡"卡死
+    #     （`NegateDecision.IsNegateCard`），是结构性保证，不靠提示词里写"展开时别管"；
+    #   * 只用**不思考的快模型**：实测对手回合的等待预算只有 15 秒，而一次"会思考"的答复
+    #     要 13 秒（当年 40 局里有 5 局是响应窗口等太久被内核判超时输掉的）；
+    #   * 答不上来就什么都不写，WindBot 按出牌脚本继续（连续 3 次熔断本局的问答）。
+    #
+    # 一局会问多少次：实测 8 局真实对局，**"对手回合里我方发动的连锁"平均 10.8 次/局**
+    # （范围 3~21），这是决策层调用次数的上界。所以"快"这件事是有余量的——
+    # 真正要小心的是单次等待，不是总次数。
+    brain_enabled: bool = Field(
+        default=True,
+        description=(
+            "【阻抗决策层】是否让模型决定「这一张无效卡该指向对面哪只怪」。**默认开**。"
+            "风险最低的一半：它只在「脚本本来就要交这张无效卡」的前提下改目标，不会让脚本少交一张牌；"
+            "模型在这里有真信息优势（脚本只认卡号，模型认识卡文）。"
+            "2026-10-08 实测：链路与模型都验过（`deepseek-chat` 关思考 0.58~0.93 秒、答复干净、"
+            "零思考 token），一局只问十次左右，等待挤得进对手回合的 15 秒预算。"
+            "关掉＝完全按出牌脚本自己的判据选目标（改动前的老口径）"
+        ),
+    )
+    brain_negate_gate: bool = Field(
+        default=True,
+        description=(
+            "【阻抗决策层·决策本身】是否让模型决定「对面发动效果时，我方能发的这几张里发哪张 / "
+            "都不发」。**默认开**——这一层就是干这个的：`chain_choice` 那一问同时回答了"
+            "「要不要发」与「该发谁的效果」；选中的若是无效系，还会再问一次"
+            "「该去针对谁」（那一问由 `brain_enabled` 控制）。"
+            "关掉＝完全按出牌脚本的注册顺序决定谁先上（改动前的老口径：第一条说 yes 的规则获胜）。"
+            "⚠ 这一半有前科（2026-10-07「逐步问 AI」三次实测没收益、86% 否决）；2026-10-08 的镜像 A/B"
+            "在「通用脚本 + 手坑重的合成牌组」上量到 170 局 61.8%（区间 54~69%），但那套牌组不代表真实卡组"
+        ),
+    )
+    # ⚠ 这里原来有 `brain_model` / `brain_timeout_ms` 两项（决策层用哪只模型、等多久）。
+    # 2026-10-08 用户口径：**模型与超时统一收进 `[llm]` 节**——决策层那两项现在是
+    # `llm.decision_model` / `llm.decision_timeout_ms`。老配置文件里残留的这两个键会被
+    # 静默忽略（`PluginConfigBase` 是 `extra="ignore"`），不会报错。
+    brain_max_tokens: int = Field(
+        default=256,
+        description=(
+            "【阻抗决策层】答复的额度上限。答复只有「一个序号」或「yes / no;理由」两种，"
+            "**给小一点反而更稳**——额度大了会诱使模型先想半天（实测思考型模型会把 256 全花在思考上、"
+            "`response` 留空；关掉思考的模型只花 1 个 token）"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -465,12 +671,19 @@ _apply_duel_config_surface()
 
 
 class MaiPlayYgoConfig(PluginConfigBase):
-    """插件配置总表（麦麦玩游戏王）。"""
+    """插件配置总表（麦麦玩游戏王）。
+
+    节的顺序就是配置页里的顺序（各节自己还带 `__ui_order__`）：
+    插件 → 运行环境 → 对局 → 模型 → 百科检索 → 训练功能 → 面板。
+    """
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     duel: DuelConfig = Field(default_factory=DuelConfig)
+    llm: LlmConfig = Field(default_factory=LlmConfig)
     wiki: WikiConfig = Field(default_factory=WikiConfig)
+    training: TrainingConfig = Field(default_factory=TrainingConfig)
+    webui: WebUiConfig = Field(default_factory=WebUiConfig)
 
 
 class ActiveRoom:
@@ -516,6 +729,18 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         # `_background_tasks`（导入卡组后写展开流程的后台任务）、`_training_task` / `_optimize_task`
         # / `_pick_task` / `_playbook_task`（训练·优化·挑脚本·写打法四条批任务的互斥锁）、
         # `_brain_tasks`（房间的问 AI 答复任务）。2026-10-07 用户口径只留核心功能，全部删掉。
+        # 2026-10-08 的**阻抗决策层**是另一回事，所以这里重新有了一份句柄：每个房间一条
+        # `(bridge, task)`，房间收摊时一起停（`_stop_room_brain`）。
+        self._brains: Dict[str, Tuple[BrainBridge, "asyncio.Task[None]"]] = {}
+        # 面板与训练功能（2026-10-08 新增）：面板是本插件自己的 HTTP 服务，
+        # 训练功能是"把 tools/ 下那批命令行脚本接进面板"的那一层，两个都在 on_load 起、
+        # on_unload 同步关（卸载只有 5 秒预算，见 on_unload 的说明）。
+        self._webui: Optional[WebUIServer] = None
+        self._train_store: Optional[TrainingStore] = None
+        self._train_runner: Optional[TrainingRunner] = None
+        # 面板的 HTTP 线程要把"起任务/停任务"送回插件自己的事件循环执行，所以这里记下它。
+        # 在 on_load 里取——那时拿到的就是宿主跑插件协程的那条循环。
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._logger: Optional[logging.Logger] = None
 
     # ------------------------------------------------------------------ 生命周期
@@ -524,6 +749,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         """准备卡组池与卡牌数据库，并检查外部程序路径是否配好。"""
 
         self._logger = self.ctx.logger
+        self._loop = asyncio.get_running_loop()
         self._deck_pool = DeckPool(
             Path(self.ctx.paths.data_dir),
             default_windbot_deck=self.config.duel.windbot_deck or DEFAULT_WINDBOT_DECK,
@@ -550,6 +776,164 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         if missing:
             self._logger.warning(
                 "以下路径尚未配置，对局功能不可用，请在插件配置页补全：%s", "；".join(missing)
+            )
+        # 面板与训练功能：放在最后起——它们都只读"已经准备好"的东西（卡组池、卡库），
+        # 而且起不来也不该拦住对局那半边（起失败的细节各自记日志）。
+        self._restart_train_runner()
+        self._restart_webui()
+
+    # ------------------------------------------------------------------ 面板与训练功能
+
+    def training_store(self) -> Optional[TrainingStore]:
+        """训练记录库（没启用训练功能时是 None；面板据此决定显示什么）。"""
+
+        return self._train_store
+
+    def training_runner(self) -> Optional[TrainingRunner]:
+        """训练执行器（没启用训练功能时是 None）。"""
+
+        return self._train_runner
+
+    def schedule_training_start(self, kind: str, params: Dict[str, Any]) -> Any:
+        """面板线程起任务用的入口：把请求送回插件的事件循环，等参数校验做完再返回。
+
+        为什么必须回事件循环：任务的执行体是协程（要 `asyncio.create_task` 起子进程、
+        要 await 模型），而面板的 HTTP 处理器跑在自己的线程里。跨线程直接用
+        `run_coroutine_threadsafe` 是标准做法，唯一的注意点是**别在这里等太久**——
+        被等的活儿只有"参数校验 + 建记录 + create_task"，真正的对局在后台跑，
+        所以这里给 10 秒已经非常宽裕（等不到就报错，绝不假装任务起来了）。
+        """
+
+        runner = self._train_runner
+        if runner is None:
+            raise TrainingError(
+                "训练功能没启用：检查配置 training.enabled，以及插件日志里「训练功能已就绪」那行"
+            )
+        return self._run_on_plugin_loop(runner.start(kind, params))
+
+    def schedule_training_stop(self) -> bool:
+        """面板线程停任务用的入口（杀进程树最长几秒，所以超时给得比启动宽）。"""
+
+        runner = self._train_runner
+        if runner is None:
+            return False
+        return bool(self._run_on_plugin_loop(runner.stop()))
+
+    def _run_on_plugin_loop(self, coro: Any) -> Any:
+        """把协程送回插件的事件循环执行并等结果（面板线程调用）。"""
+
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            raise TrainingError("插件的事件循环不可用（插件正在重载？稍后再试）")
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            return future.result(timeout=_PANEL_LOOP_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise TrainingError(
+                f"等插件的事件循环响应超过 {_PANEL_LOOP_TIMEOUT_SECONDS:.0f} 秒："
+                "这一步没有完成，看插件日志里有没有「事件循环卡顿」那行"
+            ) from exc
+
+    def _training_workspace(self) -> Path:
+        """训练工作目录（配置留空＝数据目录下的 `train/`）。"""
+
+        raw = (self.config.training.workspace or "").strip()
+        if not raw:
+            return Path(self.ctx.paths.data_dir) / "train"
+        path = Path(raw)
+        return path if path.is_absolute() else (Path(self.ctx.paths.data_dir) / path)
+
+    async def _training_generate(self, prompt: str, model: str, max_tokens: int) -> str:
+        """训练功能要用模型时的统一出口：带上配置里的超时，返回纯文本。
+
+        超时**由这里执行**（宿主那侧没有超时参数）：训练是后台任务，模型卡住时必须能变成
+        一条失败的记录，而不是让任务永远挂在"跑着"的状态上。失败一律抛异常——
+        训练报告是给人看的，"模型没答上来"必须写在记录里，不能拿一段编的结论糊过去。
+        """
+
+        llm = self.config.llm
+        result = await asyncio.wait_for(
+            self.ctx.llm.generate(
+                prompt=prompt,
+                model=model.strip(),
+                temperature=0.2,
+                max_tokens=int(max_tokens),
+            ),
+            timeout=max(float(llm.training_timeout_ms) / 1000.0, 1.0),
+        )
+        if not isinstance(result, dict) or not result.get("success", False):
+            raise RuntimeError(f"模型请求被拒绝：{result}")
+        return str(result.get("response") or "").strip()
+
+    def _restart_train_runner(self) -> None:
+        """（重）建训练功能那一层：记录库 + 执行器。
+
+        配置热更新时也走这里：模型、工作目录、局数上限都可能变，而 runner 是"一进程一套
+        子进程"的东西，重建比原地改字段更不容易留下半旧半新的状态。**正在跑的任务会被停掉**
+        （记录留成"被手动停止"），这是有意的——换了工作目录还接着往旧目录写才是灾难。
+        """
+
+        if self._train_runner is not None:
+            self._train_runner.stop_now()
+            self._train_runner = None
+        if not self.config.training.enabled:
+            self._train_store = None
+            self._logger.info("训练功能已在配置里关闭：面板只读历史，不受理新任务")
+            return
+        workspace = self._training_workspace()
+        self._train_store = TrainingStore(workspace / "training.db")
+        interrupted = self._train_store.mark_interrupted()
+        if interrupted:
+            # 上一次卸载（或插件重载）砍掉的运行中任务：库里还写着"跑着"，其实早没了。
+            self._logger.warning("有 %s 条训练任务在上次关闭时被打断，已标记为失败", interrupted)
+        self._train_runner = TrainingRunner(
+            plugin_root=Path(__file__).resolve().parent,
+            workspace=workspace,
+            deck_db_path=Path(self.ctx.paths.data_dir) / "deck_pool.db",
+            store=self._train_store,
+            generate=self._training_generate,
+            # 卡库实例会被配置热更新换掉，所以给回调而不是给实例
+            card_db=lambda: self._card_db,
+            active_rooms=lambda: len(self._rooms),
+            logger=self._logger,
+            max_duels=int(self.config.training.max_duels_per_run),
+        )
+        self._train_runner.set_training_model(self.config.llm.training_model)
+        self._logger.info(
+            "训练功能已就绪：工作目录 %s｜训练模型 %s｜单次擂台上限 %s 局",
+            workspace,
+            self.config.llm.training_model.strip() or "（宿主给插件配的那只）",
+            self.config.training.max_duels_per_run,
+        )
+
+    def _restart_webui(self) -> None:
+        """（重）起面板。端口被占用只在日志里说一声，不影响插件其余部分。"""
+
+        if self._webui is not None:
+            self._webui.stop_now()
+            self._webui = None
+        webui = self.config.webui
+        if not webui.enabled:
+            self._logger.info("面板已在配置里关闭（webui.enabled = false）")
+            return
+        api_key, key_source = resolve_api_key(webui.api_key, Path(self.ctx.paths.data_dir))
+        server = WebUIServer(
+            self,
+            host=str(webui.host or "127.0.0.1").strip(),
+            port=int(webui.port),
+            api_key=api_key,
+            key_source=key_source,
+            logger=self._logger,
+        )
+        if server.start():
+            self._webui = server
+        else:
+            self._logger.warning(
+                "面板没能启动（%s:%s 可能被别的程序占着）。对局与训练功能不受影响；"
+                "想用面板就改 webui.port。",
+                webui.host,
+                webui.port,
             )
 
     def _log_effective_config(self) -> None:
@@ -606,11 +990,18 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         # `_training_task` / `_optimize_task`（训练·优化子进程）、`_invite_task`（约战循环）、
         # `_persist_room_task`（常驻房循环）。这些功能已按 2026-10-07 用户口径删除，
         # 现在只剩"停掉进行中的房间 + 关库"。
+        #
+        # 计时是为了下次再有人问"为什么记了 plugin.shutdown 超时"时**有数可查**：
+        # 宿主那只 5 秒的预算是按整条 on_unload 算的，日志里没有耗时就只能靠猜。
+        started = time.monotonic()
         for stream_id in list(self._rooms):
             room = self._rooms.pop(stream_id, None)
             if room is None:
                 continue
             room.task.cancel()
+            # 决策层的答复任务也要收掉：它是插件自己的 asyncio 任务，卸载时不撤会留着
+            # 轮询一个已经不存在的房间目录（宿主给插件卸载的预算只有 5 秒，不能拖）
+            self._stop_room_brain(stream_id)
             try:
                 room.session.kill_now()
             except Exception:  # noqa: BLE001  卸载阶段必须尽力清理，不能中断后续步骤
@@ -622,9 +1013,24 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         if self._card_db is not None:
             self._card_db.close()
             self._card_db = None
+        # 面板与训练任务也要收：训练那层会起子进程（擂台跑起来是一整套内核 + 两个 WindBot），
+        # 卸载时不杀就会留下孤儿进程占着端口；两边都走"同步、不 await"的路径，
+        # 因为卸载给的总预算只有 5 秒。
+        if self._train_runner is not None:
+            self._train_runner.stop_now()
+            self._train_runner = None
+        self._train_store = None
+        if self._webui is not None:
+            self._webui.stop_now()
+            self._webui = None
+        if self._logger is not None:
+            self._logger.info(
+                "游戏王对局管家已卸载（用了 %.2f 秒；宿主给的预算是 5 秒）",
+                time.monotonic() - started,
+            )
 
     async def on_config_update(self, scope: str, config_data: dict[str, Any], version: str) -> None:
-        """配置热更新后重建卡牌数据库（路径可能变了）。"""
+        """配置热更新后重建卡牌数据库、卡组池、面板与训练层。"""
 
         del config_data
         del version
@@ -640,6 +1046,11 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 default_windbot_deck=self.config.duel.windbot_deck or DEFAULT_WINDBOT_DECK,
             )
             self._seed_builtin_decks()
+        # 端口/密钥/工作目录/模型都可能刚被改过：整层重建（正在跑的擂台会被停掉，
+        # 记录留成"被手动停止"——换了工作目录还往旧目录写才是更坏的结果）
+        self._restart_train_runner()
+        self._restart_webui()
+        self._log_effective_config()
 
     # ------------------------------------------------------------------ 工具
 
@@ -736,10 +1147,12 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                         deck.ydk_path,
                         exe,
                     )
-            # ⚠ 这里原来是"逐步问 AI"的起手：`_start_room_brain` 起一个答复任务，
-            # 再把问答前缀文件（brain_file）写进会话配置交给 WindBot。AI 打牌整条链路已按
-            # 2026-10-07 用户口径删除，现在开局直接用配置里的出牌脚本。
-            config = self._build_session_config(stream_id)
+            # 阻抗决策层：**起在 session.start() 之前**——问答前缀是 WindBot 的启动参数，
+            # 起来之后再补就晚了（WindBot 一进房就开始打）。
+            # 老口径的"逐步问 AI"删在这条之前（2026-10-07）；现在这条只服务阻抗时点，
+            # 展开期一步都不问，见 `duel/brain_bridge.py` 与 `Game/AI/NegateDecision.cs`。
+            brain_prefix = self._start_room_brain(stream_id)
+            config = self._build_session_config(stream_id, brain_prefix)
             session = DuelSession(
                 config,
                 group_id=group_id,
@@ -751,6 +1164,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             try:
                 info = await session.start()
             except ProcessError as exc:
+                # 房间没起来就把决策层收掉，否则那条任务会挂着空转到插件卸载
+                self._stop_room_brain(stream_id)
                 await session.stop()
                 return self._tool_result(
                     TOOL_START,
@@ -987,6 +1402,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         if room is None:
             return self._tool_result(TOOL_STOP, "现在没有进行中的对局。")
         room.task.cancel()
+        self._stop_room_brain(stream_id)
         try:
             await room.session.stop()
         except Exception as exc:  # noqa: BLE001
@@ -1800,8 +2216,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 self._logger.exception("播报对局结果失败：群 %s", group_id)
         finally:
             self._rooms.pop(stream_id, None)
-            # ⚠ 这里原来还会 `_stop_room_brain(stream_id)`：撤掉这一局的"问 AI"答复任务
-            # 并清掉问答文件。AI 打牌已按 2026-10-07 用户口径删除，收摊只剩关房间。
+            # 阻抗决策层跟着房间一起收摊：先撤答复任务（它还在轮询问答文件），再关房间。
+            # 收摊时会打一行计数（问了/答了/超时/失败各几次）——这是下一局复盘"决策层到底
+            # 有没有在工作"的凭据，别删。
+            self._stop_room_brain(stream_id)
             await session.stop()
             if self._logger is not None:
                 self._logger.info("房间已收摊：群 %s，结束原因 %s", group_id, outcome)
@@ -1888,16 +2306,30 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         )
         if not prompt:
             return ""
+        llm = self.config.llm
         try:
             # ⚠ **必须显式给 max_tokens**：省略会落到宿主给该任务配的默认额度，
             # 而那个模型"先想半天"——短请求的额度会被思考吃光、回复是**空串**
             #（2026-10-06 群里"打完没有 AI 总结"就是这个：配置 `summarize_with_ai` 明明是 true，
             # 日志里只留一条 `生成对局总结返回了空内容`）。
-            # 播报只要求 120 字，但思考会先花掉额度；模型不指定，用宿主给该任务配的那只。
-            result = await self.ctx.llm.generate(
-                prompt=prompt,
-                max_tokens=SUMMARY_MAX_TOKENS,
+            # 播报只要求 120 字，但思考会先花掉额度；模型与超时都读 `[llm]` 那节。
+            #
+            # 超时由插件自己执行（宿主那侧没有超时参数）：没超时的话，一次卡住的请求会让
+            # 播报无限期挂着——对局早结束了，群里却什么都看不到。
+            result = await asyncio.wait_for(
+                self.ctx.llm.generate(
+                    prompt=prompt,
+                    model=llm.summary_model.strip(),
+                    max_tokens=SUMMARY_MAX_TOKENS,
+                ),
+                timeout=max(float(llm.summary_timeout_ms) / 1000.0, 1.0),
             )
+        except asyncio.TimeoutError:
+            if self._logger is not None:
+                self._logger.warning(
+                    "生成对局总结超时（%s 毫秒；可调 llm.summary_timeout_ms）", llm.summary_timeout_ms
+                )
+            return ""
         except Exception:  # noqa: BLE001  模型不可用不该让整条播报消失
             if self._logger is not None:
                 self._logger.exception("生成对局总结失败")
@@ -1964,8 +2396,14 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
     # `_knowledge`（懒加载 knowledge.db 的知识库缓存）。2026-10-07 用户口径去掉 AI 打牌后
     # 两个方法都没有消费者了：`duel/knowledge.py` 已删，这里一并删掉。
 
-    def _build_session_config(self, stream_id: str) -> SessionConfig:
-        """把插件配置映射成会话配置。"""
+    def _build_session_config(self, stream_id: str, brain_prefix: Optional[Path] = None) -> SessionConfig:
+        """把插件配置映射成会话配置。
+
+        Args:
+            stream_id: 这一局属于哪个聊天流（房间按它登记）。
+            brain_prefix: 阻抗决策层的问答前缀；``None`` 表示这一局不起决策层
+                （总开关关掉，或者房间还没走到起决策层那一步）。
+        """
 
         paths = self.config.paths
         duel = self.config.duel
@@ -1991,6 +2429,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             in_game_chat=duel.in_game_chat,
             dialog=duel.dialog,
             bot_debug=duel.bot_debug,
+            brain_file=brain_prefix,
+            brain_target_choice=bool(duel.brain_enabled),
+            brain_negate_gate=bool(duel.brain_negate_gate),
+            brain_timeout_ms=int(self.config.llm.decision_timeout_ms),
             taunt_enabled=duel.taunt_enabled,
             taunt_chance_per_second=float(duel.taunt_chance_per_second),
             taunt_lines=tuple(duel.taunt_lines),
@@ -2002,6 +2444,139 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             max_duration=float(duel.max_duration_seconds),
             on_status=self._on_room_event,
         )
+
+    # ------------------------------------------------------------------ 阻抗决策层
+    #
+    # WindBot 侧在阻抗时点把问题写进 `<prefix>.q`、轮询 `<prefix>.a` 等答复
+    # （协议见 `duel/brain_bridge.py` 的文件头与 WindBot 的 `Game/AI/MaiBotBrain.cs`）。
+    # 这里负责：**每个房间一份前缀**（互不干扰，也便于按房间排查）、起停答复任务、
+    # 以及把问题交给宿主模型。
+
+    def _brain_prefix(self, stream_id: str) -> Path:
+        """给这一局生成问答前缀（数据目录下，每局一个独立名字）。
+
+        为什么不用 stream_id 直接当文件名：聊天流 ID 里带平台前缀与井号，直接落盘既不好看
+        也不安全（Windows 上 `#`、`:` 之类都可能出问题）。所以用短随机后缀，并把路径打进日志，
+        要排查时按日志里的路径去数据目录找即可。
+        """
+
+        directory = Path(self.ctx.paths.data_dir) / "brain"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"room_{uuid.uuid4().hex[:12]}"
+
+    def _start_room_brain(self, stream_id: str) -> Optional[Path]:
+        """起这一局的答复任务，返回问答前缀；不起时返回 None（调用方据此不起决策层）。"""
+
+        duel = self.config.duel
+        if not (duel.brain_enabled or duel.brain_negate_gate):
+            return None
+        existing = self._brains.get(stream_id)
+        if existing is not None:
+            self._stop_room_brain(stream_id)
+
+        prefix = self._brain_prefix(stream_id)
+        # ⚠ Python 侧的等模型上限要比 WindBot 那边**短 400 毫秒**：超时必须由这一侧先发现
+        # 并记账（`timed_out` 计数是排查"决策层是不是在拖时间"的唯一凭据），否则 WindBot
+        # 已经放弃、这边还在等，日志里什么都看不见。
+        timeout = max(float(self.config.llm.decision_timeout_ms) / 1000.0 - 0.4, 0.5)
+        bridge = BrainBridge(
+            prefix=prefix,
+            generate=self._brain_generate,
+            card_db=self._card_db,
+            logger=self._logger,
+            timeout=timeout,
+        )
+        task = asyncio.create_task(bridge.run(), name=f"mai-play-ygo-brain-{stream_id}")
+        self._brains[stream_id] = (bridge, task)
+        # 预热一次：**首次调用要多付约 1.2 秒**（宿主懒加载模型配置 + 建连），实测第一次
+        # 提问因此会撞上 WindBot 的等待上限（2.5 秒）而白等一次。开局到有人进房通常有十几秒，
+        # 正好用来把这笔开销量掉；预热失败只记日志，不影响对局（真出问题时正式提问会自己熔断）。
+        asyncio.create_task(self._warmup_brain(stream_id))
+        if self._logger is not None:
+            self._logger.info(
+                "阻抗决策层已启动：前缀 %s｜目标选择 %s｜闸门 %s｜模型 %s｜等答复上限 %.1fs",
+                prefix,
+                "开" if duel.brain_enabled else "关",
+                "开" if duel.brain_negate_gate else "关",
+                self.config.llm.decision_model.strip() or "（宿主给插件配的那只）",
+                timeout,
+            )
+        return prefix
+
+    async def _warmup_brain(self, stream_id: str) -> None:
+        """开局前把模型这条路"走通一次"，免得第一次真正的提问撞上冷启动。
+
+        为什么不省这一步：实测首次调用要比常态多约 1.2 秒（懒加载配置 + 建连），
+        单次 2.03 秒 vs 常态 0.83~0.93 秒——而 WindBot 的等待上限是 2.5 秒、
+        Python 侧更短，于是**一局的第一次提问最可能白等**（真机自测里就是这样）。
+        开局到有人进房通常有十几秒，用掉这笔开销正好。
+        """
+
+        started = time.monotonic()
+        try:
+            await self.ctx.llm.generate(
+                prompt="回复两个字：就绪",
+                model=self.config.llm.decision_model.strip(),
+                temperature=0.0,
+                max_tokens=8,
+            )
+        except Exception:  # noqa: BLE001  预热失败不该影响开局：正式提问会自己超时熔断
+            if self._logger is not None:
+                self._logger.warning("决策层预热失败（不影响开局，正式提问会自己超时熔断）", exc_info=True)
+            return
+        if self._logger is not None:
+            self._logger.info(
+                "决策层预热完成：%.2fs（这一步是为了不让一局的第一次提问撞上冷启动）",
+                time.monotonic() - started,
+            )
+
+    def _stop_room_brain(self, stream_id: str) -> None:
+        """停掉这一局的答复任务并收走问答文件（房间收摊时调用）。"""
+
+        entry = self._brains.pop(stream_id, None)
+        if entry is None:
+            return
+        bridge, task = entry
+        bridge.stop()
+        task.cancel()
+        stats = bridge.stats.as_dict()
+        if self._logger is not None:
+            self._logger.info("阻抗决策层已收摊：%s", stats)
+
+    async def _brain_generate(self, prompt: str) -> Optional[str]:
+        """把决策层的问题交给宿主模型，返回答复文本。
+
+        只做三件事：发问、把"宿主返回结构"翻译成纯文本、失败时明确返回 None。
+        **不做任何兜底措辞**：答不上来就让 WindBot 按出牌脚本打——塞一句编出来的答复
+        回去比不答更坏（它会被当成决策层的主张）。
+        """
+
+        model = self.config.llm.decision_model.strip()
+        try:
+            result = await self.ctx.llm.generate(
+                prompt=prompt,
+                model=model,
+                temperature=0.0,
+                max_tokens=int(self.config.duel.brain_max_tokens),
+            )
+        except Exception:  # noqa: BLE001  模型不可用不该让对局出问题
+            if self._logger is not None:
+                self._logger.exception("决策层调用模型失败")
+            return None
+        if not isinstance(result, dict) or not result.get("success", False):
+            if self._logger is not None:
+                self._logger.warning("决策层的模型请求被拒绝：%s", result)
+            return None
+        text = str(result.get("response") or "").strip()
+        if not text:
+            # 这句日志与"对局总结返回了空内容"是同一类坑：额度被思考吃光时答复就是空的
+            if self._logger is not None:
+                self._logger.warning(
+                    "决策层模型返回空内容（模型 %s；若是思考型模型请换一只）", model or "（宿主默认）"
+                )
+            return None
+        return text
+
 
     def _on_room_event(self, event: str, payload: Dict[str, object]) -> None:
         """把房间事件记进日志（不往群里刷消息，避免打扰）。"""

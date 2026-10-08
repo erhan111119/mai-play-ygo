@@ -5,7 +5,7 @@
 **平台：只支持 Windows**（对局内核 `ygopro.exe` 与出牌引擎 `WindBot.exe` 都是 Windows 程序；
 别的系统上插件照常加载，但开房会被明确拒绝，只有查卡与发卡图可用）。
 
-**当前版本：1.0.5**
+**当前版本：1.1.0**
 
 ## 功能
 
@@ -13,6 +13,10 @@
 - **查房出图**：`/查房` 出一张棋盘图（双方 LP、回合与阶段、场上每张卡，里侧的只画卡背）。在哪个群问就在哪个群出图、并列出全部进行中的房间——这是明确的设计选择（开房是“麦麦和群友的公共牌局”）。
 - **卡组池**：`/加卡组 <卡组码>` 投稿（YDK / `ydke://` / 萌卡链接），可放进随机池让麦麦随机抽，也可固定用一副。
 - **百科检索**：查卡（中/日/英文名、效果、攻守、FAQ）与发卡图；卡图本地优先，缺了才走在线 CDN。
+- **面板 + 训练功能**（1.1.0 新增，**不在群里用命令**）：插件自带一个小 HTTP 面板，看卡组池、日志、当前配置，
+  并在里面发起"训练功能"的四种后台任务——combo 推演（读卡表与卡文写展开流程）、
+  擂台 A/B（同一副卡表挂两份出牌脚本对打）、脚本预校验（卡表 × 执行器登记体检）、
+  录像复盘（读 `.yrp`、导出双方卡表、跟池子比对）。详见下面「面板与训练功能」。
 
 ## 安装
 
@@ -28,6 +32,54 @@
 `announce_result`、`summarize_with_ai`、`summary_prompt`、`taunt_enabled`、`taunt_lines`；`[wiki]` 只有 `endpoint` 与 `timeout`。
 `summary_prompt` 留空用内置那份，可用五个占位符：`{self_name}` `{report}` `{verdict}` `{winner}` `{turns}`
 （写错会在启动日志里报错，不会拿半截提示词去问模型）。
+
+**`[llm]` 管三处模型**（1.1.0 新增，值一律填宿主 `model_config.toml` 里的**模型名**；留空＝用宿主给插件配的那只）：
+
+| 键 | 用途 | 要点 |
+| --- | --- | --- |
+| `summary_model` / `summary_timeout_ms` | 对局总结写成一段人话 | 这活儿对智力要求低，哪只都行；超时给得宽（默认 60 秒），因为总结额度是 16384 token，思考型模型会先想一大段 |
+| `decision_model` / `decision_timeout_ms` | 阻抗决策层问"该指哪只怪" | **推荐小体量、不思考的那种**（默认 `deepseek-chat`）：对手回合的等待预算只有 15 秒，会思考的答复要 13 秒 |
+| `training_model` / `training_timeout_ms` | 训练功能:推演 / 复盘 / 写结论 | **建议用聪明点的**（和上面"决策"那只相反）；训练是后台任务，超时给得最宽 |
+
+**阻抗决策层**（2026-10-08）的开关仍是内部参数，不在上面那十项里：它只在**阻抗时点**
+（对手回合 + 当前判定的是阻抗卡）让模型参与两个决定——"这一张无效卡该指向对面哪只怪"
+（`brain_enabled`，默认开）与"要不要交这张阻抗"（`brain_negate_gate`，默认关），**展开期一步都不问**。
+用哪只模型读 `[llm].decision_model`：实测决策层提示词下
+**0.58~0.93 秒、零思考 token、答复就是干净的序号**，一局只问十次左右。
+⚠ 换模型必须同时看**模型名**与**有没有关思考**——本机其余模型都是思考型，额度被思考吃光、
+`response` 是空串（"调大 max_tokens"解决不了）。完整实测表与判读方法见 `executors/README.md` §3.5，
+换完用 `tools/brain_model_probe.py` 量一遍、用 `tools/brain_channel_check.py --real-model deepseek-chat` 验链路。
+
+## 面板与训练功能
+
+```toml
+[webui]
+enabled = true            # 面板随插件启动
+host = "127.0.0.1"        # 默认只听本机（面板能看卡组池与日志，不该默认对外）
+port = 17911              # 被占用时面板启动失败并记一条 warning，对局不受影响
+api_key = ""              # 留空＝环境变量 YGO_WEBUI_KEY → 自动生成
+
+[training]
+enabled = true
+workspace = ""            # 留空＝插件数据目录下的 train/
+max_duels_per_run = 60    # 一次擂台最多打多少局（判强弱要 ≥80 局/腿，不够时报告只会说"机制没坏"）
+```
+
+- **密钥**：`api_key` 留空时按「环境变量 `YGO_WEBUI_KEY` → 自动生成」取，自动生成的写在
+  数据目录的 `webui_key.txt`，登录页会告诉你去哪找。登录后下 cookie，之后不再带密钥。
+  浏览器里贴一次 `http://127.0.0.1:17911/?key=<密钥>` 也能进（会立刻换成 cookie 并跳到干净地址）。
+- **面板有四页**：概览（卡组数、房间、训练状态）、卡组（跨群列表 + 单副卡表详情）、
+  训练（发起/停止/看历史）、日志与配置。
+- **脚本预校验查的是"自写执行器"**：插件 `executors/*.cs` 里 `[Deck("名字")` 登记的那些
+  （KillerTune / RaiseMoon / Yaosheng…）。WindBot 自带的那些脚本只有编译产物、没有源码文件，
+  所以按 `style` 查不到它们——要体检内置卡组就填卡组编号或群号。
+- **训练任务同一时刻只跑一个**：擂台与体检都会真起 ygopro + WindBot，
+  **房间里有人的时候直接拒绝启动**（会抢进程与端口，把真人那局打坏）。
+- **停任务会连子孙进程一起杀**（Windows 用 `taskkill /F /T`）：训练脚本自己起的
+  `ygopro.exe` 与两个 `WindBot.exe` 只杀顶层是杀不掉的，留下孤儿内核占着端口，
+  下一轮任务就"有时候起不来"。
+- 训练结果都落盘：`<工作目录>/training.db`（记录）、`logs/`（原始输出）、
+  `combos/`（推演存档）、`decks/`（从录像导出的卡表）。
 
 ## 指令
 
@@ -47,8 +99,12 @@
 ## 安全与边界
 
 - 闸门默认监听 `0.0.0.0`，房间口令随机生成、由插件直接发到群里；建议只放行闸门端口（`listen_port`）。
+- **面板默认只监听 `127.0.0.1`**，且每个接口都要密钥（没带、带错都是 401）。想让它对外（手机上看）就改成
+  `0.0.0.0`——那时请同时保证端口不直接暴露在公网、密钥足够长。密钥不写进仓库（`config.toml` 已 gitignore）。
 - 出网请求都过 `duel/netguard`：只 http/https、只连公网地址（内网/回环/保留地址拒绝）、重定向逐跳校验、连接时校验目标 IP、响应体有上限（查卡 2 MiB、卡图 4 MiB）。
 - 卡图与卡号只发给 `ygocdb.com` 与卡图 CDN；对局总结只把“双方统计”交给模型，聊天记录、用户 ID、密钥都不外传。
+- 训练任务起的都是插件自带的 `tools/` 脚本（参数由面板表单给、拼成 argv 而不是 shell 命令）；
+  它不会自己去改卡表、编译执行器或删文件——那些仍由人来决定。
 
 ## 许可与随包内容
 
@@ -63,6 +119,8 @@
 
 ```
 plugin.py / wiki.py           # 插件主体（开房、卡组池、指令与工具）与百科检索
+webui.py                      # 插件自带面板（零第三方依赖：http.server + 线程）
+train/                        # 训练功能：任务记录库 / 执行器（起子进程、杀进程树）/ 问模型那两块
 clients/                      # 自带的两个虚拟客户端（ygopro + WindBot）
 executors/                    # 十份专属出牌脚本（C#）与安装说明：推荐让 agent 多轮迭代着写
 duel/ tools/ tests/ docs/     # 对局运行时、运维工具、测试、深入文档（出图与对局监视）
@@ -70,6 +128,11 @@ duel/ tools/ tests/ docs/     # 对局运行时、运维工具、测试、深入
 
 ```bash
 python -m pytest tests -q --asyncio-mode=auto                    # 测试
+python tools/run_tests.py                                        # 同上，逐个文件跑（不用 pytest）
 python tools/field_image.py --demo --render                      # 单独看查房出图长什么样
 python tools/check_engine_data.py --ygopro-dir clients/ygopro    # 内核 / 卡库 / 卡脚本是否同源
+python tools/brain_model_probe.py                                # 阻抗决策层：量各模型单次延迟（选 decision_model 用）
+python tools/brain_channel_check.py                              # 阻抗决策层：起真房间验一次问答链路
+python tools/brain_ab.py --duels 160 --gate                      # 阻抗决策层：镜像 A/B（同一副牌比"开/不开"胜率）
+python tools/pool_smoke.py                                       # 随机池逐副体检：脚本装对了没有 + 能不能打
 ```

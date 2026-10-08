@@ -71,7 +71,7 @@ index ec292fe..f4f2daf 100644
  
          private bool DefaultNoExecutor()
 diff --git a/Game/GameAI.cs b/Game/GameAI.cs
-index da8adf8..7bed52e 100644
+index da8adf8..32bdb06 100644
 --- a/Game/GameAI.cs
 +++ b/Game/GameAI.cs
 @@ -333,7 +333,15 @@ namespace WindBot.Game
@@ -90,7 +90,46 @@ index da8adf8..7bed52e 100644
                  }
              }
  
-@@ -587,6 +595,28 @@ namespace WindBot.Game
+@@ -491,6 +499,38 @@ namespace WindBot.Game
+         public int OnSelectChain(IList<ClientCard> cards, IList<int> descs, IList<bool> forces, int timing = -1)
+         {
+             Executor.OnSelectChain(cards);
++            // 进入这次链上提问：清空"上一问的否决"并打开作用域开关（见 MaiBotBrain.BeginChainPrompt）。
++            // 必须在 try/finally 里，因为下面有好几处提前 return——否决表绝不能跨提问残留，
++            // 残留会把后续提问里的卡整片挡掉（实测：一局提问数从 37 掉到 2）。
++            MaiBotBrain.BeginChainPrompt();
++            try
++            {
++                return SelectChainCore(cards, descs, forces, timing);
++            }
++            finally
++            {
++                MaiBotBrain.EndChainPrompt();
++            }
++        }
++
++        private int SelectChainCore(IList<ClientCard> cards, IList<int> descs, IList<bool> forces, int timing)
++        {
++            // 阻抗决策层：**对面发动效果带来的时点**，先问一句"发哪张 / 都不发"（见 MaiBotBrain.AskChainChoice）。
++            // 放在最前面是因为下面的循环是"按规则注册顺序、第一条说 yes 的获胜"——
++            // 我方同时有多张能交的阻抗时，谁先上完全由注册顺序决定，模型插不进来。
++            // 没开决策层 / 时点不成立 / 可发动的东西不够多时，这个调用是零开销的空转，照旧走脚本。
++            int chosen = MaiBotBrain.AskChainChoice(cards, descs, Duel);
++            if (chosen != MaiBotBrain.NoOpinion)
++            {
++                if (chosen >= 0 && chosen < cards.Count)
++                {
++                    _dialogs.SendChaining(cards[chosen].Name);
++                    return chosen;
++                }
++                // 模型说"都不发"：只把**那几张阻抗卡**从这一问里剔掉（`_chainVetoedIds`），
++                // 剩下的候选照旧交给脚本——不能整问拒答，那会把脚本自己的非阻抗动作也一起否掉。
++                // 脚本也没得选时才返回 -1（真拒答）。
++            }
+             foreach (CardExecutor exec in Executor.Executors)
+             {
+                 for (int i = 0; i < cards.Count; ++i)
+@@ -587,6 +627,28 @@ namespace WindBot.Game
          {
              _selectingPendulumSummon = false;
              CheckSurrender();
@@ -119,7 +158,7 @@ index da8adf8..7bed52e 100644
              foreach (CardExecutor exec in Executor.Executors)
              {
              	if (exec.Type == ExecutorType.GoToEndPhase && main.CanEndPhase && exec.Func()) // check if should enter end phase directly
-@@ -668,6 +698,100 @@ namespace WindBot.Game
+@@ -668,6 +730,100 @@ namespace WindBot.Game
              return new MainPhaseAction(MainPhaseAction.MainAction.ToEndPhase); 
          }
  
@@ -220,7 +259,7 @@ index da8adf8..7bed52e 100644
          /// <summary>
          /// Called when the AI has to select an option.
          /// </summary>
-@@ -763,7 +887,22 @@ namespace WindBot.Game
+@@ -763,7 +919,22 @@ namespace WindBot.Game
              int sequence = 0;
              if (location != CardLocation.PendulumZone && location != CardLocation.FieldZone)
              {
@@ -244,7 +283,7 @@ index da8adf8..7bed52e 100644
                  else if ((filter & Zones.z1) != 0) sequence = 1;
                  else if ((filter & Zones.z3) != 0) sequence = 3;
                  else if ((filter & Zones.z0) != 0) sequence = 0;
-@@ -1209,6 +1348,16 @@ namespace WindBot.Game
+@@ -1209,6 +1380,16 @@ namespace WindBot.Game
          private CardSelector m_materialSelector;
          private int m_materialSelectorHint;
          private int m_place;
@@ -261,15 +300,33 @@ index da8adf8..7bed52e 100644
          private int m_option;
          private int m_number;
          private int m_announce;
+@@ -1584,6 +1765,10 @@ namespace WindBot.Game
+ 
+         private bool ShouldExecute(CardExecutor exec, ClientCard card, ExecutorType type, int desc = -1, int timing = -1)
+         {
++            // 决策层在这一问里说"都不交"时，它否掉的是**具体那几张阻抗卡**，不是整问。
++            // 放在最前面：连 `SetCard` 都不该跑——否则卡片的状态会被"其实没在判定"的流程改掉。
++            if (card != null && type == ExecutorType.Activate && MaiBotBrain.IsChainVetoed(card))
++                return false;
+             Executor.SetCard(type, card, desc, timing);
+             if (card.Id != 0 && type == ExecutorType.Activate)
+             {
 diff --git a/WindBot.csproj b/WindBot.csproj
-index b8a3242..1343fce 100644
+index b8a3242..09a00e6 100644
 --- a/WindBot.csproj
 +++ b/WindBot.csproj
-@@ -87,6 +87,7 @@
+@@ -84,9 +84,14 @@
+     <Compile Include="Game\AI\Decks\*.cs" />
+     <Compile Include="Game\AI\DefaultExecutor.cs" />
+     <Compile Include="Game\AI\Dialogs.cs" />
++    <!-- 通用选目标判据（"该炸/该弹对面哪张"、"该无效哪只怪"），见文件头说明；缺了编译不过 -->
++    <Compile Include="Game\AI\EnemyTargeting.cs" />
      <Compile Include="Game\AI\Enums\*.cs" />
      <Compile Include="Game\AI\Executor.cs" />
      <Compile Include="Game\AI\HintMsg.cs" />
 +    <Compile Include="Game\AI\MaiBotBrain.cs" />
++    <!-- 阻抗决策层的确定性部分（阻抗卡表 + 目标过滤 + 威胁序），见文件头；缺了编译不过 -->
++    <Compile Include="Game\AI\NegateDecision.cs" />
      <Compile Include="Game\AI\Opcodes.cs" />
      <Compile Include="Game\AI\Zones.cs" />
      <Compile Include="Game\AI\ExecutorType.cs" />

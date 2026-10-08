@@ -152,12 +152,15 @@ def test_config_model_builds_and_matches_toml() -> None:
     assert defaults.duel.join_timeout_seconds > 0
     # 版本号提升是有意的：0.21.27 新增了 duel.invite_*（空闲主动约战）；
     # 2026-10-07 起 1.10.0：`taunt_enabled` / `invite_enabled` 默认关闭（用户要求"开房发完地址就不再讲话"）。
-    # 版本号保持 1.0.0 不变（2026-10-07 精简掉 AI 打牌/训练/常驻房，但不改配置版本）。
-    assert defaults.plugin.config_version == "1.0.0"  # 合并成「麦麦玩游戏王」后重新从 1.0.0 起版
+    # 2026-10-08 起 1.2.0：新增 [llm]（三个用途的模型与超时）/ [training]（训练功能）/ [webui]（插件面板），
+    # 并把 duel.brain_model + duel.brain_timeout_ms 移成 llm.decision_model + llm.decision_timeout_ms。
+    assert defaults.plugin.config_version == "1.2.0"
 
     with (_PLUGIN_ROOT / "config.toml.example").open("rb") as handle:
         toml_data = tomllib.load(handle)
-    assert set(toml_data) >= {"plugin", "paths", "duel", "wiki"}, "配置模板缺少必要的配置节"
+    assert set(toml_data) >= {"plugin", "paths", "duel", "llm", "training", "webui", "wiki"}, (
+        "配置模板缺少必要的配置节"
+    )
     assert toml_data["plugin"]["config_version"] == defaults.plugin.config_version, (
         "配置模板的 config_version 与代码默认值不一致，会导致每次启动都触发配置迁移"
     )
@@ -165,7 +168,7 @@ def test_config_model_builds_and_matches_toml() -> None:
     # 模板里出现的键必须在模型里有对应字段，否则是写错了名字
     model_fields = set(config_model.model_fields)
     assert set(toml_data) <= model_fields, f"配置模板存在模型里没有的节：{set(toml_data) - model_fields}"
-    for section in ("paths", "duel", "wiki"):
+    for section in ("paths", "duel", "llm", "training", "webui", "wiki"):
         section_model = config_model.model_fields[section].annotation
         assert section_model is not None
         assert set(toml_data[section]) <= set(section_model.model_fields), (

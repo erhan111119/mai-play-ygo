@@ -1,8 +1,8 @@
 diff --git a/Game/AI/Decks/DoEveryThingExecutor.cs b/Game/AI/Decks/DoEveryThingExecutor.cs
-index 8699807..de38a0c 100644
+index 8699807..7d167a4 100644
 --- a/Game/AI/Decks/DoEveryThingExecutor.cs
 +++ b/Game/AI/Decks/DoEveryThingExecutor.cs
-@@ -23,17 +23,82 @@ namespace WindBot.Game.AI.Decks
+@@ -23,17 +23,99 @@ namespace WindBot.Game.AI.Decks
              AddExecutor(ExecutorType.SummonOrSet, DefaultMonsterSummon);
              AddExecutor(ExecutorType.Repos, DefaultMonsterRepos);
              AddExecutor(ExecutorType.SpellSet);
@@ -57,6 +57,7 @@ index 8699807..de38a0c 100644
 +        ///   「黑森林的魔女」（从场上去墓地就检索 ⇒ 白送对面一次检索）；
 +        /// * 手坑/无效类的目标也会挑到"没在发效果的那只"。
 +        /// 现在：**先把"弄掉对面哪张卡"这类提问按卡文挑好**（见 <see cref="DefaultExecutor.PickEnemyRemovalTarget"/>），
++        /// 手坑/无效系选目标（`HintMsg.Disable`）也接上基类那条判据（含阻抗决策层，见 ①bis），
 +        /// 其余保持上游口径，只补上越界保护（原来 `max` 大于候选数时 `cards[cards.Count-i]` 会直接抛异常）。
 +        /// 这条兜底是"投稿卡组用通用脚本"时的唯一选择逻辑，所以通用层的收益最大。
 +        /// </summary>
@@ -75,6 +76,22 @@ index 8699807..de38a0c 100644
 +                IList<ClientCard> enemy = PickEnemyRemovalTarget(cards, hint, max);
 +                if (enemy != null)
 +                    return enemy;
++            }
++
++            // ①bis 手坑/无效系"选一只怪来无效"（`HintMsg.Disable`）。
++            //
++            // 2026-10-08 补：上游这里**没有这个分支**，于是手坑选目标直接掉进 ② 的"取候选尾部"——
++            // 等于把"无效哪只"交给内核报文的排列。而这条路径（投稿卡组用通用脚本）恰恰是
++            // 群友报"手坑点错对象"的地方，也是决策层收益最大的一条：`DefaultGetDisableMonsterTarget`
++            // 里"刚发效果的那只"（2026-10-08 修过）与决策层选的目标，都在这里第一次接上。
++            //
++            // 只认 min/max 都是 1 的单选提问；选出来的目标**必须在 `cards` 里**（不同卡文本要的
++            // 目标类型不同，例如要"魔陷"的场合我们给不出怪，这时不抢，退回上游口径）。
++            if (hint == HintMsg.Disable && min == 1 && max == 1)
++            {
++                ClientCard target = DefaultGetDisableMonsterTarget();
++                if (target != null && cards.Contains(target))
++                    return new List<ClientCard> { target };
 +            }
  
              IList<ClientCard> selected = new List<ClientCard>();

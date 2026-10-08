@@ -1,7 +1,13 @@
 diff --git a/Game/AI/DefaultExecutor.cs b/Game/AI/DefaultExecutor.cs
-index ab31e2d..aafe79b 100644
+index ab31e2d..83261cb 100644
 --- a/Game/AI/DefaultExecutor.cs
 +++ b/Game/AI/DefaultExecutor.cs
+@@ -1,4 +1,4 @@
+-using System;
++﻿using System;
+ using System.Collections.Generic;
+ using System.Linq;
+ using YGOSharp.OCGWrapper.Enums;
 @@ -317,6 +317,51 @@ namespace WindBot.Game.AI
          /// <summary>Columns 0-4 on Bot's field negated by Infinite Impermanence (enemy's col converted to ours: 4-col). Cleared at turn start.</summary>
          protected List<int> infiniteImpermanenceNegatedColumns = new List<int>();
@@ -82,27 +88,3 @@ index ab31e2d..aafe79b 100644
          public override void OnMove(ClientCard card, int previousControler, int previousLocation, int currentControler, int currentLocation)
          {
              if (card != null)
-@@ -1923,11 +1985,11 @@ namespace WindBot.Game.AI
-         /// </summary>
-         /// <param name="card">Bot card that would be sent to the GY. Null uses unknown type/location.</param>
-         /// <returns>True if the card would be banished instead of going to the GY.</returns>
--        protected bool DefaultCheckWhetherBotWillBeBanished(ClientCard card = null)
-+        protected bool DefaultCheckWhetherBotWillBeBanished(ClientCard card = null)
-         {
-             if (card == null)
--                return DefaultCheckWhetherBotWillBeBanished((CardType)0, (CardLocation)0);
--            return DefaultCheckWhetherBotWillBeBanished((CardType)card.Type, card.Location);
-+                return DefaultCheckWhetherBotWillBeBanished((CardType)0, (CardLocation)0);
-+            return DefaultCheckWhetherBotWillBeBanished((CardType)card.Type, card.Location);
-         }
- 
-         /// <summary>
-@@ -1937,7 +1999,7 @@ namespace WindBot.Game.AI
-         /// <param name="type">Type flags of the card that would be sent to the GY. 0 means unknown.</param>
-         /// <param name="location">Current location of the card that would be sent to the GY. 0 means unknown.</param>
-         /// <returns>True if the card would be banished instead of going to the GY.</returns>
--        protected bool DefaultCheckWhetherBotWillBeBanished(CardType type, CardLocation location = 0)
-+        protected bool DefaultCheckWhetherBotWillBeBanished(CardType type, CardLocation location = 0)
-         {
-             // EFFECT_CANNOT_REMOVE stops GY redirects: Artifact Lancea until end of the turn it resolves,
-             // Imperial Iron Wall while face-up and not disabled in either Spell/Trap Zone.
