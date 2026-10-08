@@ -167,7 +167,7 @@ def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> 
             self.banished = 1
             self.extra = 2
 
-    # 位号与内核一致：怪兽区 5/6 是额外怪兽区、魔陷区第 5 号位是场地魔法、灵摆区单列
+    # 位号与内核一致：怪兽区 5/6 是额外怪兽区、魔陷区第 5 号位是场地魔法、灵摆区＝魔陷区最左/最右
     state = types.SimpleNamespace(
         zones={
             (0, fieldstate.MONSTER_ZONE, 0): zone_card(100, 0x1),      # 表侧攻击
@@ -233,17 +233,19 @@ def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> 
             assert ours["name"] == "憨憨" and theirs["name"] == "群友", room["sides"]
             assert ours["deck"] == "升辉月", ours["deck"]
 
-            # 完整牌桌：5 主怪兽 + 2 额外怪兽 + 5 魔陷 + 场地 + 2 灵摆 + 三堆
+            # 完整牌桌：5 主怪兽 + 2 额外怪兽 + 5 魔陷（最左/最右＝灵摆）+ 场地 + 三堆
             assert len(ours["monsters"]) == 5 and len(ours["spells"]) == 5, ours
-            assert len(ours["extra_monsters"]) == 2 and len(ours["pendulums"]) == 2, ours
+            assert len(ours["extra_monsters"]) == 2, ours
+            assert ours["spell_pendulum"] == [True, False, False, False, True], ours["spell_pendulum"]
             assert ours["piles"] == {"grave": 4, "banished": 1, "extra": 2}, ours["piles"]
             # 表侧怪：报卡号 + 表示形式
             assert ours["monsters"][0]["id"] == 100 and ours["monsters"][0]["attack"] is True, ours["monsters"][0]
             assert ours["monsters"][1] is None, "空格要显式给 null，前端才画得出空场"
-            # 额外怪兽区 / 场地 / 灵摆各自归位（不能都塞进主怪兽区与魔陷区）
+            # 额外怪兽区 / 场地各自归位（不能都塞进主怪兽区与魔陷区）
             assert ours["extra_monsters"][0]["id"] == 400, ours["extra_monsters"]
             assert ours["field_zone"]["id"] == 500, ours["field_zone"]
-            assert ours["pendulums"][0]["id"] == 600, ours["pendulums"]
+            # ⚠ 灵摆区就是魔陷区最左那格：内核把这儿的牌报成 PENDULUM_ZONE，也要画在魔陷区 1
+            assert ours["spells"][0] and ours["spells"][0]["id"] == 600, ours["spells"][0]
             # 里侧：只报"有卡 + 里侧"，一个卡号都不能给（否则面板比对手本人知道得更多）
             back = theirs["monsters"][2]
             assert back is not None and back["face_up"] is False, back

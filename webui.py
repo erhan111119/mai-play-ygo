@@ -1141,6 +1141,19 @@ def _board_sides(
             card = seat_zones.get((location, sequence))
             return _slot_json(card, names=details, details=detail_map)
 
+        def spell_slot(sequence: int) -> Optional[Dict[str, Any]]:
+            """魔陷区的一格。
+
+            ⚠ **灵摆区就是魔陷区最左（0）与最右（4）这两格**（大师规则 4 之后不再单独占地）：
+            内核有时把牌报在 ``SPELL_ZONE``、有时报在 ``PENDULUM_ZONE``，两处都要看，
+            否则摆上灵摆的牌会在面板上凭空消失（第一版把灵摆单列成两张独立卡位，是错的）。
+            """
+
+            card = seat_zones.get((SPELL_ZONES[0], sequence))
+            if card is None and sequence in (0, 4):
+                card = seat_zones.get((SPELL_ZONES[1], 1 if sequence == 4 else 0))
+            return _slot_json(card, names=details, details=detail_map)
+
         player = players.get(seat)
         stats = stats_of.get(seat)
         lp = getattr(player, "lp", None)
@@ -1158,9 +1171,10 @@ def _board_sides(
                 # 主怪兽区 5 + 额外怪兽区 2
                 "monsters": [slot(MONSTER_ZONE, seq) for seq in range(5)],
                 "extra_monsters": [slot(MONSTER_ZONE, seq) for seq in (5, 6)],
-                "spells": [slot(SPELL_ZONES[0], seq) for seq in range(5)],
+                # 魔陷区 5 格（**最左/最右就是灵摆区**）+ 场地区
+                "spells": [spell_slot(seq) for seq in range(5)],
+                "spell_pendulum": [seq in (0, 4) for seq in range(5)],
                 "field_zone": slot(SPELL_ZONES[0], 5),
-                "pendulums": [slot(SPELL_ZONES[1], seq) for seq in (0, 1)],
                 "piles": {
                     "grave": int(getattr(player, "grave", 0) or 0),
                     "banished": int(getattr(player, "banished", 0) or 0),
@@ -1739,7 +1753,7 @@ pre.log .lv-debug { color:#6f7d95; } pre.log .lv-info { color:#9fe8c8; }
 .boardrow { display:grid; grid-template-columns:repeat(5, minmax(0, 92px)); gap:4px;
   justify-content:center; margin-bottom:5px; }
 .boardrow.ex { grid-template-columns:repeat(2, minmax(0, 92px)); }
-.boardrow.low { grid-template-columns:repeat(6, minmax(0, 92px)); }
+.boardrow.low { grid-template-columns:repeat(4, minmax(0, 92px)); }
 .slot { position:relative; aspect-ratio:59/86; max-height:132px; border-radius:8px; overflow:hidden;
   border:1px dashed #2a3346; background:rgba(255,255,255,.015); display:grid; place-items:center; }
 .slot img { width:100%; height:100%; object-fit:cover; display:block; }
@@ -2127,10 +2141,10 @@ function sideBoard(side){
     </div>
     <div class="boardrow ex">${(side.extra_monsters || []).map((c, i) => cardSlot(c, "额外怪兽区" + (i + 1))).join("")}</div>
     <div class="boardrow">${(side.monsters || []).map((c, i) => cardSlot(c, "怪兽区" + (i + 1))).join("")}</div>
-    <div class="boardrow">${(side.spells || []).map((c, i) => cardSlot(c, "魔陷区" + (i + 1))).join("")}</div>
+    <div class="boardrow">${(side.spells || []).map((c, i) =>
+      cardSlot(c, (side.spell_pendulum && side.spell_pendulum[i] ? "魔陷区" + (i + 1) + "·灵摆" : "魔陷区" + (i + 1)))).join("")}</div>
     <div class="boardrow low">
       ${cardSlot(side.field_zone, "场地魔法")}
-      ${(side.pendulums || []).map((c, i) => cardSlot(c, i === 0 ? "灵摆区左" : "灵摆区右")).join("")}
       <div class="pile"><span class="k">墓地</span><b>${esc(piles.grave ?? 0)}</b></div>
       <div class="pile"><span class="k">除外</span><b>${esc(piles.banished ?? 0)}</b></div>
       <div class="pile"><span class="k">额外</span><b>${esc(piles.extra ?? 0)}</b></div>
