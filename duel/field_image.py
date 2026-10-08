@@ -107,8 +107,7 @@ class CardView:
     link: bool = False             # 连接怪：没有守备，角标只报攻击力
     atk: Optional[int] = None      # 表侧怪兽才有
     def_: Optional[int] = None
-    level: int = 0                 # 等级 / 阶级 / LINK 数（超量是阶级、连接是 LINK 数）
-    rank: bool = False             # 超量：星星画成"黑底金星"的阶级星
+    level: int = 0                 # 等级 / 阶级 / LINK 数（只在连接怪的攻守角标里用：`2000/LINK-2`）
     type_line: str = ""            # 卡面第二行（"怪兽 超量 效果" 这种，来自 cards.cdb 的类型位）
     effect: str = ""               # 中文卡文（卡面下半段那框小字）
     art: str = ""                  # 立绘的 data URI（自绘卡框用）；空 = 没立绘
@@ -275,24 +274,6 @@ def _kind_of(type_text: str) -> str:
     return "monster"
 
 
-def _stars_html(card: CardView, *, overlay: bool = False) -> str:
-    """星级（等级/阶级星；连接怪写 `LINK-n`）。
-
-    `overlay=True` 时是**压在整卡图上方**的那条（用户口径 2026-10-09：
-    "卡图就直接用完整卡图……上面加上星级，下面直接写攻击力守备力"）。
-    """
-
-    if card.kind != "monster":
-        return ""
-    cls = "stars over" if overlay else "stars"
-    if card.link:
-        return f'<div class="{cls} link">LINK-{card.level}</div>' if card.level else ""
-    if card.level <= 0:
-        return ""
-    marks = "★" * min(card.level, 12)
-    return f'<div class="{cls}{" rank" if card.rank else ""}">{marks}</div>'
-
-
 #: 名字条可用宽度（卡面 64 − 卡框左右各 3 − 名字条左右各 4）
 _NAME_BOX_WIDTH = CARD_WIDTH - 6 - 8
 #: 名字字号：基准 / 单行允许的最小值 / 多行允许的最小值
@@ -384,17 +365,15 @@ def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "")
         return (
             f'<div class="{plate}"><div class="card fullcard{posture}">'
             f'<img class="cardimg" src="{card.full}" alt="">'
-            f"{_stars_html(card, overlay=True)}"
             f"</div>{numbers}</div>"
         )
-    # 兜底（缓存里暂时没有：正在后台补 / 离线）：只画 名字 + 星级 + 攻守——**不画立绘、不写效果**
+    # 兜底（缓存里暂时没有：正在后台补 / 离线）：只画 名字 + 攻守——**不画立绘、不写效果**
     name_size, _lines, name_height = _name_box(card.name or str(card.card_id))
     name_style = f"font-size:{name_size}px;line-height:{round(name_size * 1.28, 1)}px;max-height:{name_height}px"
     frame, _line = _frame_of(card)
     return (
         f'<div class="{plate}"><div class="card bare{posture}" style="--frame:{frame}">'
         f'<div class="cname" style="{name_style}">{_escape(card.name or card.card_id)}</div>'
-        f"{_stars_html(card)}"
         f'<div class="barestat">{_escape(card.field_text)}</div>'
         f"</div>{numbers}</div>"
     )
@@ -574,10 +553,6 @@ _CSS = """
   .card .cname {{ height: auto; overflow: hidden; color: #241505; font-weight: 700;
     padding: 0 4px; border-radius: 2px; word-break: break-word; text-align: center;
     background: linear-gradient(180deg, #f6e6c2, #d9c294); }}
-  .card .stars {{ height: 11px; line-height: 11px; font-size: 8.5px; color: #ffd76a;
-    text-align: right; text-shadow: 0 0 3px rgba(0,0,0,.9); padding-right: 3px; }}
-  .card .stars.rank {{ color: #17171a; text-shadow: 0 0 1px #ffd76a, 0 0 4px #ffd76a; }}
-  .card .stars.link {{ font-size: 8px; color: #cfe9ff; }}
   .card .artbox {{ height: 38px; margin: 0 1px; overflow: hidden; border: 1px solid rgba(0,0,0,.6);
     background: linear-gradient(160deg, #2b2417, #0c0a06); }}
   .card .art {{ width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }}
@@ -585,13 +560,7 @@ _CSS = """
   .card.fullcard {{ padding: 0; background: #0b0e18; }}
   .card.fullcard .cardimg {{ width: 100%; height: 100%; object-fit: fill; display: block; }}
   .card.def {{ transform: rotate(90deg) scale(.94); }}
-  /* 叠在卡图上方的星级条（用户口径：卡图上面加星级） */
-  .card .stars.over {{ position: absolute; top: 1px; left: 0; right: 0; text-align: right;
-    padding-right: 3px; font-size: 9px; line-height: 10px; color: #ffd76a;
-    text-shadow: 0 1px 2px #000, 0 0 5px #000; }}
-  .card .stars.over.rank {{ color: #1b1b1b; text-shadow: 0 0 2px #ffd76a, 0 0 5px #ffd76a; }}
-  .card .stars.over.link {{ font-size: 8px; color: #cfe9ff; }}
-  /* 兜底（暂时没整卡图）：名字 + 星级 + 攻守，不画立绘/效果 */
+  /* 兜底（暂时没整卡图）：只画 名字 + 攻守，不画立绘/效果/星级（用户口径 2026-10-09："去掉星级"） */
   .card.bare {{ display: flex; flex-direction: column; align-items: stretch; justify-content: center;
     gap: 2px; background:
       repeating-linear-gradient(45deg, rgba(255,255,255,.06) 0 5px, rgba(0,0,0,0) 5px 10px),
@@ -801,7 +770,6 @@ def to_card_view(
             name = str(getattr(detail, "name", "") or name)
             kind = _kind_of(type_text)
             link = "连接" in type_text
-            rank = "超量" in type_text
             type_line = type_text.replace(" ", "/")
             match = _STATS_RE.search(str(getattr(detail, "stats", "")))
             if match:
@@ -820,7 +788,6 @@ def to_card_view(
         atk=atk if face_up else None,
         def_=def_ if face_up else None,
         level=level if face_up else 0,
-        rank=rank,
         type_line=type_line,
         effect=effect if face_up else "",
         art=card_art_uri(card_id, art_dir=art_dir, fallback_dir=art_fallback_dir) if face_up else "",

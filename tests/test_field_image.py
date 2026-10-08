@@ -93,11 +93,11 @@ def test_fallback_card_shows_name_and_stats_only() -> None:
     assert "--frame:#14503a" in html, "魔法卡兜底要用绿色卡框"
 
 
-def test_full_image_card_gets_stars_and_stats_overlays() -> None:
-    """**完整卡图** + 我们的两个角标：上面星级、下面攻守；守备表示整张卡转 90°。
+def test_full_image_card_gets_stats_overlay_and_defence_rotation() -> None:
+    """**完整卡图** + 下面的攻守；守备表示整张卡转 90°；**不叠星级、不写效果**。
 
-    用户口径（2026-10-09）："卡图就直接用完整卡图……上面加上星级，下面直接写攻击力守备力就行，
-    另外注意一下朝向问题就可以了，不用写效果这类"。
+    用户口径（2026-10-09）："卡图就直接用完整卡图……下面直接写攻击力守备力就行，
+    另外注意一下朝向问题就可以了，不用写效果这类"、"去掉星级"。
     """
 
     attack_card = CardView(1, "闪刀姬-燎里", full="data:image/jpeg;base64,AAAA",
@@ -110,7 +110,7 @@ def test_full_image_card_gets_stars_and_stats_overlays() -> None:
                                                      monsters=[attack_card, defend_card]))
     )
     assert html.count('class="cardimg"') == 2, "两张都要用整卡图"
-    assert 'class="stars over"' in html, "卡图上方要有星级条"
+    assert "stars" not in html and "★" not in html, "星级要去掉（卡图里本来就有）"
     assert 'class="card fullcard def"' in html, "守备表示要旋转（朝向问题）"
     assert "1500/1000" in html and "2000/2100" in html, "下面要写攻守"
     assert 'class="cname"' not in html, "有整卡图就不该再叠自绘的名字条"
@@ -171,8 +171,11 @@ def test_zones_are_mapped_to_slots() -> None:
     assert view.bottom.lp == 6200 and view.top.lp == 3100
 
 
-def test_fallback_keeps_rank_and_link_marks_readable() -> None:
-    """兜底卡面（没有整卡图）也要把**阶级星**与 **LINK 数**标对——超量黑底金星、连接写 LINK-n。"""
+def test_fallback_keeps_link_rating_readable() -> None:
+    """兜底卡面（没有整卡图）只画**名字 + 攻守**；连接怪的攻守角标仍要写清 LINK 数。
+
+    用户口径（2026-10-09）："去掉星级"——星级不再由我们画（完整卡图里本来就有）。
+    """
 
     html = build_html(
         FieldView(
@@ -182,14 +185,14 @@ def test_fallback_keeps_rank_and_link_marks_readable() -> None:
                 label="我方",
                 lp=8000,
                 monsters=[
-                    CardView(1, "救援少女·卡尔麦尔", atk=2600, def_=1800, level=4, rank=True),
+                    CardView(1, "救援少女·卡尔麦尔", atk=2600, def_=1800, level=4),
                     CardView(2, "闪刀姬=零露", atk=2000, level=2, link=True),
                 ],
             ),
         )
     )
     assert "救援少女·卡尔麦尔" in html and "闪刀姬=零露" in html
-    assert "stars rank" in html, "超量要按阶级星画（黑底金星）"
+    assert "★" not in html and "stars" not in html, "星级已经去掉，不该再画"
     assert "LINK-2" in html, "连接怪要写 LINK 数"
     assert "2600/1800" in html and "2000/LINK-2" in html, "下面写攻守"
 
@@ -307,8 +310,8 @@ def _run_all() -> int:
         test_fallback_card_shows_name_and_stats_only,
         test_link_monster_shows_attack_only,
         test_zones_are_mapped_to_slots,
-        test_fallback_keeps_rank_and_link_marks_readable,
-        test_full_image_card_gets_stars_and_stats_overlays,
+        test_fallback_keeps_link_rating_readable,
+        test_full_image_card_gets_stats_overlay_and_defence_rotation,
         test_stack_counts_are_rendered,
         test_full_card_image_wins_over_drawn_frame,
         test_long_card_name_shrinks_instead_of_being_cut,

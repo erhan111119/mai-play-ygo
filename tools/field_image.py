@@ -80,7 +80,6 @@ def demo_view(
             attack=attack,
             kind=_kind_of(type_text),
             link="连接" in type_text,
-            rank="超量" in type_text,
             level=int(match.group(3)) if match and match.group(3) and face_up else 0,
             type_line=type_text.replace(" ", "/"),
             effect=str(getattr(detail, "effect", "") or "") if face_up else "",
@@ -146,7 +145,7 @@ def demo_view(
         phase="主要阶段 2",
         top=sides["them"],
         bottom=sides["me"],
-        footer="里侧的卡只画卡背（不公开卡面）｜卡面＝完整卡图 + 星级 / 攻守角标",
+        footer="里侧的卡只画卡背（不公开卡面）｜卡面＝完整卡图 + 下面的攻守角标",
     )
 
 
