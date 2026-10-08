@@ -40,6 +40,7 @@ import threading
 import time
 
 from .duel.card_images import cache_dir_for
+from .duel.field_image import _archetype_guess
 from .duel.fieldstate import MONSTER_ZONE, SPELL_ZONES
 from .train.analysis import tail_lines
 
@@ -760,10 +761,20 @@ class _PanelHandler(BaseHTTPRequestHandler):
         return {"ok": True, "run": payload}
 
     def _api_rooms(self) -> Dict[str, Any]:
-        """实时对局监控：每个进行中的房间一份局面快照。
+        """实时对局监控：每个进行中的房间一份**完整**局面快照。
 
-        数据来自房间自己的会话（`DuelSession.recorder()` → 记录器里的 `FieldState`）：
-        谁在打、第几回合、什么阶段、双方 LP、场上每格是什么（里侧不公开卡号，与出图同一口径）。
+        给的是牌桌上的全部位置（与内核的位号一一对应，和 `/查房` 出图同一套）：
+
+        * 怪兽区 7 格（0~4 主怪兽区、5~6 **额外怪兽区**）
+        * 魔陷区 5 格 + **场地魔法区**（SPELL_ZONE 的第 5 号位）+ **灵摆区 2 格**
+        * 墓地 / 除外 / 额外卡组 三堆的**当前张数**
+        * 每张表侧卡的卡名、攻守、表示形式；里侧的只报"有卡"（不公开卡号）
+        * 双方 LP、回合数、阶段、现在轮到谁，以及记录器那份"台账"（召唤/特召/发动/盖放/攻击/伤害…）
+
+        ⚠ 里侧卡在记录器里是 ``ZoneCard`` 对象（带 ``position``），**不是卡号**——
+        第一版按卡号写的 `int(card)` 就是那个 `TypeError` 的来源；这里统一走
+        ``ZoneCard.card_id`` 与 ``.face_up``。
+
         面板线程读这些字段是**只读**的、且都在同一进程里，某一帧读到不一致可以接受
         （每 2 秒刷新一次，下一帧就对上了）——要做成严格一致就得让出牌循环给面板让路，
         那会拖慢对局。
@@ -771,6 +782,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
 
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
         plugin = panel.plugin
+        card_db = getattr(plugin, "_card_db", None)
         rooms: List[Dict[str, Any]] = []
         for stream_id, room in list(dict(getattr(plugin, "_rooms", {})).items()):
             entry: Dict[str, Any] = {
@@ -781,6 +793,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 "finished": False,
                 "turn": 0,
                 "phase": "",
+                "current_seat": None,
                 "sides": [],
                 "error": "",
             }
@@ -791,19 +804,28 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 recorder = session.recorder()
                 entry["turn"] = int(getattr(recorder, "turn_count", 0) or 0)
                 entry["phase"] = str(getattr(recorder, "phase", "") or "")
+                # 现在轮到谁：内核每回合发 MSG_NEW_TURN，记录器把当前回合方存在 players 里
+                state = getattr(recorder, "field_state", None)
+                entry["current_seat"] = _current_seat(recorder, state)
                 names: Dict[int, str] = {}
+                stats_of: Dict[int, Any] = {}
                 lp_hint: Dict[int, int] = {}
                 for seat, stats in dict(getattr(recorder, "players", {}) or {}).items():
                     names[int(seat)] = str(getattr(stats, "name", "") or "")
+                    stats_of[int(seat)] = stats
                     final = getattr(stats, "lp_final", None)
                     if final:
                         lp_hint[int(seat)] = int(final)
-                entry["sides"] = _sides_from_state(
-                    getattr(recorder, "field_state", None),
+                entry["sides"] = _board_sides(
+                    state,
                     names=names,
+                    stats_of=stats_of,
                     self_seat=int(getattr(recorder, "self_seat", 0) or 0),
                     lp_hint=lp_hint,
                     start_lp=int(getattr(plugin.config.duel, "start_lp", 8000) or 8000),
+                    our_deck=str(getattr(room, "deck_name", "") or ""),
+                    card_db=card_db,
+                    current_seat=entry["current_seat"],
                 )
             except Exception as exc:  # noqa: BLE001  单个房间读失败不该让整页没数据
                 entry["error"] = f"{type(exc).__name__}: {exc}"
@@ -812,6 +834,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
             "ok": True,
             "rooms": rooms,
             "note": "只列本插件开的房间；里侧的卡不公开卡号（与出图同一口径）",
+            "unknown": [
+                "卡组剩余张数、手牌张数：内核不下发这两个数（它只在「抽牌」时报动作），所以这里给不了",
+            ],
         }
 
     def _api_deck_workspace(self, raw_deck_id: str) -> Dict[str, Any]:
@@ -1045,39 +1070,79 @@ def _card_names(card_db: Any, card_ids: List[int]) -> Dict[int, str]:
     return names
 
 
-def _sides_from_state(
+def _current_seat(recorder: Any, state: Any) -> Optional[int]:
+    """现在轮到谁下（拿不到就 None）。
+
+    三个来源依次试：记录器的当前回合方、局面对象里的同一字段。**不猜**：都没有就返回 None，
+    面板上不显示"轮到谁"，而不是标错一方。
+    """
+
+    for holder in (state, recorder):
+        for attr in ("current_seat", "turn_player", "turn_seat"):
+            value = getattr(holder, attr, None)
+            if isinstance(value, int):
+                return value
+    return None
+
+
+def _board_sides(
     state: Any,
     *,
     names: Dict[int, str],
+    stats_of: Dict[int, Any],
     self_seat: int,
     lp_hint: Optional[Dict[int, int]] = None,
     start_lp: int = 0,
+    our_deck: str = "",
+    card_db: Any = None,
+    current_seat: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """把 `FieldState` 摊成面板画牌桌要的形状：两边各自的路区与魔陷区 + 墓地/除外/额外计数。
+    """把 `FieldState` 摊成面板画**整张牌桌**要的形状。
 
-    * 里侧的卡**只报"有卡"不报卡号**（与出图同一口径：面板不该比对手本人知道得更多）。
-    * 顺序固定用 1~5 号位；空位给 ``None``，前端才画得出"空场"的样子。
-    * **还没有局面时也要给两边**（房刚开好、人还没进来时）：以前这种情况直接返回空列表，
-      面板上只剩一个标题、看着像坏了——现在照样给两边的名字与初始 LP，牌区空着。
+    位置与内核的位号一一对应（与 `/查房` 出图同一套，见 `duel/fieldstate.py`）：
+
+    * 怪兽区 7 格：0~4 主怪兽区、5~6 **额外怪兽区**
+    * 魔陷区 5 格 + **场地魔法区**（SPELL_ZONE 第 5 号位）+ **灵摆区 2 格**
+    * 墓地 / 除外 / 额外卡组 三堆的当前张数
+    * 每张卡：表侧的给卡号（前端自己去取卡图与卡名）、里侧的**只报"有卡"**
+
+    **还没有局面时也要给两边**（房刚开好、人还没进来时）：以前这种情况直接返回空列表，
+    面板上只剩一个标题、看着像坏了——现在照样给两边的名字与初始 LP，牌区空着。
     """
 
-    zones = dict(getattr(state, "zones", {}) or {}) if state is not None else {}
+    zones_of = getattr(state, "zones_of", None)
     players = dict(getattr(state, "players", {}) or {}) if state is not None else {}
     hints = dict(lp_hint or {})
     sides: List[Dict[str, Any]] = []
     for seat in (self_seat, 1 - self_seat):
+        seat_zones: Dict[Any, Any] = {}
+        if callable(zones_of):
+            try:
+                seat_zones = dict(zones_of(seat) or {})
+            except Exception:  # noqa: BLE001  某个座位读失败就当空场，别让整页报错
+                seat_zones = {}
+        # 卡名与攻守：一次批量查完（逐张查一副场要几十次 SQL）
+        wanted = [
+            card.card_id
+            for card in seat_zones.values()
+            if getattr(card, "card_id", 0) and getattr(card, "face_up", False)
+        ]
+        details = _card_names(card_db, wanted) if wanted else {}
+        detail_map: Dict[int, Any] = {}
+        if card_db is not None and wanted:
+            try:
+                detail_map = card_db.card_details(sorted(set(wanted)))
+            except Exception:  # noqa: BLE001
+                detail_map = {}
+
+        def slot(location: int, sequence: int) -> Optional[Dict[str, Any]]:
+            """一格 → 面板要的信息（``None`` 表示空格）。"""
+
+            card = seat_zones.get((location, sequence))
+            return _slot_json(card, names=details, details=detail_map)
+
         player = players.get(seat)
-        monsters: List[Any] = []
-        spells: List[Any] = []
-        for sequence in range(1, 6):
-            monsters.append(_zone_card(zones.get((seat, MONSTER_ZONE, sequence))))
-            # 魔陷区要把灵摆刻度一起找（刻度上放的是灵摆怪，玩家看到的就是"魔陷区有卡"）
-            card = None
-            for zone in SPELL_ZONES:
-                card = zones.get((seat, zone, sequence))
-                if card is not None:
-                    break
-            spells.append(_zone_card(card))
+        stats = stats_of.get(seat)
         lp = getattr(player, "lp", None)
         if lp is None or not int(lp):
             # 还没收到任何 LP 报文（等人进房时就是这样）：先显示初始 LP，别显示 0
@@ -1086,25 +1151,123 @@ def _sides_from_state(
             {
                 "seat": seat,
                 "is_self": seat == self_seat,
-                "name": names.get(seat, ""),
+                "name": names.get(seat, "") or ("我方" if seat == self_seat else "对手"),
+                "deck": _side_deck_label(state, seat, names, self_seat, our_deck, card_db),
                 "lp": int(lp or 0),
-                "graveyard": int(getattr(player, "grave", 0) or 0),
-                "banished": int(getattr(player, "banished", 0) or 0),
-                "extra": int(getattr(player, "extra", 0) or 0),
-                "monsters": monsters,
-                "spells": spells,
+                "is_turn": current_seat == seat,
+                # 主怪兽区 5 + 额外怪兽区 2
+                "monsters": [slot(MONSTER_ZONE, seq) for seq in range(5)],
+                "extra_monsters": [slot(MONSTER_ZONE, seq) for seq in (5, 6)],
+                "spells": [slot(SPELL_ZONES[0], seq) for seq in range(5)],
+                "field_zone": slot(SPELL_ZONES[0], 5),
+                "pendulums": [slot(SPELL_ZONES[1], seq) for seq in (0, 1)],
+                "piles": {
+                    "grave": int(getattr(player, "grave", 0) or 0),
+                    "banished": int(getattr(player, "banished", 0) or 0),
+                    "extra": int(getattr(player, "extra", 0) or 0),
+                },
+                "stats": _stats_json(stats),
             }
         )
     return sides
 
 
-def _zone_card(card: Optional[int]) -> Optional[Dict[str, Any]]:
-    """场上一格 → 面板要的信息（``None`` 表示空格）。"""
+def _slot_json(card: Any, *, names: Dict[int, str], details: Dict[int, Any]) -> Optional[Dict[str, Any]]:
+    """场上一格 → 面板要的信息（``None`` 表示空格）。
+
+    ⚠ 记录器里存的是 `ZoneCard`（带 ``card_id`` / ``position``），**不是卡号**：
+    第一版按卡号写（`int(card)`）在对局中就炸了 `TypeError: int() argument must be ... not 'ZoneCard'`。
+    里侧的卡**不报卡号**（只报"有卡 + 里侧"），与出图同一口径。
+    """
 
     if card is None:
         return None
-    card_id = int(card)
-    return {"id": card_id, "face_up": card_id > 0, "art": abs(card_id)}
+    card_id = int(getattr(card, "card_id", 0) or 0)
+    if not card_id:
+        return None
+    face_up = bool(getattr(card, "face_up", True))
+    if not face_up:
+        return {"id": 0, "face_up": False, "attack": bool(getattr(card, "attack_position", False))}
+    detail = details.get(card_id)
+    name = ""
+    if detail is not None:
+        name = str(getattr(detail, "name", "") or "")
+    return {
+        "id": card_id,
+        "face_up": True,
+        "attack": bool(getattr(card, "attack_position", False)),
+        "name": name or names.get(card_id, ""),
+        "atk": getattr(detail, "atk", None) if detail is not None else None,
+        "def_": getattr(detail, "def_", None) if detail is not None else None,
+        "kind": _card_kind_translate(detail) if detail is not None else "",
+    }
+
+
+def _card_kind_translate(detail: Any) -> str:
+    """卡的种类（怪兽/魔法/陷阱）——面板用它决定卡框颜色。"""
+
+    type_text = str(getattr(detail, "type_text", "") or "")
+    if "魔法" in type_text:
+        return "spell"
+    if "陷阱" in type_text:
+        return "trap"
+    return "monster" if type_text else ""
+
+
+def _side_deck_label(
+    state: Any,
+    seat: int,
+    names: Dict[int, str],
+    self_seat: int,
+    our_deck: str,
+    card_db: Any,
+) -> str:
+    """这一侧用的什么牌：我方用房间记录里的卡组名；对面内核不给，只能**按见过的卡名猜**。"""
+
+    if seat == self_seat:
+        return our_deck
+    seen_of = getattr(state, "seen_ids", None)
+    if not callable(seen_of) or card_db is None:
+        return ""
+    try:
+        seen = [int(card_id) for card_id in seen_of(seat)]
+    except Exception:  # noqa: BLE001
+        return ""
+    if not seen:
+        return ""
+    name_map = _card_names(card_db, seen)
+    guessed = _archetype_guess([name_map[card_id] for card_id in seen if card_id in name_map])
+    label = f"{guessed}（看牌猜）" if guessed else f"已见 {len(seen)} 张"
+    del names
+    return label
+
+
+def _stats_json(stats: Any) -> Dict[str, Any]:
+    """记录器那份台账 → 面板要的字段（拿不到就给空字典）。"""
+
+    if stats is None:
+        return {}
+    fields = (
+        "normal_summons",
+        "sp_summons",
+        "effects",
+        "sets",
+        "draws",
+        "attacks",
+        "direct_attacks",
+        "damage_dealt",
+        "damage_taken",
+        "biggest_hit_taken",
+        "lp_recovered",
+        "sent_to_grave",
+        "banished",
+    )
+    result: Dict[str, Any] = {}
+    for field_name in fields:
+        value = getattr(stats, field_name, None)
+        if value is not None:
+            result[field_name] = int(value or 0)
+    return result
 
 
 class _ThreadingPanelServer(ThreadingHTTPServer):
@@ -1554,28 +1717,55 @@ pre.log .lv-debug { color:#6f7d95; } pre.log .lv-info { color:#9fe8c8; }
   border-radius:999px; cursor:pointer; font-family:inherit; transition:background .16s var(--tap), color .16s var(--tap); }
 .seg button.on { background:rgba(124,108,246,.22); color:#fff; }
 
-/* ---- 对局监控：牌桌 ---- */
+/* ---- 对局监控：整张牌桌 ---- */
 .board-card { margin-bottom:14px; }
+/* 宽屏把两边**并排**：整场对局一次看完；窄屏再上下堆叠（那是手机的形状） */
+.boards { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; }
+@media (min-width: 1180px) { .boards { grid-template-columns:minmax(0,1fr) minmax(0,1fr); } }
 .board-card .bd { display:flex; flex-direction:column; gap:8px; }
 .board-mid { text-align:center; font-size:11px; letter-spacing:3px; color:var(--faint); }
-.side-board { border:1px solid var(--line-soft); border-radius:var(--r-md); padding:10px 12px;
+.side-board { border:1px solid var(--line-soft); border-radius:var(--r-md); padding:8px 10px;
   background:radial-gradient(600px 200px at 50% -40%, rgba(124,108,246,.10), transparent 70%), #101623;
-  max-width:640px; margin:0 auto; }
+  max-width:700px; margin:0 auto; width:100%; }
 .side-board.theirs { background:radial-gradient(600px 200px at 50% -40%, rgba(255,107,129,.10), transparent 70%), #101623; }
-.board-card .bd { align-items:center; }
-.side-hd { display:flex; align-items:center; gap:10px; margin-bottom:8px; font-size:12.5px; }
+.side-board.turn { border-color:rgba(61,220,151,.45); box-shadow:0 0 0 1px rgba(61,220,151,.18) inset; }
+.side-hd { display:flex; align-items:center; gap:10px; margin-bottom:8px; font-size:12.5px; flex-wrap:wrap; }
 .side-hd .who { color:var(--muted); }
 .side-hd .lp { display:inline-flex; align-items:center; gap:5px; font-weight:650; font-variant-numeric:tabular-nums;
-  color:#ffd9a6; }
+  color:#ffd9a6; font-size:14px; }
 .side-hd .lp svg.i { width:14px; height:14px; color:var(--danger); }
-.rowzones { display:grid; grid-template-columns:repeat(5, minmax(0,1fr)); gap:6px; margin-bottom:6px; }
-.slot { position:relative; aspect-ratio:59/86; border-radius:8px; overflow:hidden;
+/* 一行牌区：**固定格宽**（不是铺满）——两边牌桌要能同屏看，格子上限 112px，
+   再大就成"一次只看得到半边"，监控页失去意义。 */
+.boardrow { display:grid; grid-template-columns:repeat(5, minmax(0, 92px)); gap:4px;
+  justify-content:center; margin-bottom:5px; }
+.boardrow.ex { grid-template-columns:repeat(2, minmax(0, 92px)); }
+.boardrow.low { grid-template-columns:repeat(6, minmax(0, 92px)); }
+.slot { position:relative; aspect-ratio:59/86; max-height:132px; border-radius:8px; overflow:hidden;
   border:1px dashed #2a3346; background:rgba(255,255,255,.015); display:grid; place-items:center; }
 .slot img { width:100%; height:100%; object-fit:cover; display:block; }
 .slot.up { border-style:solid; border-color:#33405f; box-shadow:0 6px 16px -12px #000; }
+.slot.up.spell { border-color:#2f5a4a; } .slot.up.trap { border-color:#5a4a2f; }
 .slot.back { border-style:solid; border-color:#2f3a52; background:linear-gradient(150deg,#1b2233,#141a27); }
 .slot.back .backface { color:#4a5670; } .slot.back svg.i { width:22px; height:22px; }
 .slot.noart::after { content:"无图"; font-size:10px; color:var(--faint); }
+/* 格位名（空位也写出来，让人看清这一格是干什么的）+ 卡名 + 攻守角标 */
+.slot .zl { position:absolute; left:0; right:0; bottom:0; text-align:center; font-size:9px;
+  color:var(--faint); background:rgba(8,11,17,.72); padding:1px 0; letter-spacing:.2px; }
+.slot.empty .zl { position:static; background:none; }
+.slot .nm2 { position:absolute; left:0; right:0; top:0; font-size:9.5px; line-height:1.25;
+  color:#eaf0ff; background:rgba(8,11,17,.82); padding:1px 2px; max-height:26px; overflow:hidden; }
+.slot .badge2 { position:absolute; right:2px; bottom:12px; font-size:9.5px; padding:0 3px; border-radius:4px;
+  background:rgba(8,11,17,.85); border:1px solid #33405f; font-variant-numeric:tabular-nums; }
+.slot .badge2.atk { color:#ffd9a6; } .slot .badge2.def { color:#9fc8ff; }
+.pile { border:1px solid var(--line-soft); border-radius:8px; background:#0d131f;
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2px; }
+.pile .k { font-size:10px; color:var(--faint); }
+.pile b { font-size:17px; font-variant-numeric:tabular-nums; }
+/* 台账：召唤/特召/发动/盖放/攻击/伤害… */
+.ledger { display:flex; flex-wrap:wrap; gap:4px; margin-top:6px; padding-top:6px; border-top:1px solid var(--line-soft); }
+.ledger .cell { display:inline-flex; align-items:center; gap:4px; font-size:11px; font-variant-numeric:tabular-nums;
+  border:1px solid var(--line-soft); border-radius:999px; padding:1px 8px; color:#dbe3f5; }
+.ledger .cell .k { color:var(--faint); }
 .side-ft { display:flex; gap:6px; flex-wrap:wrap; }
 
 /* ---- 训练台：对话流 + 吸底输入区（"游戏王专用的小 dsh"）---- */
@@ -1903,32 +2093,62 @@ async function loadDuel(){
         群里有人说想打牌（或 <span class="mono">/开房</span>）之后，这里会实时显示牌桌。</div></div>`;
     return;
   }
-  $("duel-body").innerHTML = rooms.map(roomBoard).join("");
+  const notes = (d.unknown || []).map(item => `<li>${esc(item)}</li>`).join("");
+  $("duel-body").innerHTML = rooms.map(roomBoard).join("")
+    + (notes ? `<div class="faint" style="font-size:11.5px;line-height:1.8">
+        <b>内核不给、这里也没有的：</b><ul style="margin:4px 0 0;padding-left:20px">${notes}</ul></div>` : "");
 }
-function zoneSlot(card, isMonster){
-  if (!card) return `<div class="slot empty"></div>`;
+function cardSlot(card, label){
+  /* 一格：表侧给卡图 + 卡名 + 攻守角标；里侧只画卡背（不公开卡号）。
+     label 是格位名（主怪兽区3 / 额外怪兽区 / 场地区 / 灵摆区左…），空位也标出来，
+     这样"这一格是干什么的"一眼就能看见，不会以为是排版歪了。 */
+  if (!card) return `<div class="slot empty"><span class="zl">${esc(label)}</span></div>`;
   if (!card.face_up) {
-    // 里侧：不公开卡号，画卡背（与 /查房 出图同一口径）
-    return `<div class="slot back" title="里侧表示"><div class="backface">${ICON.back}</div></div>`;
+    return `<div class="slot back" title="${esc(label)}：里侧表示（不公开）">
+      <div class="backface">${ICON.back}</div><span class="zl">${esc(label)}</span></div>`;
   }
-  return `<div class="slot up" title="卡号 ${esc(card.id)}">
-    <img loading="lazy" src="/api/art/${esc(card.art)}" alt=""
-      onerror="this.parentNode.classList.add('noart');this.remove()"></div>`;
+  const stats = (card.atk != null) ? `<span class="badge2 ${card.attack ? "atk" : "def"}">${card.attack ? "攻" : "守"} ${esc(card.atk)}${card.def_ != null ? "/" + esc(card.def_) : ""}</span>` : "";
+  return `<div class="slot up ${esc(card.kind || "")}" title="${esc(card.name || ("卡号 " + card.id))}（${esc(label)}）｜卡号 ${esc(card.id)}">
+    <img loading="lazy" src="/api/art/${esc(card.id)}" alt=""
+      onerror="this.parentNode.classList.add('noart');this.remove()">
+    <span class="nm2">${esc(card.name || ("#" + card.id))}</span>${stats}<span class="zl">${esc(label)}</span></div>`;
 }
 function sideBoard(side){
-  return `<div class="side-board ${side.is_self ? "ours" : "theirs"}">
+  /* 一侧的**完整**牌桌：额外怪兽区 2 + 主怪兽区 5 / 魔陷区 5 / 场地区 / 灵摆区 2 + 三堆计数。
+     位置与内核的位号一一对应（与 /查房 出图同一套）。 */
+  const piles = side.piles || {};
+  return `<div class="side-board ${side.is_self ? "ours" : "theirs"} ${side.is_turn ? "turn" : ""}">
     <div class="side-hd">
       <span class="who">${side.is_self ? "我方" : "对手"}${side.name ? " · " + esc(side.name) : ""}</span>
+      ${side.deck ? `<span class="chip dim">${esc(side.deck)}</span>` : ""}
+      ${side.is_turn ? '<span class="chip ok">该它动</span>' : ""}
+      <span style="flex:1"></span>
       <span class="lp"><svg class="i" viewBox="0 0 24 24"><path d="M12 20s-7-4.4-7-9.3A4 4 0 0 1 12 8a4 4 0 0 1 7 2.7C19 15.6 12 20 12 20z"/></svg>${esc(side.lp)}</span>
     </div>
-    <div class="rowzones">${(side.monsters || []).map(c => zoneSlot(c, true)).join("")}</div>
-    <div class="rowzones">${(side.spells || []).map(c => zoneSlot(c, false)).join("")}</div>
-    <div class="side-ft">
-      <span class="chip dim">墓地 ${esc(side.graveyard ?? 0)}</span>
-      <span class="chip dim">除外 ${esc(side.banished ?? 0)}</span>
-      <span class="chip dim">额外 ${esc(side.extra ?? 0)}</span>
+    <div class="boardrow ex">${(side.extra_monsters || []).map((c, i) => cardSlot(c, "额外怪兽区" + (i + 1))).join("")}</div>
+    <div class="boardrow">${(side.monsters || []).map((c, i) => cardSlot(c, "怪兽区" + (i + 1))).join("")}</div>
+    <div class="boardrow">${(side.spells || []).map((c, i) => cardSlot(c, "魔陷区" + (i + 1))).join("")}</div>
+    <div class="boardrow low">
+      ${cardSlot(side.field_zone, "场地魔法")}
+      ${(side.pendulums || []).map((c, i) => cardSlot(c, i === 0 ? "灵摆区左" : "灵摆区右")).join("")}
+      <div class="pile"><span class="k">墓地</span><b>${esc(piles.grave ?? 0)}</b></div>
+      <div class="pile"><span class="k">除外</span><b>${esc(piles.banished ?? 0)}</b></div>
+      <div class="pile"><span class="k">额外</span><b>${esc(piles.extra ?? 0)}</b></div>
     </div>
+    ${ledgerRow(side.stats)}
   </div>`;
+}
+function ledgerRow(stats){
+  /* 这一局的台账（记录器数出来的）：召唤/特召/发动/盖放/攻击/伤害…，没有就不显示 */
+  if (!stats || !Object.keys(stats).length) return "";
+  const items = [
+    ["召唤", stats.normal_summons], ["特召", stats.sp_summons], ["发动", stats.effects],
+    ["盖放", stats.sets], ["抽牌", stats.draws], ["攻击", stats.attacks],
+    ["直击", stats.direct_attacks], ["打伤", stats.damage_dealt], ["挨打", stats.damage_taken],
+    ["最大一击", stats.biggest_hit_taken], ["回复", stats.lp_recovered],
+    ["送墓", stats.sent_to_grave], ["除外", stats.banished],
+  ];
+  return `<div class="ledger">${items.map(([k, v]) => `<span class="cell"><span class="k">${esc(k)}</span>${esc(v ?? 0)}</span>`).join("")}</div>`;
 }
 function roomBoard(room){
   const state = room.started ? (room.finished ? '<span class="chip warn">已结束</span>' : '<span class="chip ok">对局中</span>')
@@ -1946,9 +2166,10 @@ function roomBoard(room){
     </div>
     <div class="bd">
       ${room.error ? `<div class="banner warn">${ICON.warn}${esc(room.error)}</div>` : ""}
-      ${theirs ? sideBoard(theirs) : ""}
-      <div class="board-mid">VS</div>
-      ${ours ? sideBoard(ours) : ""}
+      <div class="boards">
+        ${theirs ? sideBoard(theirs) : ""}
+        ${ours ? sideBoard(ours) : ""}
+      </div>
     </div></div>`;
 }
 

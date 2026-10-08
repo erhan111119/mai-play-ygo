@@ -148,28 +148,48 @@ def test_deck_operations_go_through_the_plugin_and_need_confirmation() -> None:
 
 
 def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> None:
-    """对局监控接口：双方路区/魔陷区按 1~5 号位铺开，里侧的卡只报"有卡"不报卡号。"""
+    """对局监控接口：**整张牌桌**都要给（额外怪兽区 / 场地 / 灵摆 / 三堆计数），里侧不泄卡号。
+
+    这条同时是那个 `TypeError` 的回归测试：记录器里存的是 `ZoneCard` 对象（带 `position`），
+    不是卡号——第一版把它当卡号 `int(card)`，真机对局中整页报
+    `int() argument must be a string ... not 'ZoneCard'`。所以这里**用真的 `ZoneCard` 造数据**。
+    """
 
     webui = _load("webui")
     fieldstate = _load("duel.fieldstate")
+    zone_card = fieldstate.ZoneCard
     import http.client
 
     class Player:
         def __init__(self, lp: int, grave: int) -> None:
             self.lp = lp
             self.grave = grave
-            self.banished = 0
+            self.banished = 1
             self.extra = 2
 
-    # 卡号用正数表示表侧、负数表示里侧（`_zone_card` 就是这么判的：
-    # 记录器把里侧的卡存成负卡号，避免面板/出图泄露对手的盖牌）
+    # 位号与内核一致：怪兽区 5/6 是额外怪兽区、魔陷区第 5 号位是场地魔法、灵摆区单列
     state = types.SimpleNamespace(
         zones={
-            (0, fieldstate.MONSTER_ZONE, 1): 100,
-            (1, fieldstate.MONSTER_ZONE, 3): -200,
-            (0, fieldstate.SPELL_ZONES[0], 2): 300,
+            (0, fieldstate.MONSTER_ZONE, 0): zone_card(100, 0x1),      # 表侧攻击
+            (0, fieldstate.MONSTER_ZONE, 5): zone_card(400, 0x1),      # 额外怪兽区
+            (1, fieldstate.MONSTER_ZONE, 2): zone_card(200, 0x8),      # 对手：里侧守备
+            (0, fieldstate.SPELL_ZONES[0], 1): zone_card(300, 0x2),    # 盖放的魔陷
+            (0, fieldstate.SPELL_ZONES[0], 5): zone_card(500, 0x4),     # 场地魔法（表侧守备位＝表侧）
+            (0, fieldstate.SPELL_ZONES[1], 0): zone_card(600, 0x4),     # 灵摆区左
         },
         players={0: Player(6800, 4), 1: Player(7200, 1)},
+        zones_of=lambda seat: {
+            (location, sequence): card
+            for (controller, location, sequence), card in {
+                (0, fieldstate.MONSTER_ZONE, 0): zone_card(100, 0x1),
+                (0, fieldstate.MONSTER_ZONE, 5): zone_card(400, 0x1),
+                (1, fieldstate.MONSTER_ZONE, 2): zone_card(200, 0x8),
+                (0, fieldstate.SPELL_ZONES[0], 1): zone_card(300, 0x2),
+                (0, fieldstate.SPELL_ZONES[0], 5): zone_card(500, 0x4),
+                (0, fieldstate.SPELL_ZONES[1], 0): zone_card(600, 0x4),
+            }.items()
+            if controller == seat
+        },
     )
 
     class Recorder:
@@ -177,7 +197,10 @@ def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> 
         turn_count = 3
         phase = "主要阶段1"
         field_state = state
-        players = {0: types.SimpleNamespace(name="憨憨"), 1: types.SimpleNamespace(name="群友")}
+        players = {
+            0: types.SimpleNamespace(name="憨憨", normal_summons=2, sp_summons=3, effects=4, attacks=1),
+            1: types.SimpleNamespace(name="群友", normal_summons=1),
+        }
 
     class Session:
         started = True
@@ -203,16 +226,30 @@ def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> 
             assert payload["ok"] is True, payload
             room = payload["rooms"][0]
             assert room["turn"] == 3 and room["phase"] == "主要阶段1", room
+            assert not room["error"], room["error"]
             ours = [side for side in room["sides"] if side["is_self"]][0]
             theirs = [side for side in room["sides"] if not side["is_self"]][0]
             assert ours["lp"] == 6800 and theirs["lp"] == 7200, room["sides"]
-            assert len(ours["monsters"]) == 5 and len(ours["spells"]) == 5
-            assert ours["monsters"][0] == {"id": 100, "face_up": True, "art": 100}, ours["monsters"][0]
+            assert ours["name"] == "憨憨" and theirs["name"] == "群友", room["sides"]
+            assert ours["deck"] == "升辉月", ours["deck"]
+
+            # 完整牌桌：5 主怪兽 + 2 额外怪兽 + 5 魔陷 + 场地 + 2 灵摆 + 三堆
+            assert len(ours["monsters"]) == 5 and len(ours["spells"]) == 5, ours
+            assert len(ours["extra_monsters"]) == 2 and len(ours["pendulums"]) == 2, ours
+            assert ours["piles"] == {"grave": 4, "banished": 1, "extra": 2}, ours["piles"]
+            # 表侧怪：报卡号 + 表示形式
+            assert ours["monsters"][0]["id"] == 100 and ours["monsters"][0]["attack"] is True, ours["monsters"][0]
             assert ours["monsters"][1] is None, "空格要显式给 null，前端才画得出空场"
-            # 里侧：只报"有卡"，卡号取绝对值会泄露对手盖的是什么——所以只给 face_up=False
+            # 额外怪兽区 / 场地 / 灵摆各自归位（不能都塞进主怪兽区与魔陷区）
+            assert ours["extra_monsters"][0]["id"] == 400, ours["extra_monsters"]
+            assert ours["field_zone"]["id"] == 500, ours["field_zone"]
+            assert ours["pendulums"][0]["id"] == 600, ours["pendulums"]
+            # 里侧：只报"有卡 + 里侧"，一个卡号都不能给（否则面板比对手本人知道得更多）
             back = theirs["monsters"][2]
             assert back is not None and back["face_up"] is False, back
-            assert ours["graveyard"] == 4 and theirs["graveyard"] == 1, room["sides"]
+            assert back.get("id") in (0, None) and not back.get("name"), back
+            # 台账（记录器数出来的东西）也要带上
+            assert ours["stats"]["normal_summons"] == 2 and ours["stats"]["sp_summons"] == 3, ours["stats"]
         finally:
             server.stop_now()
 
