@@ -288,6 +288,35 @@ def _stars_html(card: CardView) -> str:
     return f'<div class="stars{" rank" if card.rank else ""}">{marks}</div>'
 
 
+#: 名字条可用宽度（卡面 64 − 卡框左右各 3 − 名字条左右各 4）
+_NAME_BOX_WIDTH = CARD_WIDTH - 6 - 8
+#: 名字字号：基准 / 单行允许的最小值 / 多行允许的最小值
+_NAME_FONT_BASE = 9.5
+_NAME_FONT_MIN_SINGLE = 7.0
+_NAME_FONT_MIN_ANY = 6.0
+
+
+def _name_box(name: str) -> Tuple[float, int, int]:
+    """卡名要多大字号、几行才能**完整**显示 → `(字号, 行数, 名字条高度)`。
+
+    **为什么要算**（2026-10-09 用户口径："卡名有的是两行有的是一行，有的还没显示完全"）：
+    原来名字条固定一行 + `overflow:hidden`，长名字直接被截掉；而"缺卡图"那版又允许换成两行，
+    于是同一张图上出现三种样子。这里按**中文全角 1 个字宽、西文按 0.55** 估宽，
+    先试一行、不行退两行、再不行三行，取"行数最少且字号最大"的那个组合——名字始终完整。
+    """
+
+    units = 0.0
+    for char in str(name):
+        units += 1.0 if ord(char) > 0x2E80 else 0.55
+    units = max(units, 1.0)
+    for lines, minimum in ((1, _NAME_FONT_MIN_SINGLE), (2, _NAME_FONT_MIN_ANY), (3, _NAME_FONT_MIN_ANY)):
+        size = min(_NAME_FONT_BASE, _NAME_BOX_WIDTH * lines / units)
+        if size >= minimum or lines == 3:
+            size = max(size, _NAME_FONT_MIN_ANY)
+            return round(size, 1), lines, int(round(size * 1.28)) * lines
+    return _NAME_FONT_MIN_ANY, 3, int(round(_NAME_FONT_MIN_ANY * 1.28)) * 3
+
+
 def card_full_uri(card_id: int, *, pic_dir: Optional[Path] = None) -> str:
     """**整卡卡图**的 data URI（本机缓存里那张 `<卡号>.jpg`）；没有就返回空串。
 
@@ -344,8 +373,12 @@ def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "")
             f'<img class="cardimg" src="{card.full}" alt=""></div>{numbers}</div>'
         )
     frame, line = _frame_of(card)
+    # 名字条按长度自适应（字号/行数都在这里定死，保证名字完整显示；顺带把立绘框高度让出来）
+    name_size, name_lines, name_height = _name_box(card.name or str(card.card_id))
+    name_style = f'font-size:{name_size}px;line-height:{round(name_size * 1.28, 1)}px;max-height:{name_height}px'
+    art_height = max(18, 38 - (name_lines - 1) * 10)
     # ⚠ 卡面用真 `<img>` 而不是 CSS 背景图：宿主渲染时等的是页面的 load 事件，
-    # 背景图**不保证**在截屏前已经解码画好（实测发到群里的棋盘常有空卡面），
+    # 背景图**不保证**在截屏前已经画好（实测发到群里的棋盘常有空卡面），
     # `<img>` 的加载与解码是 load 的一部分，配 contract 里那个 wait_until="networkidle" 才稳。
     art = f'<img class="art" src="{card.art}" alt="">' if card.art else ""
     type_line = f'<div class="tline">{_escape(card.type_line)}</div>' if card.type_line else ""
@@ -364,9 +397,9 @@ def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "")
     return (
         f'<div class="{plate}"><div class="card face{" noart" if not card.art else ""}" '
         f'style="--frame:{frame};--line:{line}">'
-        f'<div class="cname">{_escape(card.name or card.card_id)}</div>'
+        f'<div class="cname" style="{name_style}">{_escape(card.name or card.card_id)}</div>'
         f"{_stars_html(card)}"
-        f'<div class="artbox">{art}</div>'
+        f'<div class="artbox" style="height:{art_height}px">{art}</div>'
         f"{type_line}{effect}{stats}{position}</div>{numbers}</div>"
     )
 
@@ -544,9 +577,9 @@ _CSS = """
     background: linear-gradient(180deg, var(--frame, #7a4a18), #1b1206 92%);
     border: 1px solid var(--line, rgba(255,220,160,.6));
     box-shadow: 0 4px 10px rgba(0,0,0,.55); }}
-  .card .cname {{ height: 13px; line-height: 13px; font-size: 9.5px; text-align: left;
-    padding: 0 4px; color: #241505; font-weight: 700; white-space: nowrap; overflow: hidden;
-    border-radius: 2px; background: linear-gradient(180deg, #f6e6c2, #d9c294); }}
+  .card .cname {{ height: auto; overflow: hidden; color: #241505; font-weight: 700;
+    padding: 0 4px; border-radius: 2px; word-break: break-word; text-align: center;
+    background: linear-gradient(180deg, #f6e6c2, #d9c294); }}
   .card .stars {{ height: 11px; line-height: 11px; font-size: 8.5px; color: #ffd76a;
     text-align: right; text-shadow: 0 0 3px rgba(0,0,0,.9); padding-right: 3px; }}
   .card .stars.rank {{ color: #17171a; text-shadow: 0 0 1px #ffd76a, 0 0 4px #ffd76a; }}
@@ -572,10 +605,8 @@ _CSS = """
     background:
       repeating-linear-gradient(45deg, rgba(255,255,255,.07) 0 5px, rgba(0,0,0,0) 5px 10px),
       linear-gradient(180deg, var(--frame, #7a4a18), #140e05 92%); }}
-  .card.noart .cname {{ width: 100%; height: auto; font-size: 10px; line-height: 13px;
-    background: none; color: #ffeccd; text-align: center; padding: 3px 2px;
-    white-space: normal; }}
-  .card.noart .artbox {{ height: 34px; width: 100%; display: flex; align-items: center;
+  .card.noart .cname {{ width: 100%; background: none; color: #ffeccd; padding: 2px 3px; }}
+  .card.noart .artbox {{ width: 100%; display: flex; align-items: center;
     justify-content: center; border-color: rgba(255,220,160,.35); }}
   .card.noart .artbox::after {{ content: "无卡图"; font-size: 7px; color: rgba(255,235,200,.55); }}
   .card.noart .tline {{ width: 100%; text-align: center; }}

@@ -215,6 +215,36 @@ def test_full_card_image_wins_over_drawn_frame() -> None:
         assert 'class="cname"' not in html, "有整卡图就不该再叠自绘的名字条"
 
 
+def test_long_card_name_shrinks_instead_of_being_cut() -> None:
+    """卡名**必须完整显示**：长名字自动缩小字号/换行，不能像以前那样一行截断。
+
+    用户口径（2026-10-09）："卡名有的是两行有的是一行，而且有的还是没显示完全"——
+    原来名字条固定一行 + overflow:hidden，长名字直接被切掉。
+    """
+
+    from duel.field_image import _NAME_FONT_BASE, _name_box
+
+    short_size, short_lines, short_h = _name_box("无限泡影")
+    long_size, long_lines, long_h = _name_box("超魔导龙骑士-真红眼龙骑士")
+    longer_size, longer_lines, _ = _name_box("真红眼暗钢龙-真红眼黑龙剑士·究极形态")
+    assert short_lines == 1 and abs(short_size - _NAME_FONT_BASE) < 0.01, (short_size, short_lines)
+    assert long_lines >= 2 and long_size < short_size, (long_size, long_lines)
+    assert long_h >= long_lines * long_size, (long_h, long_size, long_lines)
+    assert longer_lines >= long_lines and longer_size <= long_size, (longer_size, longer_lines)
+    # 端到端：长名字原样出现在 HTML 里，并带上算出来的字号
+    html = build_html(
+        FieldView(
+            title="t",
+            turn=1,
+            bottom=SideView(
+                label="我方", lp=8000, monsters=[CardView(1, "超魔导龙骑士-真红眼龙骑士", art="")]
+            ),
+        )
+    )
+    assert "超魔导龙骑士-真红眼龙骑士" in html
+    assert f"font-size:{long_size}px" in html, long_size
+
+
 def test_html_contains_lp_turn_and_phase() -> None:
     """整张图上要有双方 LP、回合与阶段（查房图自带这些信息，群里不用再看文字）。"""
 
@@ -244,6 +274,7 @@ def _run_all() -> int:
         test_card_face_shows_chinese_name_type_and_effect,
         test_stack_counts_are_rendered,
         test_full_card_image_wins_over_drawn_frame,
+        test_long_card_name_shrinks_instead_of_being_cut,
         test_html_contains_lp_turn_and_phase,
     ]
     failed = 0
