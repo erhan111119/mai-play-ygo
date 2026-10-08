@@ -334,16 +334,16 @@ def card_full_uri(card_id: int, *, pic_dir: Optional[Path] = None) -> str:
     return ""
 
 
-def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "") -> str:
-    """一格：空位 / 卡背 / **完整卡图**（上面叠星级、下面写攻守）→ 没有图时画名字框。
+def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "", flipped: bool = False) -> str:
+    """一格：空位 / 卡背 / **完整卡图**（下面写攻守）→ 没有图时画名字框。
 
     `flat=True` 用在魔陷行/场地区：那些格位不显示下面那行大号攻守，所以矮一截，整张图才排得下。
     `owner`（`opp` / `me`）只给**中央额外怪兽区**用——那两格在上下半场中间，要标清是谁的。
+    `flipped=True` 用在**对手半场**：整张卡转 180°（和我们这半场朝向相反，像真实桌面那样，
+    一眼就看得出是谁的卡；用户口径 2026-10-09："对面的卡应该朝向和我方的卡朝向相反"）。
 
-    用户口径（2026-10-09）：**"卡图就直接用完整卡图，不用你做的立绘加卡框了，上面加上星级，
-    下面直接写攻击力守备力就行，另外注意一下朝向问题就可以了，不用写效果这类"**。
-    所以卡面一律用整卡图（`CardView.full`），我们自己只叠**星级**与**攻守**两个角标；
-    卡图自带的卡名/效果文字不再重画，守备表示整张卡转 90°。
+    用户口径（2026-10-09）："卡图就直接用完整卡图，不用你做的立绘加卡框了，下面直接写攻击力守备力
+    就行，另外注意一下朝向问题就可以了，不用写效果这类"、"去掉星级"。
     """
 
     plate = "plate flat" if flat else "plate"
@@ -359,8 +359,8 @@ def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "")
         if card.kind == "monster" and card.field_text
         else ""
     )
-    # 守备表示：整张卡转 90°（和 MD 局内一样；星级/攻守角标在卡内，跟着一起转）
-    posture = "" if card.attack else " def"
+    # 朝向：对手整张卡转 180°，守备表示再各自转 90°（合起来就是 180+90 / 90）
+    posture = (" flip" if flipped else "") + ("" if card.attack else " def")
     if card.full:
         return (
             f'<div class="{plate}"><div class="card fullcard{posture}">'
@@ -434,11 +434,15 @@ def _arena_html(view: FieldView) -> str:
 
     def side_row(side: Optional[SideView], *, spells: bool, mirrored: bool) -> str:
         cards = empty_row if side is None else (side.spells if spells else side.monsters)
-        cells = "".join(_card_html(card, flat=spells) for card in (reversed(cards) if mirrored else cards))
+        # 对手那半场（mirrored）的卡整张转 180°：朝向与我们相反，一眼分得清归属
+        cells = "".join(
+            _card_html(card, flat=spells, flipped=mirrored)
+            for card in (reversed(cards) if mirrored else cards)
+        )
         # 场地区贴在魔陷行的**右端**（双方都一样，和客户端里那格的位置一致）
         zone_html = (
             '<div class="zone-tag">'
-            + _card_html(side.field_zone, flat=True)
+            + _card_html(side.field_zone, flat=True, flipped=mirrored)
             + '<div class="zlabel">场地</div></div>'
             if side is not None and spells
             else ""
@@ -453,9 +457,10 @@ def _arena_html(view: FieldView) -> str:
         + side_row(top, spells=True, mirrored=True)
         + side_row(top, spells=False, mirrored=True)
         + "</div>"
-        # 中间那一行＝双方的额外怪兽区（规则上双方共用，MD 局内也是并排摆在中缝上）
+        # 中间那一行＝双方的额外怪兽区（规则上双方共用，MD 局内也是并排摆在中缝上）；
+        # 对手那一格也按他们的朝向转 180°
         + '<div class="row emz">'
-        + _card_html(top.extra if top else None, owner="opp")
+        + _card_html(top.extra if top else None, owner="opp", flipped=True)
         + _card_html(bottom.extra if bottom else None, owner="me")
         + "</div>"
         + '<div class="half me">'
@@ -556,10 +561,13 @@ _CSS = """
   .card .artbox {{ height: 38px; margin: 0 1px; overflow: hidden; border: 1px solid rgba(0,0,0,.6);
     background: linear-gradient(160deg, #2b2417, #0c0a06); }}
   .card .art {{ width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }}
-  /* 完整卡图：直接铺满卡位（就是真卡面）；守备表示整张卡转 90° */
+  /* 完整卡图：直接铺满卡位（就是真卡面）；朝向按半场来 */
   .card.fullcard {{ padding: 0; background: #0b0e18; }}
   .card.fullcard .cardimg {{ width: 100%; height: 100%; object-fit: fill; display: block; }}
+  /* 朝向：**对手半场整张卡转 180°**（和我们朝向相反），守备表示再各自转 90° */
+  .card.flip {{ transform: rotate(180deg); }}
   .card.def {{ transform: rotate(90deg) scale(.94); }}
+  .card.flip.def {{ transform: rotate(270deg) scale(.94); }}
   /* 兜底（暂时没整卡图）：只画 名字 + 攻守，不画立绘/效果/星级（用户口径 2026-10-09："去掉星级"） */
   .card.bare {{ display: flex; flex-direction: column; align-items: stretch; justify-content: center;
     gap: 2px; background:

@@ -242,6 +242,28 @@ def test_full_card_image_wins_over_drawn_frame() -> None:
         assert 'class="cname"' not in html, "有整卡图就不该再叠自绘的名字条"
 
 
+def test_opponent_cards_face_the_other_way() -> None:
+    """**对手半场的卡朝向要和我们相反**（整张转 180°），一眼分得清归属。
+
+    用户口径（2026-10-09）："对面的卡应该朝向应该和我方的卡朝向相反"——像真实桌面那样，
+    双方的卡各自朝向自己那一侧（我们这半场正着、对手那半场倒着）。
+    """
+
+    card = CardView(1, "闪刀姬=零露", full="data:image/jpeg;base64,AAAA", atk=2000, level=2, link=True)
+    html = build_html(
+        FieldView(
+            title="t",
+            turn=1,
+            top=SideView(label="对手", lp=3000, monsters=[card], extra=card),
+            bottom=SideView(label="我方", lp=8000, monsters=[card]),
+        )
+    )
+    assert 'class="card fullcard flip"' in html, "对手半场的卡要转 180°"
+    assert 'class="card fullcard"' in html, "我们半场的卡保持正着"
+    # 对手的额外怪兽区（在中缝那行）也要按他们的朝向
+    assert html.count("flip") >= 2, "对手的怪兽行与额外怪兽区都要翻"
+
+
 def test_long_card_name_shrinks_instead_of_being_cut() -> None:
     """卡名**必须完整显示**：长名字自动缩小字号/换行，不能像以前那样一行截断。
 
@@ -312,6 +334,7 @@ def _run_all() -> int:
         test_zones_are_mapped_to_slots,
         test_fallback_keeps_link_rating_readable,
         test_full_image_card_gets_stats_overlay_and_defence_rotation,
+        test_opponent_cards_face_the_other_way,
         test_stack_counts_are_rendered,
         test_full_card_image_wins_over_drawn_frame,
         test_long_card_name_shrinks_instead_of_being_cut,
