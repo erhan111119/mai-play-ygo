@@ -296,6 +296,43 @@ def _head_card_of(ydk_path: Path, has_art: Optional[Callable[[int], bool]] = Non
     return head
 
 
+def _find_deck_row(db_path: Path, deck_id: int) -> Optional[Dict[str, Any]]:
+    """按编号找一条卡组记录（只读打开卡组池，找不到返回 None）。"""
+
+    for row in _read_deck_rows(db_path):
+        if str(row.get("deck_id") or "") == str(int(deck_id)):
+            return row
+    return None
+
+
+def _clock(stamp: float) -> str:
+    """时间戳 → `YYYY-mm-dd HH:MM:SS`（给面板显示用）。"""
+
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp)) if stamp else ""
+
+
+def _combo_label(path: Path) -> str:
+    """推演存档的显示名：把 `20261008-193012-95-杀调.txt` 显示成 `10-08 19:30　杀调`。"""
+
+    match = re.match(r"^(\d{8})-(\d{6})-(.+)$", path.stem)
+    if not match:
+        return path.stem
+    date, clock, rest = match.groups()
+    rest = re.sub(r"^-?\d+-", "", rest)          # 去掉中间那个卡组编号
+    stamp = f"{date[4:6]}-{date[6:8]} {clock[0:2]}:{clock[2:4]}"
+    return f"{stamp}　{rest}" if rest else stamp
+
+
+def _read_head(path: Path, lines: int) -> str:
+    """读文件前若干行（读不到就空串）。"""
+
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(text.splitlines()[: max(1, int(lines))])
+
+
 def _tail_log_lines(host_root: Path, lines: int, keyword: str) -> List[str]:
     """取宿主最新日志的尾部若干行，可按关键词过滤（空关键词 = 不过滤）。"""
 
@@ -466,6 +503,12 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/api/art/"):
                 self._send_art(path[len("/api/art/"):])
+                return
+            # ⚠ 顺序要紧：`/workspace` 比"卡组详情"更具体，必须排在它前面——否则会被
+            # 详情那条路由吃掉（`deck_id` 变成 "97/workspace"，报"找不到卡组"）。
+            if path.startswith("/api/deck/") and path.endswith("/workspace"):
+                deck_id = path[len("/api/deck/"):-len("/workspace")].rstrip("/")
+                self._send_json(self._api_deck_workspace(deck_id))
                 return
             if path.startswith("/api/deck/"):
                 deck_id = path[len("/api/deck/"):]
@@ -769,6 +812,75 @@ class _PanelHandler(BaseHTTPRequestHandler):
             "ok": True,
             "rooms": rooms,
             "note": "只列本插件开的房间；里侧的卡不公开卡号（与出图同一口径）",
+        }
+
+    def _api_deck_workspace(self, raw_deck_id: str) -> Dict[str, Any]:
+        """这副牌已有的家底：当前出牌脚本、combo 推演存档、最近一次训练结论。
+
+        为什么要这个：训练台是"针对某副牌干活"的地方，动手之前该先看见它已经有什么——
+        DSH 那个游戏王插件就是这路子（把复盘结论按"卡组指纹"绑成可复用的 skill，能 list/get/activate）。
+        这里做到够用为止：**脚本与推演按卡组编号绑**（脚本名记在卡组池的 `generated_script` 上，
+        推演存档按 `*-<编号>-*.txt` 落在 `train/combos/`），再顺手把最近一次针对这副牌的
+        训练结论捞出来。
+        """
+
+        if not raw_deck_id.isdigit():
+            return {"ok": False, "error": "卡组编号必须是数字"}
+        deck_id = int(raw_deck_id)
+        panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
+        row = _find_deck_row(panel.deck_db_path, deck_id)
+        if row is None:
+            return {"ok": False, "error": f"卡组池里没有编号 {deck_id} 的卡组"}
+
+        combo_dir = panel.training_workspace() / "combos"
+        archives: List[Dict[str, Any]] = []
+        if combo_dir.is_dir():
+            for path in sorted(combo_dir.glob(f"*-{deck_id}-*.txt"), key=lambda item: item.stat().st_mtime):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                archives.append(
+                    {"name": path.name, "label": _combo_label(path), "mtime": _clock(stat.st_mtime)}
+                )
+        archives.reverse()
+
+        latest: Dict[str, Any] = {}
+        store = panel.plugin.training_store()
+        if store is not None:
+            try:
+                for run in store.list_recent(limit=40):
+                    if int(run.params.get("deck_id") or 0) != deck_id:
+                        continue
+                    latest = {
+                        "run_id": run.run_id,
+                        "kind_title": run.kind_title,
+                        "title": run.title,
+                        "status": run.status,
+                        "started_at": _clock(run.started_at),
+                        "conclusion": str(run.summary.get("conclusion") or "")[:600],
+                    }
+                    break
+            except Exception:  # noqa: BLE001  拿不到就算了，不该让训练台整页报错
+                latest = {}
+
+        return {
+            "ok": True,
+            "deck": {
+                "deck_id": deck_id,
+                "name": str(row["display_name"] or ""),
+                "group_id": str(row["group_id"] or ""),
+                "script": str(row["generated_script"] or ""),
+                "picked_style": str(row["picked_style"] or ""),
+                "windbot_deck": str(row["windbot_deck"] or ""),
+                "in_random": bool(row["in_random"]),
+                "head_card": panel.pick_head_card(Path(str(row["ydk_path"])))
+                if Path(str(row["ydk_path"])).is_file()
+                else 0,
+            },
+            "combos": archives,
+            "combo_preview": _read_head(combo_dir / archives[0]["name"], 24) if archives else "",
+            "latest": latest,
         }
 
     def _api_decks(self) -> Dict[str, Any]:
@@ -1466,7 +1578,47 @@ pre.log .lv-debug { color:#6f7d95; } pre.log .lv-info { color:#9fe8c8; }
 .slot.noart::after { content:"无图"; font-size:10px; color:var(--faint); }
 .side-ft { display:flex; gap:6px; flex-wrap:wrap; }
 
-/* ---- 配置 ---- */
+/* ---- 训练台：对话流 + 吸底输入区（"游戏王专用的小 dsh"）---- */
+.console { display:flex; flex-direction:column; gap:12px; }
+.stream { display:flex; flex-direction:column; gap:14px; padding:16px 18px; overflow:auto;
+  max-height:calc(100vh - 330px); min-height:220px; border-radius:var(--r-lg);
+  border:1px solid var(--line); background:linear-gradient(180deg, var(--panel), var(--panel-2)); }
+.msg { display:flex; flex-direction:column; gap:8px; }
+.bubble { border-radius:14px; padding:10px 13px; font-size:13px; max-width:min(860px, 92%);
+  border:1px solid var(--line); }
+.bubble.me { align-self:flex-end; background:rgba(124,108,246,.14); border-color:rgba(124,108,246,.32); }
+.bubble.me .txt { margin-top:6px; }
+.bubble.bot { align-self:flex-start; background:#111826; }
+.bubble.bot.failed { border-color:rgba(255,107,129,.4); }
+.bubble.bot.done { border-color:rgba(61,220,151,.32); }
+.bubble.bot.running { border-color:rgba(124,108,246,.45); background:rgba(124,108,246,.07); }
+.bubble .rh { display:flex; align-items:center; gap:9px; }
+.bubble .rh svg.i { width:15px; height:15px; color:var(--muted); }
+.bubble .txt { margin-top:6px; white-space:pre-wrap; line-height:1.6; }
+.bubble .at { font-size:11px; color:var(--faint); margin-top:5px; }
+.bubble pre.log { margin-top:8px; max-height:220px; }
+.deckworks { border:1px solid var(--line-soft); border-radius:var(--r-md); background:#111826; }
+.worksrow { display:flex; align-items:center; gap:12px; padding:9px 12px; }
+.worksrow .art.sm { width:44px; height:44px; flex:none; border-radius:9px; overflow:hidden;
+  border:1px solid var(--line); background:#0b101a; display:grid; place-items:center; color:var(--faint); }
+.worksrow .art.sm img { width:100%; height:100%; object-fit:cover; display:block; }
+.worksrow .winfo { flex:1; min-width:0; }
+.worksrow .nm { font-size:13px; font-weight:600; }
+.worksrow .ln { display:flex; gap:6px; flex-wrap:wrap; margin-top:5px; }
+.composer { border:1px solid var(--line); border-radius:var(--r-lg); padding:12px 14px 10px;
+  background:linear-gradient(180deg, var(--panel-2), var(--panel)); box-shadow:var(--shadow); }
+.bubble details.long { margin-top:6px; }
+.bubble details.long > summary { cursor:pointer; color:var(--brand-2); font-size:12px; }
+.bubble details.long .txt { margin-top:6px; color:var(--muted); }
+.composer .crow2 { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+.composer .crow2 > .field { flex:0 0 auto; min-width:170px; }
+.composer .crow2 select { min-width:190px; }
+.composer .crow2 .btn { padding:9px 18px; }
+.composer .cinput { margin-top:10px; }
+.composer .cinput textarea { resize:vertical; }
+.composer .extra { margin-top:10px; }
+.composer .extra:empty { display:none; }
+.composer .faint { margin-top:8px; line-height:1.7; }
 
 /* ---- 登录 ---- */
 .login { min-height:100vh; display:grid; place-items:center; padding:24px; }
@@ -1548,6 +1700,7 @@ const ICON = {
   chart: '<svg class="i" viewBox="0 0 24 24"><path d="M5 19V9M12 19V5M19 19v-7"/></svg>',
   spark: '<svg class="i" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/></svg>',
   key: '<svg class="i" viewBox="0 0 24 24"><circle cx="8.5" cy="14.5" r="3.5"/><path d="M11 12 20 3M17 6l2.5 2.5"/></svg>',
+  check: '<svg class="i" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg>',
 };
 function statusLabel(status){ return ({running:"跑着", done:"成功", failed:"失败", cancelled:"已停止"})[status] || status; }
 function statusClass(status){ return ({running:"run", done:"ok", failed:"err", cancelled:"warn"})[status] || "dim"; }
@@ -1560,7 +1713,7 @@ function tab(name){
   document.querySelectorAll("section.view").forEach(s => s.classList.toggle("active", s.id === "view-" + name));
   const titles = {overview:["总览","卡组池、房间与训练状态"],decks:["卡组","群友投稿与内置卡组"],
                   duel:["对局监控","进行中的牌桌（每 2 秒刷新）"],
-                  training:["训练功能","推演 / 写脚本 / 擂台 / 体检 / 复盘"],
+                  training:["训练台","跟它说一句要做什么：推演 / 写脚本 / 擂台 / 体检 / 复盘"],
                   logs:["日志","宿主日志（可按关键词过滤）"]};
   const pair = titles[name] || ["面板",""];
   $("page-title").textContent = pair[0]; $("page-sub").textContent = pair[1];
@@ -1800,84 +1953,224 @@ function roomBoard(room){
 }
 
 /* ------------------------------ 训练 ------------------------------ */
+/* 训练台：做成一个"游戏王专用的小 dsh"——上面是对话流（每条 = 一次任务：我要求的 + 它的结果），
+   下面是吸底的输入区（选卡组 → 选要写的东西 → 补充要求 → 开始）。 */
+const KIND_HINT = {
+  combo: "读卡表与卡文，写出这副牌的先手/后手展开线。不会打牌、不改任何文件。",
+  write_script: "按卡文 + 已有推演写一份 WindBot 的 C# 出牌脚本并编译（会改动 WindBot 源码树）。",
+  iterate: "自己跑完整条链路：推演 → 写脚本 → 打擂台 → 按结果再改一轮。**会真打牌，很慢**。",
+  arena: "同一副卡表挂两份出牌脚本对打，看哪份更强（判强弱要 ≥80 局/腿）。",
+  script: "卡表 × 自写执行器的静态体检：有没有卡没登记、执行器在不在。不打牌。",
+  replay: "读最近的录像：双方卡表、差异、导出 .ykd，可让模型写复盘要点。",
+};
+const KIND_LABEL = {
+  combo: "推演 combo", write_script: "写出牌脚本", iterate: "自动迭代",
+  arena: "打擂台 A/B", script: "脚本体检", replay: "复盘录像",
+};
+let KIND_META = {};
+
 async function loadTraining(){
   const d = await api("/api/training");
-  if (!d.ok) { $("training-body").innerHTML = `<div class="banner err">${ICON.warn}${esc(d.error||"读不到训练数据")}</div>`; return; }
+  if (!d.ok) { $("training-stream").innerHTML = `<div class="banner err">${ICON.warn}${esc(d.error||"读不到训练数据")}</div>`; return; }
   const banners = [];
   if (!d.enabled) banners.push(`<div class="banner warn">${ICON.info}训练功能在配置里关着（<span class="mono">training.enabled = false</span>）：这一页只能看历史记录。</div>`);
   if (d.enabled && !d.bridge_ready) banners.push(`<div class="banner err">${ICON.warn}训练执行器没建起来——看插件日志里"训练功能"那一行找原因。</div>`);
   $("training-banners").innerHTML = banners.join("");
+  KIND_META = {};
+  (d.kinds || []).forEach(k => { KIND_META[k.kind] = k; });
 
   const active = d.active;
-  $("training-active").innerHTML = active ? `<div class="live">
-      <div class="hd"><span class="spin"></span><b>${esc(active.title)}</b>${statusChip(active.status)}
-        <span class="faint" style="font-size:12px">起了 ${esc(active.started_at)}${active.duration_seconds==null?"":"　"+esc(active.duration_seconds)+" 秒"}</span>
-        <span style="flex:1"></span>
-        <button class="btn danger sm" onclick="stopTraining()">${ICON.stop}停止</button></div>
-      <pre class="log" id="live-log">${esc((active.tail||[]).join("\\n")) || "（还没有输出）"}</pre></div>`
-    : `<div class="banner">${ICON.info}现在没有任务在跑。</div>`;
+  ensureComposer(d, active);
 
-  const deckOptions = (d.decks||[]).map(x =>
-    `<option value="${esc(x.deck_id)}">${x.is_builtin?"[内置] ":""}${esc(x.name)}（#${esc(x.deck_id)}）</option>`).join("");
-  $("training-forms").innerHTML = (d.kinds||[]).map(k => {
-    const disabled = (!k.ready || active || !d.bridge_ready) ? "disabled" : "";
-    const fields = [];
-    if (k.fields.includes("deck")) {
-      fields.push(`<label class="field"><span>卡组</span><select id="f-${k.kind}-deck">${deckOptions}</select></label>`);
-    }
-    if (k.fields.includes("duels")) {
-      fields.push(`<label class="field"><span>局数（逐局交替座位）</span>
-        <input id="f-${k.kind}-duels" type="number" value="${esc(d.max_duels_per_run)}" min="2" max="${esc(d.max_duels_per_run)}"></label>`);
-    }
-    if (k.fields.includes("style_a")) {
-      fields.push(`<label class="field"><span>脚本 A</span><input id="f-${k.kind}-style-a" placeholder="如 RaiseMoon"></label>`);
-      fields.push(`<label class="field"><span>脚本 B</span><input id="f-${k.kind}-style-b" placeholder="如 Gen88"></label>`);
-    }
-    if (k.fields.includes("style")) {
-      fields.push(`<label class="field"><span>自写执行器名</span><input id="f-${k.kind}-style" placeholder="如 KillerTune">
-        <span class="info">查的是插件 executors/ 里的源码；WindBot 自带的没有源码文件</span></label>`);
-      fields.push(`<label class="field"><span>卡组编号</span><input id="f-${k.kind}-deck-ids" placeholder="如 95,99,88"></label>`);
-      fields.push(`<label class="field"><span>群号</span><input id="f-${k.kind}-group" placeholder="按某群随机池体检"></label>`);
-    }
-    if (k.fields.includes("latest")) {
-      fields.push(`<label class="field"><span>取最近几份</span><input id="f-${k.kind}-latest" type="number" value="5" min="1" max="50"></label>`);
-      fields.push(`<label class="field"><span>对比卡组编号</span><input id="f-${k.kind}-deck" placeholder="可留空"></label>`);
-    }
-    if (k.fields.includes("extra_prompt")) {
-      fields.push(`<label class="field" style="grid-column:1/-1"><span>额外提示词（可选）</span>
-        <textarea id="f-${k.kind}-extra" rows="2" placeholder="想强调的打法、必须避免的行为，例如：先手优先做鲜花女男爵；不要去踩对面的神宣"></textarea>
-        <span class="info">写什么都会原样进提示词：combo 按它推、脚本也按它写</span></label>`);
-    }
-    if (k.fields.includes("rounds")) {
-      const isWrite = k.kind === "write_script";
-      fields.push(`<label class="field"><span>${isWrite ? "生成→编译轮数" : "迭代轮数"}</span>
-        <input id="f-${k.kind}-rounds" type="number" value="${isWrite ? 3 : 2}" min="1" max="${isWrite ? 6 : 5}"></label>`);
-    }
-    return `<div class="kind">
-      <h4>${ICON.train}${esc(k.title)}${k.needs_engine ? '<span class="chip warn">会起对局</span>' : '<span class="chip dim">只读</span>'}</h4>
-      <p class="note">${esc(k.note || "")}${k.needs_engine ? "　房间里有人在打时不能跑（会抢内核与端口）" : ""}</p>
-      <div class="fields">${fields.join("")}</div>
-      <div class="go"><button class="btn primary" ${disabled} onclick="startTraining('${k.kind}')">${ICON.play}开始</button></div>
-    </div>`;
-  }).join("");
+  const runs = (d.runs || []).slice().reverse();   // 对话流：旧的在上、新的在下
+  const stream = $("training-stream");
+  const stick = nearBottom(stream);
+  const blocks = runs.map(runExchange);
+  if (active) blocks.push(activeExchange(active));
+  stream.innerHTML = blocks.length ? blocks.join("")
+    : `<div class="empty">${ICON.train}<div>还没有任务</div>
+       <div class="faint" style="font-size:12px">选一副卡组、挑一件要做的事，然后在下面写一句要求就能开始</div></div>`;
+  if (stick) stream.scrollTop = stream.scrollHeight;
 
-  const runs = d.runs || [];
-  $("training-runs").innerHTML = runs.length ? `<div class="runlist">${runs.map(r => {
-    const summary = r.summary || {};
-    const note = summary.conclusion ? String(summary.conclusion).slice(0, 90)
-      : (r.error ? String(r.error).slice(0, 90)
-      : (summary.conclusion_error ? "结论没生成：" + String(summary.conclusion_error).slice(0, 70)
-      : (summary.exit_code === 0 ? "（没有结论）" : "")));
-    return `<div class="run" onclick="showRun('${esc(r.run_id)}')">
-      <span class="mono rid">${esc(r.run_id)}</span>
-      <div class="sp"><div class="ttl">${esc(r.title)}</div>
-        <div class="meta">${esc(r.kind_title)}　${esc(r.started_at)}${r.duration_seconds==null?"":"　"+esc(r.duration_seconds)+"s"}${note ? "　·　"+esc(note) : ""}</div></div>
-      ${statusChip(r.status)}</div>`;
-  }).join("")}</div>` : `<div class="empty">${ICON.train}<div>还没有训练记录</div></div>`;
-  $("training-run-detail").innerHTML = "";
-
-  if (active && !State.trainTimer) State.trainTimer = setInterval(() => { if (State.tab === "training") loadTraining(); }, 5000);
+  if (active && !State.trainTimer) State.trainTimer = setInterval(() => { if (State.tab === "training") loadTraining(); }, 4000);
   if (!active && State.trainTimer) { clearInterval(State.trainTimer); State.trainTimer = null; }
+}
+function nearBottom(el){ return el.scrollHeight - el.scrollTop - el.clientHeight < 80; }
+function longText(text){
+  /* 长文本折叠：训练台里经常有人贴一整段打法说明，直接铺开会把对话流刷得没法看 */
+  const body = esc(text);
+  if (String(text).length <= 320) return `<div class="txt">${body}</div>`;
+  return `<details class="long"><summary>展开我写的要求（${esc(String(text).length)} 字）</summary>
+      <div class="txt">${body}</div></details>`;
+}
+function runExchange(run){
+  const summary = run.summary || {};
+  const params = run.params || {};
+  const ask = [
+    `<span class="chip brand">${esc(KIND_LABEL[run.kind] || run.kind_title)}</span>`,
+    params.deck_name ? `<span class="chip">${esc(params.deck_name)}</span>` : "",
+    params.rounds ? `<span class="chip dim">${esc(params.rounds)} 轮</span>` : "",
+    params.duels ? `<span class="chip dim">${esc(params.duels)} 局</span>` : "",
+  ].filter(Boolean).join(" ");
+  const reply = summary.conclusion ? esc(String(summary.conclusion))
+    : summary.guide_path ? "推演已存档，点开看全文。"
+    : summary.style_name ? `出牌脚本 ${esc(summary.style_name)} 已编译通过（第 ${esc(summary.attempts || "?")} 轮）。`
+    : summary.exit_code === 0 ? "跑完了，没有结论（点开看输出尾巴）。"
+    : (run.error ? esc(String(run.error)) : "（没有输出）");
+  // 失败原因（编译器输出、日志尾巴）经常很长：对话流里折起来，详情抽屉里看全文
+  const replyHtml = reply.length > 400
+    ? `<details class="long"><summary>展开详情（${esc(reply.length)} 字）</summary><div class="txt">${reply}</div></details>`
+    : `<div class="txt">${reply}</div>`;
+  return `<div class="msg">
+      <div class="bubble me">${ask}${params.extra_prompt ? longText(params.extra_prompt) : ""}
+        <div class="at">${esc(run.started_at || "")}${run.duration_seconds==null?"":"　"+esc(run.duration_seconds)+"s"}</div></div>
+      <div class="bubble bot ${run.status}">
+        <div class="rh">${KIND_MARK(run.status)}<b>${esc(run.title)}</b>${statusChip(run.status)}
+          <span style="flex:1"></span>
+          <a href="#" onclick="showRun('${esc(run.run_id)}');return false;">详情</a></div>
+        ${replyHtml}</div>
+    </div>`;
+}
+function activeExchange(run){
+  return `<div class="msg">
+      <div class="bubble me">${esc(KIND_LABEL[run.kind] || run.kind_title)}　<span class="at">${esc(run.started_at)}</span></div>
+      <div class="bubble bot running">
+        <div class="rh"><span class="spin"></span><b>${esc(run.title)}</b>${statusChip(run.status)}
+          <span style="flex:1"></span>
+          <button class="btn danger sm" onclick="stopTraining()">${ICON.stop}停止</button></div>
+        <pre class="log" id="live-log">${esc((run.tail||[]).join("\\n")) || "（还没有输出）"}</pre></div>
+    </div>`;
+}
+function KIND_MARK(status){
+  return status === "done" ? ICON.check : status === "failed" ? ICON.warn : ICON.info;
+}
+function ensureComposer(d, active){
+  const deckSel = $("c-deck");
+  const kindSel = $("c-kind");
+  if (deckSel.options.length !== (d.decks || []).length) {
+    const keep = deckSel.value;
+    deckSel.innerHTML = (d.decks||[]).map(x =>
+      `<option value="${esc(x.deck_id)}">${x.is_builtin?"[内置] ":""}${esc(x.name)}（#${esc(x.deck_id)}）</option>`).join("");
+    if (keep) deckSel.value = keep;
+  }
+  if (!kindSel.options.length) {
+    kindSel.innerHTML = (d.kinds||[]).map(k => `<option value="${esc(k.kind)}">${esc(k.title)}</option>`).join("");
+  }
+  kindSel.disabled = !!active || !d.bridge_ready;
+  $("btn-send").disabled = !!active || !d.bridge_ready;
+  $("btn-send").textContent = active ? "有任务在跑" : "开始";
+  deckSel.onchange = loadDeckWorks;
+  onKindChange();
+  renderExtraFields(active);
+  loadDeckWorks();
+}
+function onKindChange(){
+  const kind = $("c-kind").value;
+  const meta = KIND_META[kind] || {};
+  const hint = KIND_HINT[kind] || meta.note || "";
+  const blocked = meta.ready === false;
+  $("c-hint").innerHTML = (blocked ? `<span style="color:#ffd39a">现在不能跑：${esc(meta.note || "")}</span><br>` : "")
+    + esc(hint) + (meta.needs_engine ? '　<span class="chip warn">会起对局</span>' : "");
+  renderExtraFields();
+}
+function renderExtraFields(active){
+  const kind = $("c-kind").value;
+  const meta = KIND_META[kind] || {};
+  const fields = meta.fields || [];
+  const box = $("c-extra");
+  if (kind === "arena") {
+    box.innerHTML = `<div class="crow2">
+      <label class="field"><span>脚本 A</span><input id="c-style-a" placeholder="如 RaiseMoon"></label>
+      <label class="field"><span>脚本 B</span><input id="c-style-b" placeholder="如 Gen88"></label>
+      <label class="field"><span>局数</span><input id="c-duels" type="number" value="60" min="2"></label></div>`;
+    return;
+  }
+  if (kind === "script") {
+    box.innerHTML = `<div class="crow2">
+      <label class="field"><span>自写执行器名</span><input id="c-style" placeholder="如 KillerTune"></label>
+      <label class="field"><span>卡组编号</span><input id="c-deck-ids" placeholder="如 95,99,88"></label>
+      <label class="field"><span>群号</span><input id="c-group" placeholder="按某群随机池体检"></label></div>`;
+    return;
+  }
+  if (kind === "replay") {
+    box.innerHTML = `<div class="crow2">
+      <label class="field"><span>取最近几份</span><input id="c-latest" type="number" value="5" min="1" max="50"></label></div>`;
+    return;
+  }
+  if (kind === "iterate") {
+    box.innerHTML = `<div class="crow2">
+      <label class="field"><span>迭代轮数</span><input id="c-rounds" type="number" value="2" min="1" max="5"></label>
+      <label class="field"><span>每轮局数</span><input id="c-duels" type="number" value="20" min="2"></label></div>`;
+    return;
+  }
+  if (kind === "write_script") {
+    box.innerHTML = `<div class="crow2" style="grid-template-columns:max-content">
+      <label class="field"><span>生成→编译轮数</span><input id="c-rounds" type="number" value="3" min="1" max="6"></label></div>`;
+    return;
+  }
+  box.innerHTML = "";
+}
+async function loadDeckWorks(){
+  const deckId = $("c-deck").value;
+  const box = $("deck-works");
+  if (!deckId) { box.innerHTML = ""; return; }
+  const d = await api(`/api/deck/${encodeURIComponent(deckId)}/workspace`);
+  if (!d.ok) { box.innerHTML = `<div class="banner warn">${ICON.warn}${esc(d.error || "读不到这副牌的情况")}</div>`; return; }
+  const deck = d.deck || {};
+  const combos = d.combos || [];
+  box.innerHTML = `<div class="worksrow">
+      ${art(deck.head_card, "art sm")}
+      <div class="winfo">
+        <div class="nm">${esc(deck.name)} <span class="faint mono" style="font-size:11px">#${esc(deck.deck_id)}</span></div>
+        <div class="ln">
+          ${deck.script ? `<span class="chip brand">脚本 ${esc(deck.script)}</span>` : '<span class="chip dim">还没写过脚本</span>'}
+          ${deck.picked_style ? `<span class="chip">挑样式 ${esc(deck.picked_style)}</span>` : ""}
+          ${deck.in_random ? '<span class="chip ok">随机池</span>' : ""}
+          ${combos.length ? `<span class="chip">推演 ${combos.length} 份</span>` : ""}
+        </div>
+        ${d.latest && d.latest.conclusion ? `<div class="faint" style="font-size:11.5px;margin-top:5px">上次${esc(d.latest.kind_title)}：${esc(String(d.latest.conclusion).slice(0, 120))}</div>` : ""}
+      </div>
+      ${combos.length ? `<a class="btn sm" href="#" onclick="showCombo('${encodeURIComponent(combos[0].name)}');return false;">看最近推演</a>` : ""}
+    </div>`;
+}
+async function showCombo(fileName){
+  const deckId = $("c-deck").value;
+  const d = await api(`/api/deck/${encodeURIComponent(deckId)}/workspace`);
+  if (!d.ok) { toast(d.error || "读不到推演", "err"); return; }
+  $("sheet-title").innerHTML = `${esc(d.deck.name)}　<span class="chip brand">推演存档</span>`;
+  $("sheet-body").innerHTML = `<pre class="log">${esc(d.combo_preview || "（还没有推演存档）")}</pre>
+    <p class="faint" style="font-size:11.5px">这份推演的完整文件：<span class="mono">${esc((d.combos[0]||{}).name || "")}</span></p>`;
+  openSheet();
+}
+async function sendTask(){
+  const kind = $("c-kind").value;
+  const payload = { kind: kind, deck_id: Number($("c-deck").value) };
+  const text = $("c-text").value.trim();
+  if (text) payload.extra_prompt = text;
+  const num = (id) => { const el = $(id); return el && el.value !== "" ? Number(el.value) : undefined; };
+  const val = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
+  if (kind === "arena") {
+    payload.style_a = val("c-style-a"); payload.style_b = val("c-style-b");
+    payload.duels = num("c-duels") ?? 60;
+  }
+  if (kind === "script") {
+    payload.style = val("c-style"); payload.deck_ids = val("c-deck-ids"); payload.group = val("c-group");
+  }
+  if (kind === "replay") payload.latest = num("c-latest") ?? 5;
+  if (kind === "iterate") { payload.rounds = num("c-rounds") ?? 2; payload.duels = num("c-duels") ?? 20; }
+  if (kind === "write_script") payload.rounds = num("c-rounds") ?? 3;
+
+  const d = await postApi("/api/training/start", payload);
+  if (!d.ok) { toast(d.error || "起不来", "err"); return; }
+  $("c-text").value = "";
+  toast(`已开始：${d.run.title}`, "ok");
+  loadTraining();
+}
+async function stopTraining(){
+  const d = await postApi("/api/training/stop", {});
+  if (!d.ok) { toast(d.error || "停不下来", "err"); return; }
+  toast(d.stopped ? "已发出停止信号" : "没有在跑的任务", "ok");
+  loadTraining();
 }
 async function showRun(runId){
   const d = await api(`/api/training/run/${encodeURIComponent(runId)}`);
@@ -1923,38 +2216,6 @@ async function showRun(runId){
   $("sheet-title").innerHTML = `${esc(run.title)} ${statusChip(run.status)}`;
   $("sheet-body").innerHTML = `<div class="faint mono" style="font-size:11.5px;margin-bottom:10px">${esc(JSON.stringify(run.params))}　起 ${esc(run.started_at)}${run.duration_seconds==null?"":"　耗时 "+esc(run.duration_seconds)+"s"}</div>${parts.join("")}`;
   openSheet();
-}
-function fieldValue(kind, name){ const el = $(`f-${kind}-${name}`); return el ? el.value.trim() : ""; }
-async function startTraining(kind){
-  const payload = { kind };
-  const deck = fieldValue(kind, "deck");
-  if (deck) payload.deck_id = Number(deck);
-  const extra = fieldValue(kind, "extra");
-  if (extra) payload.extra_prompt = extra;
-  const rounds = fieldValue(kind, "rounds");
-  if (rounds) payload.rounds = Number(rounds);
-  if (kind === "arena") {
-    payload.duels = Number(fieldValue(kind, "duels") || 60);
-    payload.style_a = fieldValue(kind, "style-a");
-    payload.style_b = fieldValue(kind, "style-b");
-  }
-  if (kind === "iterate") {
-    payload.duels = Number(fieldValue(kind, "duels") || 20);
-  }
-  if (kind === "script") {
-    payload.style = fieldValue(kind, "style");
-    payload.deck_ids = fieldValue(kind, "deck-ids");
-    payload.group = fieldValue(kind, "group");
-  }
-  if (kind === "replay") {
-    payload.latest = Number(fieldValue(kind, "latest") || 5);
-    const compare = fieldValue(kind, "deck");
-    if (compare) payload.deck_id = Number(compare);
-  }
-  const d = await postApi("/api/training/start", payload);
-  if (!d.ok) { toast(d.error || "起不来", "err"); return; }
-  toast(`已起任务：${d.run.title}`, "ok");
-  loadTraining();
 }
 async function stopTraining(){
   const d = await postApi("/api/training/stop", {});
@@ -2007,7 +2268,6 @@ document.addEventListener("DOMContentLoaded", async () => {
     if (State.logTimer) { clearInterval(State.logTimer); State.logTimer = null; }
     if (event.target.checked) State.logTimer = setInterval(() => { if (State.tab === "logs") loadLogs(); }, 4000);
   };
-  if ($("btn-training-refresh")) $("btn-training-refresh").onclick = loadTraining;
   if ($("btn-duel-refresh")) $("btn-duel-refresh").onclick = loadDuel;
   if ($("duel-live")) $("duel-live").onchange = startDuelLive;
   if ($("btn-overview-refresh")) $("btn-overview-refresh").onclick = loadOverview;
@@ -2074,7 +2334,7 @@ def _app_page() -> str:
       <div class="navlink active" data-tab="overview"><svg class="i" viewBox="0 0 24 24"><path d="M4 10.5 12 4l8 6.5V20H4z"/><path d="M10 20v-5h4v5"/></svg>总览</div>
       <div class="navlink" data-tab="decks"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="15" rx="2.2"/><path d="M8 3h10a2 2 0 0 1 2 2v13"/><path d="M7.5 11h4"/></svg>卡组</div>
       <div class="navlink" data-tab="duel"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h16M4 18h16"/><rect x="5" y="8" width="6" height="8" rx="1.5"/><rect x="13" y="8" width="6" height="8" rx="1.5"/></svg>对局</div>
-      <div class="navlink" data-tab="training"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v3M6.5 5.5l2 2M17.5 5.5l-2 2"/><rect x="4" y="10" width="16" height="10" rx="3"/><path d="M9 15h6"/></svg>训练</div>
+      <div class="navlink" data-tab="training"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v3M6.5 5.5l2 2M17.5 5.5l-2 2"/><rect x="4" y="10" width="16" height="10" rx="3"/><path d="M9 15h6"/></svg>训练台</div>
       <div class="navlink" data-tab="logs"><svg class="i" viewBox="0 0 24 24"><path d="M5 4h14v16H5z"/><path d="M8.5 9h7M8.5 12.5h7M8.5 16h4"/></svg>日志</div>
     </nav>
     <div class="foot">面板只监听本机。<br><a id="side-url" href="http://127.0.0.1:17911">载入中…</a></div>
@@ -2125,16 +2385,24 @@ def _app_page() -> str:
 
       <section class="view" id="view-training">
         <div id="training-banners"></div>
-        <div id="training-active"></div>
-        <div class="grid cols-main">
-          <div>
-            <div class="panel" style="margin-bottom:14px"><div class="hd"><h3>起一个任务</h3>
-                <span class="sp"></span><span class="faint" style="font-size:12px">同一时刻只跑一个</span></div>
-              <div class="bd" id="training-forms"></div></div>
+        <div class="console">
+          <div class="stream" id="training-stream">
+            <div class="empty">加载中…</div>
           </div>
-          <div class="panel"><div class="hd"><h3>最近的任务</h3><span class="sp"></span>
-              <button class="btn sm" id="btn-training-refresh">刷新</button></div>
-            <div class="bd" id="training-runs"></div></div>
+          <div class="deckworks" id="deck-works"></div>
+          <div class="composer">
+            <div class="crow2">
+              <label class="field"><span>卡组</span><select id="c-deck"></select></label>
+              <label class="field"><span>要写的东西</span><select id="c-kind" onchange="onKindChange()"></select></label>
+              <button class="btn primary" id="btn-send" onclick="sendTask()">开始</button>
+            </div>
+            <div class="cinput">
+              <textarea id="c-text" rows="2"
+                placeholder="想强调的打法、额外的要求（可以不填）。例如：先手优先做鲜花女男爵；别去踩对面的神宣"></textarea>
+            </div>
+            <div class="extra" id="c-extra"></div>
+            <div class="faint" id="c-hint" style="font-size:11.5px"></div>
+          </div>
         </div>
         <div id="training-run-detail"></div>
       </section>

@@ -21,6 +21,7 @@ import importlib
 import json
 import sys
 import tempfile
+import time
 import types
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -306,6 +307,84 @@ def _make_tree(root: Path) -> tuple:
     return source, windbot
 
 
+def test_deck_workspace_endpoint_lists_script_and_combo_archives() -> None:
+    """训练台要先看见"这副牌已经有什么"：当前脚本、推演存档、最近的结论。
+
+    这里顺带锁住路由顺序：`/api/deck/<id>/workspace` 比"卡组详情"更具体，
+    必须排在它前面——第一版把顺序写反了，`deck_id` 变成 `97/workspace`，
+    面板上显示的是"找不到卡组：97/workspace"。
+    """
+
+    webui = _load("webui")
+    import http.client
+
+    def get(port: int, path: str, key: str):
+        """对面板发一个 GET，返回 ``(状态码, 解析后的 JSON)``。"""
+
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            connection.request("GET", path, headers={"X-API-Key": key})
+            response = connection.getresponse()
+            return response.status, json.loads(response.read().decode("utf-8"))
+        finally:
+            connection.close()
+
+    secret = "k" * 32
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        data_dir = root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        deck_text = "\n".join(
+            ["#main"] + [str(1000 + i) for i in range(3)] + ["#extra", "5001", "!side", ""]
+        )
+        deckpool = _load("duel.deckpool")
+        pool = deckpool.DeckPool(data_dir)
+        try:
+            stored = pool.add(
+                group_id="111",
+                display_name="测试牌",
+                contributor_id="u",
+                contributor_name="群友",
+                ydk_text=deck_text,
+                deck_code="",
+                source_format="ydk",
+                main_count=3,
+                extra_count=1,
+                side_count=0,
+            )
+            pool.set_generated_script(stored.deck_id, "Gen111")
+        finally:
+            pool.close()
+
+        # 造一份推演存档（训练台的"看最近推演"读的就是它）
+        workspace = data_dir / "train"
+        (workspace / "combos").mkdir(parents=True, exist_ok=True)
+        (workspace / "combos" / f"20261008-193012-{stored.deck_id}-测试牌.txt").write_text(
+            "【这副牌想做什么】先手做阻抗。\n", encoding="utf-8"
+        )
+
+        plugin = StubPlugin(data_dir)
+        server, port = _start_panel(webui, plugin, secret)
+        try:
+            status, payload = get(port, f"/api/deck/{stored.deck_id}/workspace", secret)
+            assert status == 200, (status, payload)
+            assert payload["ok"] is True, payload
+            assert payload["deck"]["script"] == "Gen111", payload["deck"]
+            assert [item["label"] for item in payload["combos"]], payload["combos"]
+            assert "10-08 19:30" in payload["combos"][0]["label"], payload["combos"][0]
+            assert "先手做阻抗" in payload["combo_preview"], payload["combo_preview"]
+
+            # 路由顺序：详情那条不能被 workspace 抢走，workspace 也不能被详情吃掉
+            status, payload = get(port, f"/api/deck/{stored.deck_id}?group=111", secret)
+            assert payload["ok"] is True, payload
+
+            status, payload = get(port, "/api/deck/abc/workspace", secret)
+            assert payload["ok"] is False, payload
+        finally:
+            server.stop_now()
+            time.sleep(0.4)
+
+
 def test_script_generator_writes_compiles_and_reports_attempts() -> None:
     """生成 → 编译成功：文件写进源码树、卡表写进 Decks/、轮数如实记下来。"""
 
@@ -537,6 +616,7 @@ def main() -> int:
 
     tests = [
         test_deck_operations_go_through_the_plugin_and_need_confirmation,
+        test_deck_workspace_endpoint_lists_script_and_combo_archives,
         test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards,
         test_rooms_endpoint_still_draws_the_table_before_the_duel_starts,
         test_script_generator_writes_compiles_and_reports_attempts,
