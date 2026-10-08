@@ -121,6 +121,35 @@ def test_windbot_args_omit_optional_fields() -> None:
     assert not any(arg.startswith("Debug=") for arg in args)
 
 
+def test_windbot_args_carry_brain_layer_only_when_enabled() -> None:
+    """阻抗决策层的参数：**没给前缀就一个都不传**，给了才带上三个开关。
+
+    为什么这条要单独测：`BrainFile=` 是"开不开决策层"的唯一开关，但 WindBot 侧
+    `BrainIdleChoice` / 攻击目标那两个**展开期**钩子只判"传没传 BrainFile"——
+    少传一个 `BrainIdleChoice=false`，展开期就会被模型插一脚（那正是被否掉的老口径）。
+    所以这里既要测"没前缀不带参数"，也要测"带前缀时必须显式带上三个值"。
+    """
+
+    args = WindBotSettings(name="MaiBot").to_args("127.0.0.1", 1)
+    assert not any(arg.startswith("Brain") for arg in args), args
+
+    brain_file = Path("/data/brain/room_abc")
+    args = WindBotSettings(
+        name="MaiBot",
+        brain_file=brain_file,
+        brain_target_choice=True,
+        brain_negate_gate=False,
+        brain_timeout_ms=2500,
+    ).to_args("127.0.0.1", 1)
+    assert f"BrainFile={brain_file}" in args
+    assert "BrainTargetChoice=true" in args
+    assert "BrainNegateGate=false" in args
+    assert "BrainTimeoutMs=2500" in args
+
+    gate_on = WindBotSettings(name="MaiBot", brain_file=brain_file, brain_negate_gate=True)
+    assert "BrainNegateGate=true" in gate_on.to_args("127.0.0.1", 1)
+
+
 def test_windbot_debug_switch() -> None:
     """打开调试后 WindBot 会把对局过程打到 stdout。"""
 

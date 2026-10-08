@@ -205,6 +205,7 @@ async def _run_one(
     index: int,
     seat_a: str,
     deck_file: Path,
+    deck_file_b: Path,
     style_a: str,
     style_b: str,
     paths: Path,
@@ -218,10 +219,16 @@ async def _run_one(
     max_duel_seconds: float,
     join_timeout: float,
 ) -> DuelOutcome:
-    """打一局：`seat_a` 侧用 A 脚本，另一侧用 B 脚本。"""
+    """打一局：`seat_a` 侧用 A 那副牌与它的脚本，另一侧用 B 的。
+
+    **牌与脚本必须一起换**：座位每局交替，换座位时如果只换脚本不换卡表，
+    就变成"A 的脚本拿 B 的卡表在打"——那不是比强弱，是在比谁的脚本更抗错配。
+    """
 
     bot_style = style_a if is_a_on_bot else style_b
     opponent_style = style_b if is_a_on_bot else style_a
+    bot_deck = deck_file if is_a_on_bot else deck_file_b
+    opponent_deck = deck_file_b if is_a_on_bot else deck_file
 
     config = SessionConfig(
         ygopro_executable=paths / "ygopro" / "ygopro.exe",
@@ -232,7 +239,7 @@ async def _run_one(
         room=RoomSettings(save_replay=False),
         bot_name="A/B-bot",
         windbot_deck=bot_style,
-        bot_deck_file=deck_file,
+        bot_deck_file=bot_deck,
         listen_port=0,
         join_timeout=join_timeout,
         max_duration=max_duel_seconds,
@@ -250,7 +257,7 @@ async def _run_one(
             config.windbot_executable,
             config.windbot_dir,
             WindBotSettings(
-                name="A/B-opponent", deck=opponent_style, deck_file=deck_file,
+                name="A/B-opponent", deck=opponent_style, deck_file=opponent_deck,
                 password=info.password, db_path=config.cards_cdb, debug=True,
             ),
             logger=opponent_logger,
@@ -306,6 +313,12 @@ async def run(args: argparse.Namespace) -> int:
     if not deck_file.is_file():
         print(f"卡表不在：{deck_file}")
         return 2
+    # 第二副牌（可选）：给了就是"两副牌互打"（各自用自己的脚本），
+    # 不给就是老口径"同一副牌换脚本"，两边行为完全兼容
+    deck_file_b = Path(args.deck_file_b) if args.deck_file_b else deck_file
+    if not deck_file_b.is_file():
+        print(f"B 侧卡表不在：{deck_file_b}")
+        return 2
     paths = _PLUGIN_ROOT / "clients"
     windbot_exe = _resolve_windbot_exe(paths)
     db = CardDatabase(paths / "ygopro" / "cards.cdb")
@@ -324,7 +337,10 @@ async def run(args: argparse.Namespace) -> int:
                   log_b=log_map.get(args.style_b, args.style_b),
                   name_a=args.style_a, name_b=args.style_b)
     print(f"被测 exe：{windbot_exe}")
-    print(f"卡表（两边一样）：{deck_file}")
+    if deck_file_b == deck_file:
+        print(f"卡表（两边一样）：{deck_file}")
+    else:
+        print(f"A 的卡表：{deck_file}\nB 的卡表：{deck_file_b}")
     print(f"A = {args.style_a}（日志名 {tally.log_a}）｜B = {args.style_b}（日志名 {tally.log_b}）")
     print(f"计划 {args.duels} 局，逐局交替座位（两边都**不开**决策层，只比脚本）\n")
 
@@ -336,7 +352,7 @@ async def run(args: argparse.Namespace) -> int:
         is_a_on_bot = index % 2 == 0
         seat_a = "bot" if is_a_on_bot else "opponent"
         outcome = await _run_one(
-            index=index, seat_a=seat_a, deck_file=deck_file,
+            index=index, seat_a=seat_a, deck_file=deck_file, deck_file_b=deck_file_b,
             style_a=args.style_a, style_b=args.style_b,
             paths=paths, windbot_exe=windbot_exe, db=db,
             session_logger=session_logger, opponent_logger=opponent_logger,
@@ -381,7 +397,8 @@ async def run(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="同一副卡表、两个出牌脚本对打")
-    parser.add_argument("--deck-file", required=True, help="两边共用的 .ydk")
+    parser.add_argument("--deck-file", required=True, help="A 侧的 .ydk")
+    parser.add_argument("--deck-file-b", default="", help="B 侧的 .ydk（留空＝两边同一副牌，只换脚本）")
     parser.add_argument("--style-a", required=True, help="A 脚本（Deck= 的名字）")
     parser.add_argument("--style-b", required=True, help="B 脚本")
     parser.add_argument("--duels", type=int, default=60, help="总对局数（座位逐局交替）")

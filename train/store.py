@@ -20,13 +20,14 @@ import uuid
 # ---- 任务种类 ---------------------------------------------------------------
 
 KIND_COMBO = "combo"
-"""读卡表+卡文推演展开流程（只问模型，不开对局）。"""
+"""combo 推演：读卡表+卡文推演展开流程（只问模型，不开对局）。
+**只剩历史记录**：2026-10-09 起推演降级成「编写脚本 / 卡组迭代」的内部步骤，不再单独起任务。"""
 
 KIND_ARENA = "arena"
-"""同一副卡表挂两份出牌脚本对打（`tools/style_ab.py`，**会真打牌**）。"""
+"""两副卡组各带自己的出牌脚本对打（`tools/style_ab.py`，**会真打牌**）。"""
 
 KIND_SCRIPT = "script"
-"""卡表 × 执行器登记的静态体检（`tools/check_card_coverage.py`，不打牌）。"""
+"""卡表 × 执行器登记的静态体检（`tools/check_card_coverage.py`，不打牌）。**只剩历史记录**。"""
 
 KIND_WRITE_SCRIPT = "write_script"
 """给一副卡组**写**出牌脚本：模型读卡文 + combo 写 C#，再 `dotnet build`（会写源码树）。"""
@@ -35,15 +36,25 @@ KIND_ITERATE = "iterate"
 """自动迭代：combo → 写脚本 → 编译 → 擂台实测 → 把结论回喂下一轮（**会真打牌**）。"""
 
 KIND_REPLAY = "replay"
-"""录像复盘（`tools/analyze_replay.py`：卡表、双方差异、导出 .ydk，不打牌）。"""
+"""录像复盘（`tools/analyze_replay.py`：卡表、双方差异、导出 .ydk，不打牌）。**只剩历史记录**。"""
 
+KIND_REVIEW = "review"
+"""复盘优化：读这副牌最近打过的对局记录，让模型指出具体该改哪里（不自动改文件）。"""
+
+KIND_DUEL = "duel"
+"""房间对局记录（插件在每局打完时自动写一条）：复盘优化的素材，不是用户起的任务。"""
+
+#: 记录里显示的名字。前四项就是面板上的四个选项，两边用词保持一致；
+#: 另外三个标着"只剩历史记录"的种类不会再产生新记录，留着只为旧记录还能显示标题。
 KIND_TITLES: Dict[str, str] = {
     KIND_COMBO: "combo 推演",
-    KIND_WRITE_SCRIPT: "写脚本",
-    KIND_ITERATE: "自动迭代",
-    KIND_ARENA: "擂台 A/B",
+    KIND_WRITE_SCRIPT: "编写脚本",
+    KIND_ITERATE: "卡组迭代",
+    KIND_ARENA: "卡组互打",
     KIND_SCRIPT: "脚本预校验",
     KIND_REPLAY: "录像复盘",
+    KIND_REVIEW: "复盘优化",
+    KIND_DUEL: "房间对局",
 }
 
 #: 会真的开对局的种类——房间里有人时不许起（见 `train.runner`）。

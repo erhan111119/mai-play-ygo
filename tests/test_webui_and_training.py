@@ -625,6 +625,40 @@ def _write_deck(path: Path, card_ids: List[int]) -> None:
     )
 
 
+def _seed_two_decks(tmp: Path, *, first_script: str = "GenA", second_script: str = "GenB") -> List[int]:
+    """往临时卡组池里登记两副牌（各自带出牌脚本），返回编号。
+
+    擂台与迭代现在选的是"另一副卡组"而不是"另一个脚本名"（2026-10-09 用户口径：
+    一个卡组只有一个脚本），所以这两种任务必须有**两副都配了脚本的牌**才起得来。
+    """
+
+    deckpool = _load("duel.deckpool")
+    pool = deckpool.DeckPool(tmp)
+    try:
+        deck_ids: List[int] = []
+        for index, (name, script) in enumerate((("甲牌", first_script), ("乙牌", second_script))):
+            ydk_path = tmp / f"seed{index}.ydk"
+            _write_deck(ydk_path, [101 + index])
+            stored = pool.add(
+                group_id="111",
+                display_name=name,
+                contributor_id="u",
+                contributor_name="群友",
+                ydk_text=ydk_path.read_text(encoding="utf-8"),
+                deck_code="",
+                source_format="ydk",
+                main_count=1,
+                extra_count=0,
+                side_count=0,
+            )
+            pool.set_generated_script(stored.deck_id, script)
+            deck_ids.append(stored.deck_id)
+        return deck_ids
+    finally:
+        # 一定要关：Windows 上没关连接，临时目录清理会报"文件正在使用"
+        pool.close()
+
+
 def _wait_for(predicate: Any, timeout: float = 15.0, interval: float = 0.2) -> bool:
     """等一个条件成立（同步版，用在没跑事件循环的等待里）。"""
 
@@ -636,8 +670,13 @@ def _wait_for(predicate: Any, timeout: float = 15.0, interval: float = 0.2) -> b
     return False
 
 
-async def _combo_case() -> None:
-    """combo 推演：读卡表 → 问模型 → 落盘 → 记录成功。"""
+async def _combo_derivation_archives_the_guide() -> None:
+    """combo 推演：读卡表 → 问模型 → 落盘。
+
+    推演现在**不是**面板上的一个任务（2026-10-09 用户口径：只留卡组互打 / 编写脚本 /
+    卡组迭代 / 复盘优化），它是「编写脚本」与「卡组迭代」的中间材料。所以这里直接走它
+    真正被调用的那个入口（`_derive_combo_for`），测的还是那条链：卡表 → 卡文 → 模型 → 存档。
+    """
 
     store_module = _load("train.store")
     with tempfile.TemporaryDirectory() as directory:
@@ -663,18 +702,17 @@ async def _combo_case() -> None:
             )
 
         runner = _make_runner(tmp, store, generate=fake_generate)
-        run = await runner.start("combo", {"deck_file": str(deck_path)})
-        await runner._task  # 用例里等它跑完（真机上是后台跑，面板轮询看进度）
-        saved = store.get(run.run_id)
-        assert saved is not None and saved.status == store_module.STATUS_DONE, saved.error
-        assert saved.summary["cards"] == 2, saved.summary
-        guide = Path(saved.summary["guide_path"])
-        assert guide.is_file(), guide
-        assert "先攻压制" in guide.read_text(encoding="utf-8")
+        guide_text = await runner._derive_combo_for(
+            {"deck_id": 0, "deck_name": "测试牌", "deck_file": str(deck_path)}
+        )
+        assert "先攻压制" in guide_text, guide_text[:200]
+        archived = list(runner.combo_dir.glob("*.txt"))
+        assert len(archived) == 1, archived
+        assert "先攻压制" in archived[0].read_text(encoding="utf-8")
         assert not runner.busy
 
 
-async def _combo_rejects_unknown_deck() -> None:
+async def _unknown_deck_is_refused_before_a_record_exists() -> None:
     """卡组找不到时必须起不来（在"建记录"之前就拦掉，不留下半截任务）。"""
 
     store_module = _load("train.store")
@@ -684,7 +722,7 @@ async def _combo_rejects_unknown_deck() -> None:
         store = store_module.TrainingStore(tmp / "training.db")
         runner = _make_runner(tmp, store)
         try:
-            await runner.start("combo", {"deck_id": 999})
+            await runner.start("write_script", {"deck_id": 999})
         except runner_module.TrainingError as exc:
             assert "999" in str(exc), exc
         else:
@@ -746,7 +784,8 @@ async def _subprocess_run_writes_log_and_stops() -> None:
     """起子进程那条路：输出直接落进日志；停任务后子进程必须真的不再输出。
 
     假工具不认识任何参数，只管打印 + 写心跳——测的是"接线"（日志、停任务、记录状态），
-    不是工具本身的逻辑。
+    不是工具本身的逻辑。走的种类是**卡组互打**：四个面板任务里只有它（和迭代）会起子进程，
+    而它现在要两副各自带脚本的卡组。
     """
 
     store_module = _load("train.store")
@@ -754,8 +793,9 @@ async def _subprocess_run_writes_log_and_stops() -> None:
         tmp = Path(directory)
         store = store_module.TrainingStore(tmp / "training.db")
         runner = _make_runner(tmp, store)
+        deck_a, deck_b = _seed_two_decks(tmp)
         heartbeat = tmp / "heartbeat.txt"
-        tool = runner.tools_dir / "analyze_replay.py"
+        tool = runner.tools_dir / "style_ab.py"
         tool.write_text(
             "import pathlib, sys, time\n"
             "print('假工具开始跑', flush=True)\n"
@@ -775,11 +815,12 @@ async def _subprocess_run_writes_log_and_stops() -> None:
             return "这一轮只是机制检查。"
 
         runner = _make_runner(tmp, store, generate=fake_generate)
-        run = await runner.start("replay", {"latest": 1})
+        params = {"deck_id": deck_a, "opponent_deck_id": deck_b, "duels": 2}
+        run = await runner.start("arena", params)
         assert runner.busy, "起完之后应该在跑"
         # 起第二个任务必须被拦住（同一台机器上两套内核会互相抢资源）
         try:
-            await runner.start("replay", {"latest": 1})
+            await runner.start("arena", params)
         except _load("train.runner").TrainingError as exc:
             assert "已经在跑" in str(exc) or "在跑" in str(exc), exc
         else:
@@ -827,8 +868,9 @@ async def _stop_now_kills_the_tree_within_unload_budget() -> None:
     with tempfile.TemporaryDirectory() as directory:
         tmp = Path(directory)
         store = store_module.TrainingStore(tmp / "training.db")
+        deck_a, deck_b = _seed_two_decks(tmp)
         heartbeat = tmp / "heartbeat.txt"
-        tool = tmp / "plugin" / "tools" / "analyze_replay.py"
+        tool = tmp / "plugin" / "tools" / "style_ab.py"
         tool.parent.mkdir(parents=True, exist_ok=True)
         tool.write_text(
             "import pathlib, time\n"
@@ -842,7 +884,9 @@ async def _stop_now_kills_the_tree_within_unload_budget() -> None:
             encoding="utf-8",
         )
         runner = _make_runner(tmp, store)
-        run = await runner.start("replay", {"latest": 1})
+        run = await runner.start(
+            "arena", {"deck_id": deck_a, "opponent_deck_id": deck_b, "duels": 2}
+        )
         ok = await asyncio.get_running_loop().run_in_executor(
             None, lambda: _wait_for(heartbeat.exists)
         )
@@ -937,7 +981,7 @@ def test_deck_names_and_head_cards_come_from_the_card_db() -> None:
         deckpool = _load("duel.deckpool")
         pool = deckpool.DeckPool(data_dir)
         try:
-            pool.add(
+            stored = pool.add(
                 group_id="111",
                 display_name="测试牌",
                 contributor_id="u",
@@ -949,6 +993,9 @@ def test_deck_names_and_head_cards_come_from_the_card_db() -> None:
                 extra_count=2,
                 side_count=0,
             )
+            # 卡组页那个「AI 决策档位」：面板是直接读卡组库这一列的。
+            # ⚠ 顺带锁住"新库也要有 brain_scope 列"——列不存在时接口会静默变成"一副牌都没有"。
+            pool.set_brain_scope(stored.deck_id, "target_only")
         finally:
             # 一定要关：Windows 上没关连接，临时目录清理会报"文件正在使用"，
             # 而那个报错会把真正的失败原因（比如参数写错）盖掉
@@ -967,6 +1014,7 @@ def test_deck_names_and_head_cards_come_from_the_card_db() -> None:
             status, body, _reply = _http(port, "GET", "/api/decks", headers=headers)
             deck = json.loads(body)["groups"][0]["decks"][0]
             assert deck["head_card"] == 5002, f"头牌该挑本地有图的那张：{deck['head_card']}"
+            assert deck["brain_scope"] == "target_only", deck["brain_scope"]
 
             status, body, _reply = _http(
                 port, "GET", f"/api/deck/{deck['deck_id']}?group=111", headers=headers
@@ -977,6 +1025,7 @@ def test_deck_names_and_head_cards_come_from_the_card_db() -> None:
             assert [entry["name"] for entry in detail["entries"]["extra"]] == ["额额外一", "额额外二"]
             assert detail["entries"]["main"][0]["count"] == 1
             assert detail["head_card"] == 5002
+            assert detail["brain_scope"] == "target_only", detail["brain_scope"]
         finally:
             server.stop_now()
             # 面板的请求是在**自己的线程**里跑的（daemon 线程，停服务时不会被 join），
@@ -1020,8 +1069,8 @@ def main() -> int:
         test_empty_model_reply_is_an_error_not_an_empty_guide,
         test_timeout_failure_says_what_to_change,
         test_combo_keeps_the_main_lines_when_the_notes_round_fails,
-        _combo_case,
-        _combo_rejects_unknown_deck,
+        _combo_derivation_archives_the_guide,
+        _unknown_deck_is_refused_before_a_record_exists,
         _arena_refused_while_room_is_active,
         _arena_needs_two_different_styles,
         _subprocess_run_writes_log_and_stops,

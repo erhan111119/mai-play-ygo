@@ -126,6 +126,40 @@ def _split_fields(line: str, expected: int) -> List[str]:
     return parts
 
 
+def _split_verdict(text: str) -> tuple:
+    """把答复切成 ``(判词, 理由)``——**按前导 token 切，不依赖分隔符**。
+
+    为什么不能只按分号切：模型写理由的方式随措辞变——`4;理由`、`4 理由：…`、
+    `4\\n\\n理由：…`、`都不发：…` 都出现过（实测：换一档提示词就让 15.6% 的答复
+    因为"只认分号"而被整条丢弃）。所以这里只认开头那一小段：连续数字 / `no` /
+    中文的"不发"类字样，剩下的不管是什么都当理由。
+    """
+
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized:
+        return "", ""
+    # 理由两侧的分隔/标点一律剥掉（`4。` 这种"只有句号"的答复理由应当为空）
+    trim = " ;；:：,，、-。．.!！?？"
+    head = ""
+    rest = normalized
+    # 先试数字
+    index = 0
+    while index < len(normalized) and normalized[index].isdigit():
+        index += 1
+    if index > 0:
+        return normalized[:index], normalized[index:].strip(trim)
+    # 再试英文 no / 中文的"不发"类
+    lowered = normalized.lower()
+    for token in ("no", "不发", "都不发", "否", "不要"):
+        if lowered.startswith(token):
+            rest = normalized[len(token):]
+            head = "no" if token == "no" else token
+            break
+    if not head:
+        return "", ""
+    return head, rest.strip(trim)
+
+
 def _field(fields: Sequence[str], index: int) -> str:
     """按下标取字段，缺的给空串——**不要用元组解包**。
 
@@ -139,6 +173,50 @@ def _field(fields: Sequence[str], index: int) -> str:
     return fields[index] if index < len(fields) else ""
 
 
+#: 决策档位：控制模型"交阻抗"的**幅度**。
+#:
+#: 为什么要有这个旋钮（2026-10-08 实测）：同一个决策层、同一份提示词，
+#: 在"20 张手坑 + 20 张白板大怪"的合成牌组上是 **+13 个点**（那副牌没有展开需要保护，
+#: "留着不交"接近最优），在真实卡组「全盛俱舍」上是 **-5.6 / -9.4 个点**（该断就得断，
+#: 保守就是亏的）。所以"幅度"必须可调，而不是把某个口径写死在提示词里。
+#:
+#: * `conservative`（保守）：有疑问就不交，留着以后；
+#: * `normal`（平常）：值得拦才拦，两种判断差不多时看手里还剩几张；
+#: * `aggressive`（激进）：能拦就拦，别为了"留到以后"放过现在这一步。
+#:
+#: ⚠ **只改提示词，不用改 C#、不用重编译 exe**——档位只影响"怎么问模型"，
+#: 候选卡仍然来自内核（内核保证那些卡此刻真的能发动），所以再激进也不会做出非法动作。
+DECISION_STYLES = ("conservative", "normal", "aggressive")
+
+#: 档位别名：中英文都收（`decision_style` 是写给人看的配置，不该逼人记英文）。
+_STYLE_ALIASES = {
+    "conservative": "conservative", "保守": "conservative", "谨慎": "conservative",
+    "normal": "normal", "平常": "normal", "普通": "normal", "默认": "normal",
+    "aggressive": "aggressive", "激进": "aggressive",
+}
+
+
+def normalize_decision_style(raw: str, logger: Optional[logging.Logger] = None) -> str:
+    """把配置里写的档位规范化成三个值之一；认不出来的回落到 `normal` 并留一行日志。
+
+    回落到 `normal` 而不是报错：档位只是个措辞旋钮，为它挡住一局不值得；
+    但**必须留日志**——配置写错了却静默按别的档位跑，是最难查的那类问题。
+    """
+
+    key = str(raw or "").strip().lower()
+    if not key:
+        return "normal"
+    style = _STYLE_ALIASES.get(key)
+    if style is not None:
+        return style
+    if logger is not None:
+        logger.warning(
+            "决策档位 %r 不认识（认识的是 %s 或 保守/平常/激进），按 normal 处理",
+            raw, "/".join(DECISION_STYLES),
+        )
+    return "normal"
+
+
 class BrainBridge:
     """阻抗决策层的答复端。
 
@@ -146,6 +224,7 @@ class BrainBridge:
         prefix: 与 C# 的 ``BrainFile=`` 同一个前缀（不含扩展名）；问题写 ``.q``、答复写 ``.a``。
         timeout: 自己这一侧的等模型上限（秒）。**必须比 C# 的 ``BrainTimeoutMs`` 略短**，
             否则"超时"这件事只会由 C# 发现，这里是白白多占一段没人用的时间。
+        style: 决策档位（保守/平常/激进），只影响提示词里那段"判断口径"。
     """
 
     def __init__(
@@ -159,6 +238,7 @@ class BrainBridge:
         poll_interval: float = 0.03,
         cache_size: int = 64,
         max_answers: int = 0,
+        style: str = "normal",
     ) -> None:
         self._prefix = Path(prefix)
         self._generate = generate
@@ -169,6 +249,7 @@ class BrainBridge:
         self._cache_size = max(int(cache_size), 0)
         #: 本局最多答多少问（0 = 不限）。用来给"模型突然变慢"兜一个上限。
         self._max_answers = max(int(max_answers), 0)
+        self._style = normalize_decision_style(style, logger)
 
         self._question_path = Path(f"{self._prefix}.q")
         self._answer_path = Path(f"{self._prefix}.a")
@@ -193,6 +274,12 @@ class BrainBridge:
         """累计计数（只读视图）。"""
 
         return self._stats
+
+    @property
+    def style(self) -> str:
+        """当前生效的决策档位（规范化之后的值，供启动日志展示）。"""
+
+        return self._style
 
     def stop(self) -> None:
         """请求停止循环（下一次轮询时退出）。"""
@@ -377,11 +464,15 @@ class BrainBridge:
         if not text:
             return None
         if kind == "chain_choice":
-            # 序号 + 可选理由；序号必须**正是候选行首那个数字**（它是内核下标+1，不保证从 1 连续）
-            split = text.split(";", 1)
-            head = split[0].strip().lower()
-            reason = " ".join(split[1].split())[:60] if len(split) > 1 else ""
-            if head.startswith("no") or head == "0":
+            # 答复 = 序号（可选理由）或"不发"。
+            #
+            # ⚠ **只认分号是踩过的坑**：原来按 `;` 切第一段当答复，结果是模型写
+            # "1\n\n理由：对手发动的是…"（换行 + 「理由：」）时整条被判"不合语法"丢弃——
+            # 激进档的措辞更爱让它写理由，那一腿 **88/566 = 15.6% 的答复就这样被扔了**，
+            # 整腿的测量因此不干净。所以这里按**前导 token** 解析：
+            # 取开头那段连续的数字或"不发"字样，后面不管写什么都当作理由。
+            head, reason = _split_verdict(text)
+            if head in ("no", "0", "不发", "都不发", "否", "不要"):
                 return f"no;{reason}" if reason else "no"
             if not head.isdigit():
                 return None
@@ -420,6 +511,39 @@ class BrainBridge:
 
     # ------------------------------------------------------------------ 提示词
 
+    def _enemy_card_lines(self, question: Mapping[str, str]) -> List[str]:
+        """**对手场上的卡也给卡文**——这是修出来的一个关键缺口。
+
+        背景（2026-10-08 实测）：模型对冷门系列（例如俱舍）的卡**会自信地编效果**
+        （直接问它「珠泪哀歌族型俱舍怒威族」，它答成"融合怪兽、不能通常召唤"，而卡库原文是
+        "主卡组怪兽、主要阶段从手卡自跳"）。而原来的提示词只给三类卡补了卡文——链上那张、
+        我方候选、以及本次要发的卡——**对手场上/已露出的卡只有卡名**，于是模型只能靠记忆补，
+        补出来的就是编的。合成牌组那条 A/B 之所以好看，恰恰因为对手打的是青眼白龙这种
+        "不用认识也能判断"的牌；换成真实系列（全盛俱舍）胜率就掉到 44.4%，这条缺口是首要嫌疑。
+
+        只补"对手的怪 + 魔陷 + 已见过的少数几张"，每张截断也更短：输入越长答复越慢，
+        而对手回合的等待预算只有十几秒。
+        """
+
+        ids: List[int] = []
+        for key, position in (("theirs", 0), ("their_spell", 0), ("their_seen", 0)):
+            raw = question.get(key)
+            if not raw:
+                continue
+            limit = 6 if key == "their_seen" else 10
+            ids.extend(self._ids_from(str(raw).splitlines()[:limit], position))
+        # 去过重、去掉已经在别处给过卡文的（链上/候选由调用方自己补）
+        unique: List[int] = []
+        for card_id in ids:
+            if card_id not in unique:
+                unique.append(card_id)
+        if not unique:
+            return []
+        rendered = self._card_lines(unique[:12])
+        if not rendered:
+            return []
+        return ["", "【对手场上的卡（卡文）】"] + rendered
+
     def _build_prompt(self, question: Mapping[str, str]) -> Optional[str]:
         """按问题类型组装提示词。"""
 
@@ -431,6 +555,87 @@ class BrainBridge:
         if kind == "negate_gate":
             return self._build_gate_prompt(question)
         return None
+
+    def _policy_lines(self, kind: str) -> List[str]:
+        """「判断口径」那一段——**三档的差别只在这一段**（档位含义见 `DECISION_STYLES`）。
+
+        为什么把口径做成可换的几段而不是写死：实测同一段口径在不同牌组上一正一负
+        （合成手坑牌组 +13 点、真实俱舍 -5.6/-9.4 点），"该不该保守"本身就是要按牌组调的。
+        """
+
+        common_rule = (
+            "2. 卡文条件对不上的不要选（「灰流丽」只能无效『从卡组把卡加入手卡 / 从卡组特召 / "
+            "从卡组送墓』的效果；「效果遮蒙者」只能无效『怪兽效果』且必须指对方场上的效果怪兽）"
+        )
+        if kind == "chain_choice":
+            if self._style == "conservative":
+                return [
+                    "1. 只有当这一步**明显会扩大对手优势**（检索 / 从卡组特召 / 堆墓 / 破坏我的场面）时才交；",
+                    common_rule + "；",
+                    "3. **有疑问就不交**——这张牌留到后面可能更值，宁可漏掉这一步；",
+                    "4. 第一行只写一个序号（发哪张）或 no；写 no 时同一行用分号接理由（不超过 20 字）。",
+                ]
+            if self._style == "aggressive":
+                return [
+                    "1. **能拦就拦**：只要卡文条件对得上、拦下去能打断对手的节奏，就交；",
+                    "2. **宁可早一点**：这一步看着像要开始做展开（召唤 / 特殊召唤 / 检索 / 贴场地）就压上去，"
+                    "不要等它做完；",
+                    "3. 不要为了「留到以后」而放过现在这一步——以后未必有更好的窗口；",
+                    "4. 第一行只写一个序号（发哪张）或 no；**no 只留给卡文条件明确对不上、"
+                    "或者交了也没用的场合**。",
+                ]
+            return [
+                "1. 看这一步值不值得拦：检索 / 从卡组特召 / 堆墓 / 破坏我的场面 → 拦；"
+                "只是通常召唤、盖牌、单纯铺场 → 不拦；",
+                common_rule + "；",
+                "3. 两种判断差不多时，**看我手里还剩几张阻抗**：只剩这一张就省着用，还有别的就交；",
+                "4. 第一行只写一个序号（发哪张）或 no；写 no 时同一行用分号接理由（不超过 20 字）。",
+            ]
+        if kind == "negate_gate":
+            if self._style == "conservative":
+                return [
+                    "1. 这一步放任结算会明显扩大对手优势（检索、展开、破坏我的场面）→ 交；"
+                    "只是一步无关紧要的动作 → 留着；",
+                    "2. 卡文条件对不上的不要交；",
+                    "3. **有疑问就不交**——这张牌留到后面可能更值；",
+                    "4. 第一行只写 yes 或 no；写 no 时同一行用分号接理由（不超过 20 字）。",
+                ]
+            if self._style == "aggressive":
+                return [
+                    "1. **能拦就拦**：卡文条件对得上、而且这一步是对手在做展开或找资源 → 交；",
+                    "2. 不要为了「留到以后」而放过现在这一步；",
+                    "3. 只在卡文条件明确对不上、或者交了也没用时才写 no；",
+                    "4. 第一行只写 yes 或 no；写 no 时同一行用分号接理由（不超过 20 字）。",
+                ]
+            return [
+                "1. 这一步放任结算会明显扩大对手优势（检索、展开、破坏我的场面）→ 交；"
+                "只是一步无关紧要的动作 → 留着；",
+                "2. 卡文条件对不上的不要交；",
+                "3. 拿不准时，**看这局我还能交几张**：只剩这一张就省着用，还有别的就交；",
+                "4. 第一行只写 yes 或 no；写 no 时同一行用分号接理由（不超过 20 字）。",
+            ]
+        # disable_target（"该去针对谁"）：档位在这里的含义是"优先拦现在这一下，还是拦场上最大的威胁"
+        if self._style == "conservative":
+            return [
+                "1. **优先选刚刚发效果的那一只**——拦下正在发生的这一步最稳；",
+                "2. 只有当它已经失效 / 不能被指定 / 卡文说明无效不了它时，才改选别的；",
+                "3. 卡文里写着「不受效果影响 / 不能成为效果对象」的那一只不要选，选了也是白扔一张牌；",
+                "4. 只输出序号（行首那个整数），不要输出任何其它字。",
+            ]
+        if self._style == "aggressive":
+            return [
+                "1. **优先废掉威胁最大的那一只**（永续/场地类压制、打点最高、明显的展开核心），"
+                "哪怕它这一步并没有在发效果；",
+                "2. 只有在没有明显更大的威胁时，才退而选刚刚发效果的那一只；",
+                "3. 卡文里写着「不受效果影响 / 不能成为效果对象」的那一只不要选，选了也是白扔一张牌；",
+                "4. 只输出序号（行首那个整数），不要输出任何其它字。",
+            ]
+        return [
+            "1. 选「接下来最可能靠自身效果带来优势 / 压制」的那一只——断掉它收益最大；",
+            "2. 卡文里写着「不受效果影响 / 不能成为效果对象」的那一只不要选，选了也是白扔一张牌；",
+            "3. 都差不多时，选攻击力更高、或是永续压制类（贴纸）的那一只；",
+            "4. 只输出序号（行首那个整数），不要输出任何其它字。",
+        ]
 
     def _build_chain_prompt(self, question: Mapping[str, str]) -> Optional[str]:
         """「对面发动了效果，我方能交的这几张里发哪张 / 都不发」。
@@ -449,18 +654,15 @@ class BrainBridge:
             "手上/场上的这几张里，要发哪一张来应对，还是都不发。",
             "",
             "判断口径：",
-            "1. 先看**对手这一步值不值得拦**：它在检索 / 从卡组特召 / 堆墓 / 破坏我的场面吗？",
-            "   只是一步无关紧要的动作（通常召唤、盖牌、单纯的场面铺垫）→ 都不发；",
-            "2. 要拦时**挑那张拦得住它的**：卡文条件对不上的不要选",
-            "   （例如「灰流丽」只能无效『从卡组把卡加入手卡 / 从卡组特召 / 从卡组送墓』的效果；",
-            "   「效果遮蒙者」只能无效『怪兽效果』且必须指对方场上的效果怪兽）；",
-            "3. 手里还有别的牌时**不要因为『有牌就想用』而交**——这张牌留到后面可能更值；",
-            "4. 第一行只写一个序号（发哪张），或者写 no 表示都不发；",
-            "   写 no 时同一行用分号接一句简短理由（不超过 20 字），写序号时也可以接理由。",
+            *self._policy_lines("chain_choice"),
             "",
+            "⚠ 只按我给你的卡文判断。**不要凭记忆补卡的效果**——我给的卡文才是这张卡的真实文本，"
+            "你对冷门系列的记忆经常是错的（实测会自信地把卡的效果说反）。没给卡文的卡，"
+            "就只按「它在场 / 它在链上」这个事实来判断。",
             "【当前局面】",
         ]
         lines.extend(self._digest_lines(question))
+        lines.extend(self._enemy_card_lines(question))
         chain = [line for line in str(question.get("chain", "")).splitlines() if line.strip()]
         if chain:
             lines.append("")
@@ -503,15 +705,15 @@ class BrainBridge:
             "它该指向对手场上的哪一只怪兽。",
             "",
             "判断口径：",
-            "1. 选「接下来最可能靠自身效果带来优势/压制」的那一只——断掉它收益最大；",
-            "2. 卡文里写着「效果不会被无效 / 不受效果影响 / 不能成为效果对象」的那一只不要选,",
-            "   选了也是白扔一张牌；",
-            "3. 都差不多时，选攻击力更高、或是永续压制类（贴纸）的那一只；",
-            "4. 只输出序号（从 1 开始的整数），不要输出任何其它字。",
+            *self._policy_lines("disable_target"),
             "",
+            "⚠ 只按我给你的卡文判断。**不要凭记忆补卡的效果**——我给的卡文才是这张卡的真实文本，"
+            "你对冷门系列的记忆经常是错的（实测会自信地把卡的效果说反）。没给卡文的卡，"
+            "就只按「它在场 / 它在链上」这个事实来判断。",
             "【当前局面】",
         ]
         lines.extend(self._digest_lines(question))
+        lines.extend(self._enemy_card_lines(question))
         lines.append("")
         lines.append("【我准备发动的卡】")
         lines.extend(self._card_lines(self._source_ids(question)))
@@ -546,15 +748,15 @@ class BrainBridge:
             "你是游戏王对局的决策助手，只负责一件事：现在要不要发动我手上的这张阻抗卡。",
             "",
             "判断口径：",
-            "1. 对手这一步如果放任结算，会不会明显扩大它的优势（检索、展开、破坏我的场面）？",
-            "   会 → 交；只是一步无关紧要的动作 → 留着；",
-            "2. 卡文条件对不上的（例如对手这张不检索/不从卡组特召）不要交；",
-            "3. 不要因为「手上有牌就想用」而交——这张牌留到后面可能更值；",
-            "4. 第一行只写 yes 或 no；写 no 时同一行用分号接一句简短理由（不超过 20 字）。",
+            *self._policy_lines("negate_gate"),
             "",
+            "⚠ 只按我给你的卡文判断。**不要凭记忆补卡的效果**——我给的卡文才是这张卡的真实文本，"
+            "你对冷门系列的记忆经常是错的（实测会自信地把卡的效果说反）。没给卡文的卡，"
+            "就只按「它在场 / 它在链上」这个事实来判断。",
             "【当前局面】",
         ]
         lines.extend(self._digest_lines(question))
+        lines.extend(self._enemy_card_lines(question))
         lines.append("")
         lines.append("【我准备发动的卡】")
         lines.extend(self._card_lines(self._source_ids(question)))

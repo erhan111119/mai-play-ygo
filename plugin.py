@@ -361,6 +361,18 @@ class LlmConfig(PluginConfigBase):
             "调大之前想清楚：对手回合的等待预算一共只有 15 秒"
         ),
     )
+    decision_style: str = Field(
+        default="aggressive",
+        description=(
+            "【AI 决策·档位】控制模型交阻抗的**幅度**，三档：`conservative`（保守：有疑问就不交、"
+            "留着以后）/ `normal`（平常：值得拦才拦）/ `aggressive`（激进：能拦就拦、宁可早一点）。"
+            "中英文都收（也认「保守 / 平常 / 激进」），写别的按 normal 处理并在日志里说一声。"
+            "**只改提示词，不用重编译 exe**——候选卡仍由内核给出，再激进也不会做出非法动作。"
+            "⚠ 一正一负的实测：同一份保守口径在「手坑泛滥、没有展开要保护」的合成牌组上是 +13 个点，"
+            "在真实卡组「全盛俱舍」上是 -5.6/-9.4 个点（该断就得断，保守就是亏的）"
+            "——档位要按牌组调，用 `tools/brain_ab.py` 各档各量一遍再定"
+        ),
+    )
     training_model: str = Field(
         default="",
         description=(
@@ -382,7 +394,7 @@ class LlmConfig(PluginConfigBase):
 
 
 class TrainingConfig(PluginConfigBase):
-    """训练功能（插件里的「研究台」）：推演 combo、复盘录像、预校验脚本、跑擂台 A/B。
+    """训练功能（插件里的「研究台」）：面板上就四件事——卡组互打、编写脚本、卡组迭代、复盘优化。
 
     这一节只放**开关与放东西的地方**——用哪只模型在上面的「模型」节里（`training_model`）。
     """
@@ -610,7 +622,7 @@ class DuelConfig(PluginConfigBase):
         ),
     )
     brain_negate_gate: bool = Field(
-        default=False,
+        default=True,
         description=(
             "【阻抗决策层·决策本身】是否让模型决定「对面发动效果时，我方能发的这几张里发哪张 / "
             "都不发」。`chain_choice` 那一问同时回答了「要不要发」与「该发谁的效果」；"
@@ -828,6 +840,48 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         if runner is None:
             return False
         return bool(self._run_on_plugin_loop(runner.stop()))
+
+    def schedule_deck_settings(
+        self, deck_id: int, *, in_random: Optional[bool] = None, brain_scope: Optional[str] = None
+    ) -> str:
+        """面板上改一副牌的设置（随机池开/关、AI 决策档位）。
+
+        和卡组删除/随机池一样：卡组池的 sqlite 连接建在插件的事件循环上，
+        **面板线程不能直接碰**，所以绕回循环里执行并同步等结果。
+        """
+
+        return str(
+            self._run_on_plugin_loop(
+                self._deck_settings(deck_id, in_random=in_random, brain_scope=brain_scope)
+            )
+        )
+
+    async def _deck_settings(
+        self, deck_id: int, *, in_random: Optional[bool], brain_scope: Optional[str]
+    ) -> str:
+        """真正改设置的那一步（在插件循环里跑）。"""
+
+        pool = self._deck_pool
+        if pool is None:
+            raise TrainingError("卡组池没准备好（插件正在重载？稍后再试）")
+        changed: List[str] = []
+        if in_random is not None:
+            if not pool.set_in_random(deck_id, in_random):
+                raise TrainingError(f"卡组池里没有编号 {deck_id} 的卡组")
+            changed.append(f"随机池{'开' if in_random else '关'}")
+        if brain_scope is not None:
+            # 档位在写入时就校验：读的时候认不出的值会当作"跟随全局"（老库里的历史值照旧能读），
+            # 但面板写进来的错值必须当场报出来，否则用户点了设置却什么都没改，还看不出来
+            scope = str(brain_scope).strip().lower()
+            if scope and scope not in self._BRAIN_SCOPE_SWITCHES:
+                options = "、".join(("跟随全局", *self._BRAIN_SCOPE_SWITCHES))
+                raise TrainingError(f"不认识的 AI 决策档位：{brain_scope}（可选：{options}）")
+            if not pool.set_brain_scope(deck_id, scope):
+                raise TrainingError(f"卡组池里没有编号 {deck_id} 的卡组")
+            changed.append(f"AI 决策 {scope or '跟随全局'}")
+        if self._logger is not None:
+            self._logger.info("面板改了卡组 #%s：%s", deck_id, "、".join(changed) or "（没改什么）")
+        return "已保存：" + "、".join(changed)
 
     def schedule_deck_action(
         self, action: str, deck_id: int, *, in_random: bool = False, group_id: str = ""
@@ -1249,8 +1303,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             # 起来之后再补就晚了（WindBot 一进房就开始打）。
             # 老口径的"逐步问 AI"删在这条之前（2026-10-07）；现在这条只服务阻抗时点，
             # 展开期一步都不问，见 `duel/brain_bridge.py` 与 `Game/AI/NegateDecision.cs`。
-            brain_prefix = await self._start_room_brain(stream_id)
-            config = self._build_session_config(stream_id, brain_prefix)
+            brain_prefix = await self._start_room_brain(stream_id, deck)
+            config = self._build_session_config(stream_id, brain_prefix, deck)
             session = DuelSession(
                 config,
                 group_id=group_id,
@@ -2234,6 +2288,31 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
     # 卡牌清单那份口径本身是通用工具，留在 `duel/cards.py` 的 `collect_card_info()`
     # （原来那两支 CLI——写打法数据 / 写展开流程——也一起删了，所以现在没有人调它）。
 
+    def _record_room_duel(self, stream_id: str, group_id: str, result_data: Dict[str, object]) -> None:
+        """把这一局房间对局写进训练记录（`kind=duel`），给「复盘优化」当素材。
+
+        为什么不解析录像：`.yrp` 里**只有玩家的应答，没有内核的提问**，逐动作复盘根本做不出来
+        （`tools/analyze_replay.py` 的模块头写着这条）。而这边的记录器是**活着看到全部报文**的，
+        回合数、双方动作数、召唤/特召/发动/盖放/攻击、伤害、用过的卡都在手里——
+        这比录像强得多，所以对局一结束就把它落库。
+
+        写失败只记日志：这是训练功能的素材，不该影响对局播报。
+        """
+
+        store = self._train_store
+        if store is None:
+            return
+        try:
+            title = f"房间对局：{result_data.get('deck_name') or '未知卡组'}"
+            log_dir = self._training_workspace() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-duel.log"
+            record = store.create("duel", title, {"stream_id": stream_id, "group_id": group_id}, log_path)
+            store.finish(record.run_id, "done", summary=dict(result_data))
+        except Exception:  # noqa: BLE001  记录失败不该影响播报
+            if self._logger is not None:
+                self._logger.exception("写对局记录失败（不影响播报）")
+
     async def _announce(self, stream_id: str, text: str) -> None:
         """往群里发一条消息；发不出去也只记日志。"""
 
@@ -2270,6 +2349,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             # 供 /复盘 与 review_decisions 判断干预对错）与 `_record_room_duel`（把真实房间对局
             # 写进擂台那张结果库，arena="room"）。AI 打牌 / 复盘 / 训练调优整条链路已按
             # 2026-10-07 用户口径删除，这两步连同 duel/duelrecord.py 与 train/store.py 一起去掉了。
+            # 打完就记一条：复盘优化要有"这一局到底发生了什么"才能说问题。
+            # 只有真的打完（不是没人来/超时收摊）才记。
+            if outcome == OUTCOME_FINISHED:
+                self._record_room_duel(stream_id, group_id, result_data)
             report = self._compose_result_message(outcome, summary)
             if outcome == OUTCOME_FINISHED:
                 # 打完的总结交给模型写成一段人话，再由插件直接发到群里。
@@ -2494,7 +2577,12 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
     # `_knowledge`（懒加载 knowledge.db 的知识库缓存）。2026-10-07 用户口径去掉 AI 打牌后
     # 两个方法都没有消费者了：`duel/knowledge.py` 已删，这里一并删掉。
 
-    def _build_session_config(self, stream_id: str, brain_prefix: Optional[Path] = None) -> SessionConfig:
+    def _build_session_config(
+        self,
+        stream_id: str,
+        brain_prefix: Optional[Path] = None,
+        deck: Optional[StoredDeck] = None,
+    ) -> SessionConfig:
         """把插件配置映射成会话配置。
 
         Args:
@@ -2528,8 +2616,9 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             dialog=duel.dialog,
             bot_debug=duel.bot_debug,
             brain_file=brain_prefix,
-            brain_target_choice=bool(duel.brain_enabled),
-            brain_negate_gate=bool(duel.brain_negate_gate),
+            # 决策层开哪半跟着**卡组**走（卡组页那个档位），没设过就跟随全局配置
+            brain_target_choice=self._brain_switches_for(deck)[0],
+            brain_negate_gate=self._brain_switches_for(deck)[1],
             brain_timeout_ms=int(self.config.llm.decision_timeout_ms),
             taunt_enabled=duel.taunt_enabled,
             taunt_chance_per_second=float(duel.taunt_chance_per_second),
@@ -2562,7 +2651,29 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         directory.mkdir(parents=True, exist_ok=True)
         return directory / f"room_{uuid.uuid4().hex[:12]}"
 
-    async def _start_room_brain(self, stream_id: str) -> Optional[Path]:
+    #: 卡组页那个「AI 决策档位」的取值 → 这一局开哪半决策层。
+    #: 空串（或认不出的旧值）＝跟随全局配置，行为与从前一致。
+    _BRAIN_SCOPE_SWITCHES: Dict[str, Tuple[bool, bool]] = {
+        "off": (False, False),           # 不问（只用脚本）
+        "target_only": (True, False),    # 只问"该指哪只怪"
+        "full": (True, True),            # 目标 + 要不要交，都问
+    }
+
+    def _brain_switches_for(self, deck: Optional[StoredDeck]) -> Tuple[bool, bool]:
+        """这一局的阻抗决策层开哪半：``(问目标, 问要不要交)``。
+
+        顺序是"全局配置 → 卡组自己的档位覆盖"：档位记在卡组上（面板卡组页每副牌一个设置），
+        因为实测"有的牌脚本就够、有的牌非要 AI 才动得起来"，一个全局开关满足不了两种牌。
+        """
+
+        enabled = bool(self.config.duel.brain_enabled)
+        gate = bool(self.config.duel.brain_negate_gate)
+        if deck is None:
+            return enabled, gate
+        scope = deck.brain_scope.strip().lower()
+        return self._BRAIN_SCOPE_SWITCHES.get(scope, (enabled, gate))
+
+    async def _start_room_brain(self, stream_id: str, deck: Optional[StoredDeck] = None) -> Optional[Path]:
         """起这一局的答复任务，返回问答前缀；不起时返回 None（调用方据此不起决策层）。
 
         **是 async 的、而且会在开房之前把预热走完**：预热与第一次提问撞在一起时，那条提问会
@@ -2570,8 +2681,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         预热本身最多等 ``_WARMUP_LIMIT_SECONDS``，超时就放弃（正式提问有熔断兜底）。
         """
 
-        duel = self.config.duel
-        if not (duel.brain_enabled or duel.brain_negate_gate):
+        wants_target, wants_gate = self._brain_switches_for(deck)
+        if not (wants_target or wants_gate):
             return None
         existing = self._brains.get(stream_id)
         if existing is not None:
@@ -2588,6 +2699,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             card_db=self._card_db,
             logger=self._logger,
             timeout=timeout,
+            style=self.config.llm.decision_style,
         )
         task = asyncio.create_task(bridge.run(), name=f"mai-play-ygo-brain-{stream_id}")
         self._brains[stream_id] = (bridge, task)
@@ -2606,11 +2718,12 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 )
         if self._logger is not None:
             self._logger.info(
-                "阻抗决策层已启动：前缀 %s｜目标选择 %s｜闸门 %s｜模型 %s｜等答复上限 %.1fs",
+                "阻抗决策层已启动：前缀 %s｜目标选择 %s｜闸门 %s｜模型 %s｜档位 %s｜等答复上限 %.1fs",
                 prefix,
-                "开" if duel.brain_enabled else "关",
-                "开" if duel.brain_negate_gate else "关",
+                "开" if wants_target else "关",
+                "开" if wants_gate else "关",
                 self.config.llm.decision_model.strip() or "（宿主给插件配的那只）",
+                bridge.style,
                 timeout,
             )
         return prefix

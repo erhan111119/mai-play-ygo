@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import asyncio
-import json
 import logging
 import os
 import sqlite3
@@ -28,6 +27,7 @@ import sys
 import time
 
 from .analysis import (
+    SUMMARY_MAX_TOKENS,
     AnalysisError,
     build_deck_digest,
     deck_card_ids,
@@ -43,10 +43,8 @@ from .scriptgen import (
 )
 from .store import (
     KIND_ARENA,
-    KIND_COMBO,
     KIND_ITERATE,
-    KIND_REPLAY,
-    KIND_SCRIPT,
+    KIND_REVIEW,
     KIND_TITLES,
     KIND_WRITE_SCRIPT,
     KINDS_NEEDING_QUIET,
@@ -74,8 +72,8 @@ _UNLOAD_KILL_TIMEOUT = 2.0
 #: 面板里展示给用户看的输出尾巴有多少行。
 PANEL_TAIL_LINES = 80
 
-#: 需要模型写结论的种类（combo / 写脚本 / 自动迭代的模型调用本身就是任务，不在此列）。
-KINDS_WITH_CONCLUSION = frozenset({KIND_ARENA, KIND_SCRIPT, KIND_REPLAY})
+#: 需要模型写结论的种类（写脚本 / 自动迭代的模型调用本身就是任务，不在此列）。
+KINDS_WITH_CONCLUSION = frozenset({KIND_ARENA})
 
 
 class TrainingError(RuntimeError):
@@ -165,6 +163,11 @@ class TrainingRunner:
             payload["tail"] = tail_lines(run.log_path, PANEL_TAIL_LINES)
         return payload
 
+    #: 面板上给用户挑的任务（2026-10-09 用户口径：只留这四项）。
+    #: 其余种类（combo / script / replay）降级成**内部步骤**——由这几项自己调用，
+    #: 不再让用户先想"我该跑哪个"。
+    PANEL_KINDS = (KIND_ARENA, KIND_WRITE_SCRIPT, KIND_ITERATE, KIND_REVIEW)
+
     def describe_kinds(self) -> List[Dict[str, Any]]:
         """五种任务在当前环境里能不能跑（面板据此把按钮置灰/给出原因）。
 
@@ -177,61 +180,130 @@ class TrainingRunner:
         engine_note = ""
         quiet_note = ""
         if rooms:
-            engine_note = f"现在有 {rooms} 个房间在打，擂台会抢进程与端口，等打完再开"
+            engine_note = f"现在有 {rooms} 个房间在打，打牌类的任务会抢进程与端口，等打完再开"
             quiet_note = f"现在有 {rooms} 个房间在打，它的 WindBot 占着要重编的那个 exe，等打完再写"
         source_dir, windbot_dir = self._windbot_dirs()
         script_ready = bool(source_dir) and bool(windbot_dir)
         script_note = "" if script_ready else "要配 paths.windbot_src_dir（写脚本要编译进 WindBot）"
+        no_decks = len(self._deck_choices()) < 2
         return [
             {
-                "kind": KIND_COMBO,
-                "title": KIND_TITLES[KIND_COMBO],
-                "ready": cards_ready,
-                "note": "" if cards_ready else "卡库不可用：推演要读卡文，请先配好 cards.cdb",
-                "needs_engine": False,
-                "fields": ["deck", "extra_prompt"],
+                "kind": KIND_ARENA,
+                "title": KIND_TITLES[KIND_ARENA],
+                "ready": not rooms,
+                "note": engine_note or "两副牌各自用自己的脚本对打，逐局交替座位",
+                "needs_engine": True,
+                "fields": ["opponent_deck", "duels"],
             },
             {
                 "kind": KIND_WRITE_SCRIPT,
                 "title": KIND_TITLES[KIND_WRITE_SCRIPT],
                 "ready": cards_ready and script_ready and not rooms,
-                "note": quiet_note or script_note or "读卡文+combo 写 C# 并编译（会改动 WindBot 源码树）",
+                "note": quiet_note or script_note or "读卡文写真脚本并编译，会自动先推一遍 combo",
                 "needs_engine": False,
-                "fields": ["deck", "extra_prompt", "rounds"],
+                "fields": ["rounds"],
             },
             {
                 "kind": KIND_ITERATE,
                 "title": KIND_TITLES[KIND_ITERATE],
-                "ready": cards_ready and script_ready and not rooms,
-                "note": engine_note or "combo → 写脚本 → 擂台 → 回喂下一轮（**会真打牌**，很慢）",
+                "ready": cards_ready and script_ready and not rooms and not no_decks,
+                "note": engine_note or script_note or "推演 → 写脚本 → 跟另一副牌打 → 按结果再改一轮",
                 "needs_engine": True,
-                "fields": ["deck", "extra_prompt", "rounds", "duels"],
+                "fields": ["opponent_deck", "rounds", "duels"],
             },
             {
-                "kind": KIND_ARENA,
-                "title": KIND_TITLES[KIND_ARENA],
-                "ready": not rooms,
-                "note": engine_note,
-                "needs_engine": True,
-                "fields": ["deck", "style_a", "style_b", "duels"],
-            },
-            {
-                "kind": KIND_SCRIPT,
-                "title": KIND_TITLES[KIND_SCRIPT],
+                "kind": KIND_REVIEW,
+                "title": KIND_TITLES[KIND_REVIEW],
                 "ready": True,
-                "note": "静态体检，不打牌",
+                "note": "读这副牌最近打过的对局记录，指出具体该改哪里（不动文件）",
                 "needs_engine": False,
-                "fields": ["style", "deck_ids", "group"],
-            },
-            {
-                "kind": KIND_REPLAY,
-                "title": KIND_TITLES[KIND_REPLAY],
-                "ready": True,
-                "note": "只读录像文件，不打牌",
-                "needs_engine": False,
-                "fields": ["latest", "deck"],
+                "fields": ["latest"],
             },
         ]
+
+    def _deck_choices(self) -> List[Dict[str, Any]]:
+        """面板上"选卡组/选对手"要的那份清单（编号 + 名字 + 它自己的脚本）。"""
+
+        if not self.deck_db_path.exists():
+            return []
+        import sqlite3 as _sqlite3
+
+        connection = _sqlite3.connect(f"file:{self.deck_db_path}?mode=ro", uri=True)
+        try:
+            connection.row_factory = _sqlite3.Row
+            rows = connection.execute(
+                "SELECT deck_id, group_id, display_name, generated_script, picked_style,"
+                " brain_scope, in_random FROM decks ORDER BY deck_id"
+            ).fetchall()
+        except _sqlite3.Error:
+            return []
+        finally:
+            connection.close()
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            result.append(
+                {
+                    "deck_id": int(row["deck_id"]),
+                    "group_id": str(row["group_id"] or ""),
+                    "name": str(row["display_name"] or ""),
+                    "script": str(row["generated_script"] or row["picked_style"] or ""),
+                    "brain_scope": str(row["brain_scope"] or ""),
+                    "in_random": bool(row["in_random"]),
+                    "is_builtin": str(row["group_id"] or "") == "__builtin__",
+                }
+            )
+        return result
+
+    def _resolve_matchup(self, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """解析"哪两副牌对打"：A 是被迭代/主看的那副，B 是对手。
+
+        两副牌各自带**自己那份脚本**（一个卡组只有一个脚本，这是用户 2026-10-09 的口径）：
+        所以面板上选的是"另一副卡组"，不是"另一个脚本名"。
+        """
+
+        deck_a = self._deck_info(params.get("deck_id"), params.get("deck_file"))
+        opponent_id = params.get("opponent_deck_id")
+        if opponent_id in (None, ""):
+            raise TrainingError("要选一副**对手卡组**（跟谁打）")
+        deck_b = self._deck_info(opponent_id, None)
+        if deck_a["deck_id"] and deck_a["deck_id"] == deck_b["deck_id"]:
+            raise TrainingError("两边选的是同一副卡组：那样比的是运气，不是牌组强弱")
+        for label, deck in (("主卡组", deck_a), ("对手卡组", deck_b)):
+            if not deck["style"]:
+                raise TrainingError(
+                    f"{label}「{deck['name']}」还没有出牌脚本：先给它写一份（训练台的「编写脚本」），"
+                    "或者把它指定给 WindBot 自带的风格名"
+                )
+        return deck_a, deck_b
+
+    def _deck_info(self, deck_id: Any, deck_file: Any) -> Dict[str, Any]:
+        """取一副牌的"能开打"信息：编号、名字、卡表路径、它自己的脚本名。"""
+
+        if deck_file:
+            path = Path(str(deck_file))
+            if not path.is_file():
+                raise TrainingError(f"找不到卡表文件：{path}")
+            return {"deck_id": 0, "name": path.stem, "ydk_path": path, "style": GENERIC_STYLE_NAME}
+        if deck_id in (None, ""):
+            raise TrainingError("要选一副卡组")
+        row = self._deck_row(int(deck_id))
+        if row is None:
+            raise TrainingError(f"卡组池里没有编号 {deck_id} 的卡组")
+        keys = set(row.keys())
+        script = ""
+        for key in ("generated_script", "picked_style", "windbot_deck"):
+            if key in keys and str(row[key] or "").strip():
+                script = str(row[key]).strip()
+                break
+        path = Path(str(row["ydk_path"]))
+        if not path.is_file():
+            raise TrainingError(f"卡组 {deck_id} 的卡表文件不见了：{path}")
+        return {
+            "deck_id": int(deck_id),
+            "name": str(row["display_name"] or path.stem),
+            "ydk_path": path,
+            "style": script,
+        }
 
     # ---- 起任务 ----
 
@@ -255,8 +327,11 @@ class TrainingRunner:
                 "ygopro + WindBot，抢进程与端口会把真人那局打坏。等这局结束再来"
             )
 
-        if kind not in KIND_TITLES:
-            raise TrainingError(f"不认识的训练种类：{kind}")
+        if kind not in self.PANEL_KINDS:
+            raise TrainingError(
+                f"这个训练种类不对外开放：{kind}"
+                f"（面板上能起的是：{'、'.join(KIND_TITLES[k] for k in self.PANEL_KINDS)}）"
+            )
         if self.busy:
             active = self.store.get(self._run_id)
             label = f"{active.kind_title}（{self._run_id}）" if active else self._run_id
@@ -323,15 +398,8 @@ class TrainingRunner:
     def _plan(self, kind: str, params: Dict[str, Any]) -> Tuple[List[str], str, Dict[str, Any]]:
         """把 ``(种类, 参数)`` 翻译成 ``(命令行, 标题, 落到记录里的参数)``。
 
-        不需要子进程的种类返回空命令行（combo 推演只问模型）。
+        不需要子进程的种类返回空命令行（写脚本与迭代都是"只问模型 + 写文件"）。
         """
-
-        if kind == KIND_COMBO:
-            deck_name, ydk_path, deck_id = self._resolve_deck(params)
-            resolved = {"deck_id": deck_id, "deck_name": deck_name, "deck_file": str(ydk_path)}
-            if str(params.get("extra_prompt") or "").strip():
-                resolved["extra_prompt"] = str(params["extra_prompt"]).strip()[:2000]
-            return [], f"{KIND_TITLES[kind]}：{deck_name}", resolved
 
         if kind == KIND_WRITE_SCRIPT:
             deck_name, ydk_path, deck_id = self._resolve_deck(params)
@@ -344,98 +412,78 @@ class TrainingRunner:
             return [], f"{KIND_TITLES[kind]}：{deck_name}", resolved
 
         if kind == KIND_ITERATE:
-            deck_name, ydk_path, deck_id = self._resolve_deck(params)
+            deck = self._deck_info(params.get("deck_id"), params.get("deck_file"))
+            opponent = self._deck_info(params.get("opponent_deck_id"), None)
+            if deck["deck_id"] and deck["deck_id"] == opponent["deck_id"]:
+                raise TrainingError("主卡组与对手卡组是同一副：迭代要有对手才能量出强弱")
             self._require_windbot_tree()
             duels = int(params.get("duels") or 20)
             duels = max(2, min(duels, self.max_duels))
             duels -= duels % 2
             rounds = max(1, min(int(params.get("rounds") or 2), 5))
             resolved = {
-                "deck_id": deck_id,
-                "deck_name": deck_name,
-                "deck_file": str(ydk_path),
+                "deck_id": deck["deck_id"],
+                "deck_name": deck["name"],
+                "deck_file": str(deck["ydk_path"]),
+                "opponent_deck_id": opponent["deck_id"],
+                "opponent_name": opponent["name"],
+                "opponent_deck_file": str(opponent["ydk_path"]),
+                "opponent_style": opponent["style"],
                 "rounds": rounds,
                 "duels": duels,
             }
             if str(params.get("extra_prompt") or "").strip():
                 resolved["extra_prompt"] = str(params["extra_prompt"]).strip()[:2000]
-            return [], f"{KIND_TITLES[kind]}：{deck_name}（{rounds} 轮 × {duels} 局）", resolved
+            title = f"{KIND_TITLES[kind]}：{deck['name']}（{rounds} 轮 × {duels} 局 vs {opponent['name']}）"
+            return [], title, resolved
+
+        if kind == KIND_REVIEW:
+            deck = self._deck_info(params.get("deck_id"), params.get("deck_file"))
+            self._require_script_deck(deck)
+            latest = max(1, min(int(params.get("latest") or 3), 20))
+            resolved = {
+                "deck_id": deck["deck_id"],
+                "deck_name": deck["name"],
+                "deck_file": str(deck["ydk_path"]),
+                "style": deck["style"],
+                "latest": latest,
+            }
+            if str(params.get("extra_prompt") or "").strip():
+                resolved["extra_prompt"] = str(params["extra_prompt"]).strip()[:2000]
+            return [], f"{KIND_TITLES[kind]}：{deck['name']}（最近 {latest} 局）", resolved
 
         if kind == KIND_ARENA:
-            deck_name, ydk_path, deck_id = self._resolve_deck(params)
-            style_a = str(params.get("style_a") or "").strip()
-            style_b = str(params.get("style_b") or "").strip()
-            if not style_a or not style_b:
-                raise TrainingError("擂台要给两个出牌脚本名（style_a / style_b）")
-            if style_a == style_b:
-                raise TrainingError("两边的脚本名一样，打出来的是同一份脚本，比不出东西")
+            deck_a, deck_b = self._resolve_matchup(params)
             duels = int(params.get("duels") or 60)
             # 座位逐局交替：奇数局会让两边坐的次数不一样，取偶数局保证两边坐上/下家一样多
             duels = max(2, min(duels, self.max_duels))
             duels -= duels % 2
             resolved = {
-                "deck_id": deck_id,
-                "deck_name": deck_name,
-                "deck_file": str(ydk_path),
-                "style_a": style_a,
-                "style_b": style_b,
+                "deck_id": deck_a["deck_id"],
+                "deck_name": deck_a["name"],
+                "deck_file": str(deck_a["ydk_path"]),
+                "opponent_deck_id": deck_b["deck_id"],
+                "opponent_name": deck_b["name"],
+                "opponent_deck_file": str(deck_b["ydk_path"]),
+                "style_a": deck_a["style"],
+                "style_b": deck_b["style"],
                 "duels": duels,
             }
             argv = [
                 str(self.tools_dir / "style_ab.py"),
                 "--deck-file",
-                str(ydk_path),
+                str(deck_a["ydk_path"]),
+                "--deck-file-b",
+                str(deck_b["ydk_path"]),
                 "--style-a",
-                style_a,
+                deck_a["style"],
                 "--style-b",
-                style_b,
+                deck_b["style"],
                 "--duels",
                 str(duels),
             ]
-            return argv, f"{KIND_TITLES[kind]}：{style_a} vs {style_b}（{duels} 局）", resolved
-
-        if kind == KIND_SCRIPT:
-            style = str(params.get("style") or "").strip()
-            group = str(params.get("group") or "").strip()
-            deck_ids = _as_int_list(params.get("deck_ids"))
-            argv = [str(self.tools_dir / "check_card_coverage.py")]
-            resolved: Dict[str, Any] = {}
-            if style:
-                argv += ["--style", style]
-                resolved["style"] = style
-            elif deck_ids:
-                for deck_id in deck_ids:
-                    argv += ["--deck-id", str(deck_id)]
-                resolved["deck_ids"] = deck_ids
-            elif group:
-                argv += ["--group", group]
-                resolved["group"] = group
-            else:
-                raise TrainingError(
-                    "脚本预校验要么给出牌脚本名（style），要么给卡组编号（deck_ids），要么给群号（group）"
-                )
-            argv += ["--data-dir", str(self._data_dir_of_deck_db()), "--cards-cdb", str(self._cards_cdb())]
-            label = style or group or "、".join(str(item) for item in deck_ids)
-            return argv, f"{KIND_TITLES[kind]}：{label}", resolved
-
-        if kind == KIND_REPLAY:
-            latest = max(1, min(int(params.get("latest") or 5), 50))
-            argv = [
-                str(self.tools_dir / "analyze_replay.py"),
-                "--latest",
-                str(latest),
-                "--export-dir",
-                str(self.export_dir),
-            ]
-            resolved = {"latest": latest}
-            if params.get("deck_id"):
-                compare = int(params["deck_id"])
-                argv += ["--compare", str(compare)]
-                resolved["compare"] = compare
-            cards_cdb = self._cards_cdb()
-            if cards_cdb:
-                argv += ["--cards-cdb", cards_cdb]
-            return argv, f"{KIND_TITLES[kind]}：最近 {latest} 份", resolved
+            title = f"{KIND_TITLES[kind]}：{deck_a['name']} vs {deck_b['name']}（{duels} 局）"
+            return argv, title, resolved
 
         raise TrainingError(f"不认识的训练种类：{kind}")
 
@@ -445,12 +493,12 @@ class TrainingRunner:
         """跑一个任务并把结果写进记录库。"""
 
         try:
-            if run.kind == KIND_COMBO:
-                await self._run_combo(run, params)
-            elif run.kind == KIND_WRITE_SCRIPT:
+            if run.kind == KIND_WRITE_SCRIPT:
                 await self._run_write_script(run, params)
             elif run.kind == KIND_ITERATE:
                 await self._run_iterate(run, params)
+            elif run.kind == KIND_REVIEW:
+                await self._run_review(run, params)
             elif argv:
                 await self._run_process(run, argv, params)
             else:
@@ -466,54 +514,6 @@ class TrainingRunner:
             if self.logger is not None:
                 self.logger.exception("训练任务异常：%s", run.run_id)
             self.store.finish(run.run_id, STATUS_FAILED, error=f"{type(exc).__name__}: {exc}")
-
-    async def _run_combo(self, run: TrainingRun, params: Dict[str, Any]) -> None:
-        """combo 推演：读卡表 → 问模型 → 落盘。"""
-
-        ydk_path = Path(str(params["deck_file"]))
-        deck = _read_ydk(ydk_path)
-        if not deck.main:
-            raise TrainingError(f"从 {ydk_path} 里没读到主卡组，请检查这份 .ydk")
-        card_db = self._card_db()
-        card_ids = deck_card_ids(deck.main, deck.extra, deck.side)
-        digest, known_names, warnings = build_deck_digest(
-            str(params["deck_name"]),
-            card_ids,
-            card_db,
-            group_counts={"主卡组": len(deck.main), "额外卡组": len(deck.extra)},
-        )
-        result = await derive_combo(
-            self._generate,
-            deck_name=str(params["deck_name"]),
-            digest=digest,
-            known_names=known_names,
-            model=str(self._model_name()),
-            extra_prompt=str(params.get("extra_prompt") or ""),
-            logger=self.logger,
-        )
-        warnings.extend(result.warnings)
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        stem = _safe_stem(f"{params.get('deck_id') or 'deck'}-{params['deck_name']}")
-        guide_path = self.combo_dir / f"{stamp}-{stem}.txt"
-        guide_path.write_text(result.text(), encoding="utf-8")
-        (self.combo_dir / f"{stamp}-{stem}.json").write_text(
-            _dump_json(result.guide), encoding="utf-8"
-        )
-        self.store.finish(
-            run.run_id,
-            STATUS_DONE,
-            summary={
-                "deck_name": params["deck_name"],
-                "cards": len(card_ids),
-                "lines": len(result.guide.get("lines") or []),
-                "uncertain": len(result.guide.get("uncertain") or []),
-                "warnings": warnings,
-                "guide_path": str(guide_path),
-                "model": result.model or "（宿主给插件配的那只）",
-            },
-        )
-        if self.logger is not None:
-            self.logger.info("combo 推演已存档：%s", guide_path)
 
     async def _run_process(self, run: TrainingRun, argv: List[str], params: Dict[str, Any]) -> None:
         """起子进程跑一个工具，然后把结论交给模型写。"""
@@ -549,6 +549,15 @@ class TrainingRunner:
         self.store.finish(run.run_id, status, summary=summary, error=error, exit_code=exit_code)
 
     # ---------------------------------------------------------------- 写脚本 / 自动迭代
+
+    @staticmethod
+    def _require_script_deck(deck: Dict[str, Any]) -> None:
+        """这副牌得有自己的脚本，否则"优化"无从谈起。"""
+
+        if not deck.get("style"):
+            raise TrainingError(
+                f"「{deck['name']}」还没有出牌脚本：先用「编写脚本」写一份再来复盘"
+            )
 
     def _require_windbot_tree(self) -> Tuple[Path, Path]:
         """取 WindBot 源码树与运行目录；没配就明确报错（不做假成功）。"""
@@ -598,9 +607,14 @@ class TrainingRunner:
         return await self._generate(prompt, str(self._model_name()), 4096)
 
     async def _run_write_script(self, run: TrainingRun, params: Dict[str, Any]) -> None:
-        """写脚本：模型写 C# → 编译 → 把"这副牌该用哪个脚本"写回卡组池。"""
+        """写脚本：**先推一遍 combo**，再让模型照它写 C# → 编译 → 把脚本名写回卡组池。
 
-        guide = self._load_latest_combo(int(params.get("deck_id") or 0), str(params["deck_name"]))
+        推演放在这一步里面（而不是让用户先跑一次"推演 combo"）：用户口径是"一件事一句话"，
+        而推演只是写脚本的中间材料——它自己会存档，想看得去 `train/combos/`，
+        不必先在面板上跑一次。
+        """
+
+        guide = await self._derive_combo_for(params)
         script = await self._generate_script(params, combo_guide=guide)
         if self._record_script is not None:
             # 不写回池子的话，刚写好的脚本不会被对局用上——那就白写了
@@ -624,6 +638,26 @@ class TrainingRunner:
                 script.attempts,
                 script.file_path,
             )
+
+    async def _derive_combo_for(self, params: Dict[str, Any]) -> str:
+        """给这副牌推一遍 combo，存档并返回正文（写脚本 / 迭代共用）。"""
+
+        result = await derive_combo(
+            self._generate,
+            deck_name=str(params["deck_name"]),
+            digest=self._deck_digest(params),
+            known_names=self._known_names(params),
+            model=str(self._model_name()),
+            extra_prompt=str(params.get("extra_prompt") or ""),
+            logger=self.logger,
+        )
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        deck_id = int(params.get("deck_id") or 0)
+        path = self.combo_dir / f"{stamp}-{deck_id}-{_safe_stem(str(params['deck_name']))}.txt"
+        path.write_text(result.text(), encoding="utf-8")
+        if self.logger is not None:
+            self.logger.info("combo 推演已存档：%s", path)
+        return result.text()
 
     def _load_latest_combo(self, deck_id: int, deck_name: str) -> str:
         """取这副牌最近一份 combo 推演（没有就空串：脚本退化成"只按卡文写"）。"""
@@ -652,13 +686,15 @@ class TrainingRunner:
            这就是"复盘找问题再优化"的自动化版本。
 
         局数刻意给得小（默认 20）：这个循环的价值在于"快速试错"，判定强弱要 ≥80 局/腿，
-        那是循环结束后单独跑擂台的事（面板上「擂台 A/B」就是干这个的）。
+        那是循环结束后单独跑擂台的事（面板上「卡组互打」就是干这个的）。
         """
 
         deck_id = int(params.get("deck_id") or 0)
         rounds = int(params.get("rounds") or 2)
         duels = int(params.get("duels") or 20)
-        baseline = self._baseline_style(deck_id, params)
+        opponent_file = str(params.get("opponent_deck_file") or "")
+        opponent_name = str(params.get("opponent_name") or "对手")
+        baseline = str(params.get("opponent_style") or "") or GENERIC_STYLE_NAME
         log_path = Path(run.log_path)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         history: List[Dict[str, Any]] = []
@@ -673,7 +709,10 @@ class TrainingRunner:
             if self.logger is not None:
                 self.logger.info("[自动迭代 %s] %s", run.run_id, text)
 
-        note(f"开始自动迭代：{params['deck_name']}，{rounds} 轮 × {duels} 局/轮，基线脚本 {baseline}")
+        note(
+            f"开始迭代：{params['deck_name']}，{rounds} 轮 × {duels} 局/轮，"
+            f"对手「{opponent_name}」（脚本 {baseline}）"
+        )
         for index in range(1, rounds + 1):
             if self._stopping:
                 break
@@ -707,6 +746,8 @@ class TrainingRunner:
                 str(self.tools_dir / "style_ab.py"),
                 "--deck-file",
                 str(params["deck_file"]),
+                "--deck-file-b",
+                opponent_file or str(params["deck_file"]),
                 "--style-a",
                 script.style_name,
                 "--style-b",
@@ -762,6 +803,81 @@ class TrainingRunner:
                 "log_path": str(log_path),
             },
         )
+
+    async def _run_review(self, run: TrainingRun, params: Dict[str, Any]) -> None:
+        """复盘优化：读这副牌**最近打过的几局**，让模型指出具体该改哪里。
+
+        素材是插件自己在每局结束时写下的记录（`kind=duel`）——那里面有记录器活着看到的
+        回合数、双方动作数、召唤/特召/发动/盖放/攻击、伤害、用过的卡。**不用录像**：
+        `.yrp` 只有玩家的应答、没有内核的提问，逐动作复盘做不出来（`tools/analyze_replay.py`
+        的模块头写着这条限制）。
+
+        产出是一份"改哪儿"的清单，**不动任何文件**：改脚本是「编写脚本」那一步的事，
+        让复盘自己去改代码就等于把"看"和"改"混在一起，出了问题说不清是哪一步坏的。
+        """
+
+        deck_id = int(params.get("deck_id") or 0)
+        latest = int(params.get("latest") or 3)
+        records = self._recent_duels(deck_id, latest)
+        if not records:
+            raise TrainingError(
+                f"还没有「{params['deck_name']}」的对局记录：先在群里跟它打几局（每局打完会自动记下来），再来复盘"
+            )
+        material = "\n\n".join(_duel_brief(index + 1, record) for index, record in enumerate(records))
+        prompt = _REVIEW_PROMPT.format(
+            deck=params["deck_name"],
+            style=params.get("style") or "（未设置）",
+            count=len(records),
+            material=material[:12000],
+            extra=str(params.get("extra_prompt") or "").strip()[:1500],
+        )
+        try:
+            text = await self._generate(prompt, str(self._model_name()), SUMMARY_MAX_TOKENS)
+        except Exception as exc:  # noqa: BLE001  模型那层失败就是这次复盘失败，如实报
+            raise AnalysisError(f"调用模型失败：{exc}") from exc
+        answer = str(text or "").strip()
+        if not answer:
+            raise AnalysisError("模型返回了空内容（额度被思考吃光，或那只模型不能用）")
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target = self.workspace / "reviews"
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / f"{stamp}-{deck_id}-{_safe_stem(params['deck_name'])}.txt"
+        head = (
+            f"# {params['deck_name']}（脚本 {params.get('style') or '未设置'}）复盘\n"
+            f"# 依据：最近 {len(records)} 局房间对局记录\n\n"
+        )
+        path.write_text(head + answer + "\n", encoding="utf-8")
+        self.store.finish(
+            run.run_id,
+            STATUS_DONE,
+            summary={
+                "deck_name": params["deck_name"],
+                "style_name": params.get("style") or "",
+                "duels": len(records),
+                "conclusion": answer[:4000],
+                "review_path": str(path),
+            },
+        )
+        if self.logger is not None:
+            self.logger.info("复盘优化已存档：%s", path)
+
+    def _recent_duels(self, deck_id: int, latest: int) -> List[Any]:
+        """这副牌最近的房间对局记录（新的在前）。"""
+
+        try:
+            runs = self.store.list_recent(limit=200, kind="duel")
+        except Exception:  # noqa: BLE001  库读不动就当没有记录
+            return []
+        picked: List[Any] = []
+        for record in runs:
+            params = record.params or {}
+            if str(params.get("deck_id") or "") != str(deck_id):
+                continue
+            picked.append(record)
+            if len(picked) >= latest:
+                break
+        return picked
 
     def _baseline_style(self, deck_id: int, params: Dict[str, Any]) -> str:
         """这一轮迭代的对照脚本：卡组池里现在记着的那份（没有就用通用脚本）。"""
@@ -944,6 +1060,58 @@ class TrainingRunner:
 # ---------------------------------------------------------------------------
 
 
+#: 复盘优化的提示词。**要求它说"改哪一行/哪条规则"**，不接受"多练习"这种废话；
+#: 也不许它编卡（素材里出现了哪些卡就是哪些卡）。
+_REVIEW_PROMPT = """你在帮一副游戏王卡组做复盘。下面是它最近打过的对局记录（记录器在对局里
+实时看到的：回合、双方动作数、召唤/特召/发动/盖放/攻击、伤害、双方用过的卡）。
+
+这副牌：{deck}
+它当前的出牌脚本：{style}
+依据：最近 {count} 局房间对局记录
+{extra}
+
+要求：
+1. **只根据上面的事实说话**，不要猜没写出来的东西；
+2. 指出**具体**问题：例如"第 2 回合有 3 张手牌却只盖了 1 张""整局没发动过 XX""对手只剩 800 血
+   时没有进战阶"；说不清就别写；
+3. 每条问题要给出**可执行**的改法：改哪张卡的规则、加什么前提、优先做哪一步；
+4. 最后给一句"下一版脚本的重点"，不超过 30 字；
+5. 输出用中文小标题 + 短句，不要长篇大论。
+
+对局记录：
+{material}
+"""
+
+
+def _duel_brief(index: int, record: Any) -> str:
+    """把一条对局记录压成几行事实（给复盘提示词用）。"""
+
+    summary = dict(getattr(record, "summary", {}) or {})
+    params = dict(getattr(record, "params", {}) or {})
+    lines = [
+        f"第 {index} 局（{getattr(record, 'started_at', '') or ''}）："
+        f"{'我方赢' if summary.get('winner_is_self') else '我方输' if summary.get('winner_is_self') is False else '未判定'}"
+        f"｜回合 {summary.get('turns', '?')}"
+    ]
+    for label, key in (("我方", "self"), ("对手", "opponent")):
+        stats = summary.get(key)
+        if isinstance(stats, dict):
+            lines.append(
+                f"  {label}：召唤 {stats.get('normal_summons', 0)}"
+                f"｜特召 {stats.get('sp_summons', 0)}｜发动 {stats.get('effects', 0)}"
+                f"｜盖放 {stats.get('sets', 0)}｜攻击 {stats.get('attacks', 0)}"
+                f"｜造成伤害 {stats.get('damage_dealt', 0)}｜受到伤害 {stats.get('damage_taken', 0)}"
+                f"｜剩 LP {stats.get('lp_final', '?')}"
+            )
+    usage = summary.get("card_usage") or {}
+    if isinstance(usage, dict) and usage:
+        top = sorted(usage.items(), key=lambda pair: -int(pair[1] or 0))[:8]
+        lines.append("  用过的卡：" + "、".join(f"{card}×{count}" for card, count in top))
+    if params.get("deck_name"):
+        lines.append(f"  （这一局机器人用的是「{params['deck_name']}」）")
+    return "\n".join(lines)
+
+
 def kill_tree_command(pid: int) -> List[str]:
     """返回"连子孙一起杀"的命令；平台没有这个语义时返回空列表。
 
@@ -1010,38 +1178,9 @@ def _read_ydk(path: Path) -> Any:
         raise TrainingError(f"{path} 不是能识别的卡组格式：{exc}") from exc
 
 
-def _as_int_list(raw: Any) -> List[int]:
-    """把 ``"1,2,3"`` / ``[1,2,3]`` 之类的输入读成整数列表（读不出来的项直接跳过并报错）。"""
-
-    if raw in (None, ""):
-        return []
-    items: List[Any]
-    if isinstance(raw, str):
-        items = [part for part in raw.replace("，", ",").split(",") if part.strip()]
-    elif isinstance(raw, (list, tuple)):
-        items = list(raw)
-    else:
-        items = [raw]
-    values: List[int] = []
-    for item in items:
-        text = str(item).strip()
-        if not text:
-            continue
-        if not text.lstrip("-").isdigit():
-            raise TrainingError(f"卡组编号只能是数字，读到的是 {text!r}")
-        values.append(int(text))
-    return values
-
-
 def _safe_stem(text: str) -> str:
     """把卡组名转成文件名安全的一段（中文保留，只把 Windows 不认的字符换掉）。"""
 
     cleaned = "".join("_" if char in '\\/:*?"<>|' else char for char in str(text))
     cleaned = cleaned.strip().strip(".")
     return cleaned[:60] or "deck"
-
-
-def _dump_json(payload: Any) -> str:
-    """按 UTF-8 中文可读的方式导出 JSON。"""
-
-    return json.dumps(payload, ensure_ascii=False, indent=2)

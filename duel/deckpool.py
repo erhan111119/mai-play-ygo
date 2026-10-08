@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS decks (
     generated_script TEXT NOT NULL DEFAULT '',
     picked_style TEXT NOT NULL DEFAULT '',
     in_random INTEGER NOT NULL DEFAULT 1,
+    brain_scope TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_decks_group ON decks (group_id);
@@ -67,11 +68,12 @@ CREATE TABLE IF NOT EXISTS settings (
 
 
 # 读取时必须显式列出列名：老库是用 ALTER TABLE 补的列，物理列序与新库不同，
-# 用 SELECT * 按位置取值会读串（这个坑被迁移测试抓到过）
+# 用 SELECT * 按位置取值会读串（这个坑被迁移测试抓到过）。
+# ⚠ 这份顺序必须与 `_row_to_deck` 的下标一一对应（brain_scope 在最后）。
 _DECK_COLUMNS = (
     "deck_id, group_id, display_name, contributor_id, contributor_name, ydk_path, "
     "source_format, main_count, extra_count, side_count, windbot_deck, generated_script, "
-    "picked_style, in_random, created_at"
+    "picked_style, in_random, created_at, brain_scope"
 )
 
 # 内置卡组统一挂在这个保留群号下，对每个群都可见
@@ -126,6 +128,12 @@ class StoredDeck:
     """
     in_random: bool = True
     created_at: float = 0.0
+    brain_scope: str = ""
+    """这副牌的 AI 决策档位：``""`` 跟随全局配置，``off`` / ``target_only`` / ``full`` 覆盖它。
+
+    档位挂在卡组上（卡组页每副牌一个设置），取值到"开哪半决策层"的映射在
+    ``plugin.py`` 的 ``_BRAIN_SCOPE_SWITCHES``。
+    """
 
     @property
     def is_builtin(self) -> bool:
@@ -247,6 +255,7 @@ class DeckPool:
             generated_script="",
             in_random=False,
             created_at=time.time(),
+            brain_scope="",
         )
 
     def list_decks(self, group_id: str) -> List[StoredDeck]:
@@ -312,9 +321,25 @@ class DeckPool:
         self._connection.commit()
         return cursor.rowcount > 0
 
-    # ⚠ 这里原来有 `set_brain_scope`（按卡组写"问 AI 档位"）。AI 打牌（逐步问 AI / 出牌模式）
-    # 已按 2026-10-07 用户口径删除，没有调用方了，方法删掉；表里的 `brain_scope` 列与
-    # `StoredDeck.brain_scope` 字段**照旧保留**（不动表结构、不做迁移，老库读得出来）。
+    def set_brain_scope(self, deck_id: int, scope: Optional[str]) -> bool:
+        """按卡组写「AI 决策档位」，返回是否真的改到了东西。
+
+        2026-10-09 用户口径：档位记在**卡组**上（面板卡组页每副牌一个设置）——
+        一个全局开关满足不了"有的牌脚本就够、有的牌非要 AI 才动得起来"。
+
+        取值（与面板上那两个控件一一对应）：``""`` 跟随全局（默认）、``off`` 不问、
+        ``target_only`` 只问"该指哪只怪"（阻抗层的目标选择）、``full`` 目标 + 要不要交都问。
+        认不出的值**原样存进去、对局时按"跟随全局"处理**：老库里可能存着当年那套
+        `all` / `high_stakes` / `interrupt_only` 的旧口径，不该因为它让插件报错。
+        """
+
+        cursor = self._connection.execute(
+            "UPDATE decks SET brain_scope = ? WHERE deck_id = ?",
+            (str(scope or ""), int(deck_id)),
+        )
+        self._connection.commit()
+        return cursor.rowcount > 0
+
     def seed_builtin_decks(self, entries: List[Tuple[str, str, Path]]) -> Tuple[int, int]:
         """把 WindBot 自带卡组登记进池子（幂等）。
 
@@ -424,9 +449,16 @@ class DeckPool:
             self._connection.execute(
                 "ALTER TABLE decks ADD COLUMN in_random INTEGER NOT NULL DEFAULT 1"
             )
-        # ⚠ 老库里可能还留着 `playbook` / `brain_scope` 两列（AI 打牌与打法数据已按
-        # 2026-10-07 用户口径删除，这两个功能没了）。列留着不影响读：读取时是显式列名，
-        # 多的列没人碰；新库干脆不建这两列。
+        if "brain_scope" not in columns:
+            # 这副牌开不开 AI 决策、开到哪一档（见 plugin.py 的 `_BRAIN_SCOPE_SWITCHES`）。
+            # ⚠ 这一列必须保证存在：卡组面板与训练面板都要读它，而读的时候写的是
+            # `SELECT ... brain_scope ...`——列不存在会抛 sqlite3.Error，
+            # 上层按"查询失败就当没有卡组"处理，于是面板静默变成一副牌都没有。
+            self._connection.execute(
+                "ALTER TABLE decks ADD COLUMN brain_scope TEXT NOT NULL DEFAULT ''"
+            )
+        # ⚠ 老库里可能还留着 `playbook` 列（打法数据已按 2026-10-07 用户口径删除）。
+        # 列留着不影响读：读取时是显式列名，多的列没人碰；新库不建这一列。
 
     def _migrate_fixed_deck(self) -> None:
         """把老库里的「按群固定卡组」搬成全局固定值。
@@ -628,4 +660,5 @@ class DeckPool:
             picked_style=str(row[12] or ""),
             in_random=bool(row[13]),
             created_at=float(row[14]),  # type: ignore[arg-type]
+            brain_scope=str(row[15] or ""),
         )

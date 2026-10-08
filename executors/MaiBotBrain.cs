@@ -99,6 +99,175 @@ namespace WindBot.Game.AI
             get { return _tripped; }
         }
 
+        /// <summary>`AskChainChoice` 的"我不发表意见，交给脚本"返回值。</summary>
+        public static readonly int NoOpinion = int.MinValue;
+
+        /// <summary>这一卡号是不是被决策层在**当前这次链上提问**里否决了。</summary>
+        private static readonly List<int> _chainVetoedIds = new List<int>();
+
+        /// <summary>
+        /// 是否正处在一次链上提问的裁决过程中。
+        ///
+        /// ⚠ 这个开关是修出来的：第一版只靠 `_chainVetoedIds` 的内容来判断，而那个表**只在
+        /// `AskChainChoice` 里清空**——可是 `ShouldExecute` 在别的提问里（例如"这张效果要不要发动"）
+        /// 也会被调用，于是上一次链上的否决残留下来，把后面的卡全挡掉了。
+        /// 现象很隐蔽：真机一局的提问数从 37 次掉到 2 次（`Guard` 根本跑不到），决策层看起来"更省事"，
+        /// 实际是被自己的残留状态掐住了。所以否决**必须绑定在"当前这一次提问"上**。
+        /// </summary>
+        private static bool _inChainPrompt;
+
+        /// <summary>`GameAI.OnSelectChain` 进入时调：清空否决表并打开开关。</summary>
+        public static void BeginChainPrompt()
+        {
+            _chainVetoedIds.Clear();
+            _inChainPrompt = true;
+        }
+
+        /// <summary>`GameAI.OnSelectChain` 退出时调（含提前 return，用 finally 保证）。</summary>
+        public static void EndChainPrompt()
+        {
+            _inChainPrompt = false;
+        }
+
+        /// <summary>这张卡是不是被决策层在这一问里否决了（`GameAI.ShouldExecute` 每张都会问一次）。</summary>
+        public static bool IsChainVetoed(ClientCard card)
+        {
+            if (!_inChainPrompt || _chainVetoedIds.Count == 0 || card == null)
+                return false;
+            return _chainVetoedIds.Contains(card.Id);
+        }
+
+        /// <summary>
+        /// **对面发动效果带来的时点**：问模型"我方这几张里发哪张 / 都不发"。
+        ///
+        /// 这是决策层的第二问（第一问是"要不要交"，第三问是"该针对谁"）。**为什么不复用 `Guard`**：
+        /// `Guard` 是挂在**单张卡的规则**上的，那时脚本已经决定"这张要发"了，模型只能否决它；
+        /// 而"我手上同时有灰流丽和无限泡影，该交哪张"是个**选择题**——只有站在
+        /// `OnSelectChain`（所有候选卡与规则都摆在这里）这一层才问得出来。
+        ///
+        /// 调用时机与代价：
+        /// * **对面必须是链上最后那个发动者**（`LastChainPlayer == 1`）。⚠ 这里**不再限定"对手回合"**——
+        ///   对面在我方回合丢手坑（灰流丽/无限泡影都是）同样是"对面发动效果带来的时点"，
+        ///   2026-10-08 之前把它漏了；
+        /// * 我方候选里**至少两张是阻抗卡**才问——一张就没得挑，那一张由 `Guard` 负责；
+        /// * 问不到（超时/熔断/没开闸门）一律返回 <see cref="NoOpinion"/>，脚本照旧。
+        /// </summary>
+        /// <returns>
+        /// 要发动的那张在 `cards` 里的下标；<see cref="NoOpinion"/> 表示"没意见/不该问"；
+        /// -1 表示"都不发"（调用方据此把这几张阻抗卡记进否决表，再交回脚本）。
+        /// </returns>
+        public static int AskChainChoice(IList<ClientCard> cards, IList<int> descs, Duel duel)
+        {
+            Init();
+            if (!_enabled || _tripped || !_negateGateEnabled || duel == null || cards == null)
+                return NoOpinion;
+            // 时点：对面是链上最后一个发动者（`-1` = 没有连锁，那属于召唤响应窗口，由别的钩子管）
+            if (duel.LastChainPlayer != 1)
+                return NoOpinion;
+            // 我方能交的阻抗卡：从内核给的候选里筛（它已经保证这些卡现在**真的能发动**）
+            List<int> negateIndexes = new List<int>();
+            for (int i = 0; i < cards.Count; ++i)
+            {
+                if (NegateDecision.IsNegateCard(cards[i]))
+                    negateIndexes.Add(i);
+            }
+            if (negateIndexes.Count < 2)
+            {
+                if (_verbose && negateIndexes.Count == 1)
+                {
+                    Logger.WriteLine("[决策] 链上只有 1 张阻抗可交（" + NegateDecision.NameOf(cards[negateIndexes[0]])
+                        + "），改由单张闸门那问处理；候选共 " + cards.Count + " 张");
+                }
+                return NoOpinion;
+            }
+            int budgetLeft = BudgetLeft(duel);
+            if (budgetLeft <= 0)
+                return NoOpinion;
+
+            _seq++;
+            string answer = AskRaw(
+                _seq, BuildChainQuestion(_seq, cards, descs, negateIndexes, duel), budgetLeft);
+            if (string.IsNullOrEmpty(answer))
+                return NoOpinion;
+            int split = answer.IndexOf(';');
+            string verdict = (split >= 0 ? answer.Substring(0, split) : answer).Trim().ToLowerInvariant();
+            string reason = split >= 0 ? answer.Substring(split + 1).Trim() : "";
+            if (verdict == "no" || verdict == "0")
+            {
+                foreach (int index in negateIndexes)
+                    _chainVetoedIds.Add(cards[index].Id);
+                Logger.WriteLine("[决策] 对面「" + NameOfLastChain(duel) + "」这一步都不交（"
+                    + negateIndexes.Count + " 张可选）"
+                    + (reason.Length > 0 ? "：理由＝" + reason : "（模型没给理由）"));
+                return -1;
+            }
+            int choice;
+            if (!int.TryParse(verdict, out choice))
+                return NoOpinion;
+            int picked = negateIndexes.IndexOf(choice - 1);
+            if (picked < 0)
+                return NoOpinion;
+            int cardIndex = negateIndexes[picked];
+            // 其余的阻抗卡在这一问里也剔掉：模型已经在"发哪张"上做了选择，脚本不该再拿别的顶上来
+            foreach (int index in negateIndexes)
+            {
+                if (index != cardIndex)
+                    _chainVetoedIds.Add(cards[index].Id);
+            }
+            Logger.WriteLine("[决策] 交「" + NegateDecision.NameOf(cards[cardIndex]) + "」"
+                + (reason.Length > 0 ? "：理由＝" + reason : ""));
+            return cardIndex;
+        }
+
+        /// <summary>
+        /// 链上最后一张卡的名字（只为日志）。**不能用 `Executor.Util`**：那是每个执行器实例自己持有的，
+        /// 静态类拿不到（编译期就报"上下文中不存在 Util"）。
+        /// </summary>
+        private static string NameOfLastChain(Duel duel)
+        {
+            if (duel == null || duel.CurrentChain == null || duel.CurrentChain.Count == 0)
+                return "（未知）";
+            return NegateDecision.NameOf(duel.CurrentChain[duel.CurrentChain.Count - 1]);
+        }
+
+        /// <summary>
+        /// 链上选择问题的正文：**我方候选逐张列出（带卡文由 Python 侧补）+ 对面刚才做了什么**。
+        /// </summary>
+        private static List<string> BuildChainQuestion(
+            int id, IList<ClientCard> cards, IList<int> descs, List<int> negateIndexes, Duel duel)
+        {
+            List<string> lines = new List<string>();
+            lines.Add("id=" + id);
+            lines.Add("kind=chain_choice");
+            lines.Add("turn=" + duel.Turn);
+            lines.Add("my_phase=" + (duel.Player == 0 ? "1" : "0"));
+            lines.Add("phase=" + (int)duel.Phase);
+            lines.Add("my_lp=" + (duel.Fields[0] != null ? duel.Fields[0].LifePoints : 0));
+            lines.Add("opp_lp=" + (duel.Fields[1] != null ? duel.Fields[1].LifePoints : 0));
+            // 对面刚才发动的是什么（模型判断"要不要拦"的第一依据）
+            if (duel.CurrentChain != null && duel.CurrentChain.Count > 0)
+            {
+                foreach (ClientCard item in duel.CurrentChain)
+                {
+                    if (item != null)
+                        lines.Add("chain=" + item.Id + ";" + item.Name + ";" + item.Controller);
+                }
+            }
+            AppendZone(lines, "mine", duel.Fields[0] != null ? duel.Fields[0].MonsterZone : null);
+            AppendZone(lines, "my_spell", duel.Fields[0] != null ? duel.Fields[0].SpellZone : null);
+            AppendZone(lines, "theirs", duel.Fields[1] != null ? duel.Fields[1].MonsterZone : null);
+            AppendZone(lines, "their_spell", duel.Fields[1] != null ? duel.Fields[1].SpellZone : null);
+            // 我方能交的这几张：**只列阻抗卡**（非阻抗的照旧交脚本自己排），带内核给的发动描述
+            foreach (int index in negateIndexes)
+            {
+                ClientCard card = cards[index];
+                int desc = (descs != null && index < descs.Count) ? descs[index] : -1;
+                lines.Add("option=" + (index + 1) + ";" + card.Id + ";" + card.Name + ";"
+                    + card.Attack + ";" + card.Defense + ";desc=" + desc);
+            }
+            return lines;
+        }
+
         /// <summary>这条路通不通（没传 BrainFile 就是不通）。</summary>
         public static bool Enabled
         {
@@ -183,7 +352,9 @@ namespace WindBot.Game.AI
                 return null;
             if (candidates == null || candidates.Count < 2)
                 return null;
-            if (duel.Player != 1)
+            // 时机：要么正在响应对面的发动（我方回合对面丢手坑也算），要么就是对面的回合。
+            // ⚠ 原来只判 `duel.Player == 1`，把我方回合里响应对面手坑的时点漏掉了。
+            if (duel.LastChainPlayer != 1 && duel.Player != 1)
                 return null;
             int budgetLeft = BudgetLeft(duel);
             if (budgetLeft <= 0)
@@ -442,8 +613,30 @@ namespace WindBot.Game.AI
             if (!own)
                 return false;
             Duel duel = CurrentDuel();
-            if (duel == null || duel.Player != 1 || !NegateDecision.IsNegateCard(_currentCard))
+            // 时点（**并集**，只扩大不缩小）：
+            //   * 对面是链上最后那个发动者（`LastChainPlayer == 1`）——"对面发动效果带来的时点"，
+            //     包括**我方回合**对面丢手坑（灰流丽/无限泡影都是）。2026-10-08 之前只判"对手回合"，
+            //     把这种情况漏了；
+            //   * 或者就是**对面的回合**（`Player == 1`）——实测这些时点里 `LastChainPlayer` 常常是 **-1**
+            //     （对面召唤/独立窗口，没有连锁），而脚本在这时照样会主动交阻抗（通用脚本的
+            //     `DefaultDontChainMyself` 对 -1 也返回 yes）。⚠ 我一度把判据**收窄**成只看
+            //     `LastChainPlayer == 1`，结果真机一局的提问数从 37 掉到 1——这类"静默少问"是
+            //     决策层最难查的故障，判据只能往宽了写、再靠后面的开关分层。
+            bool atOpponentMoment = duel != null && (duel.LastChainPlayer == 1 || duel.Player == 1);
+            if (duel == null || !atOpponentMoment || !NegateDecision.IsNegateCard(_currentCard))
+            {
+                // 只在 Debug 下记一行"为什么没问"——**且只记"这张是阻抗卡、但时点不成立"那一种**。
+                // 最初是无条件记，结果一局打了两百多行、99% 是"判定卡=某张普通卡（是阻抗卡=False）"，
+                // 把真正要看的那几行淹了（2026-10-08 真人对局日志里就是这个现象）。
+                if (_verbose && NegateDecision.IsNegateCard(_currentCard))
+                {
+                    Logger.WriteLine("[决策] 未问单张闸门：LastChainPlayer="
+                        + (duel == null ? -99 : duel.LastChainPlayer)
+                        + "｜Player=" + (duel == null ? -99 : duel.Player)
+                        + "｜判定卡=" + NegateDecision.NameOf(_currentCard));
+                }
                 return true;
+            }
             string answer = Ask("negate_gate", _currentCard, null, duel);
             if (answer == null)
                 return true;

@@ -44,7 +44,8 @@ taunt_lines = []  # 挑衅台词池（集合，一条一句）；留空用内置
 # **用哪只模型见下面的 [llm] 节**（`decision_model` / `decision_timeout_ms`）：
 # 2026-10-08 起模型与超时统一收进 [llm]，这里只剩"开哪半"与答复额度。
 # brain_enabled = true       # 让模型决定「这张无效卡该去针对对面哪只怪」（默认开）
-# brain_negate_gate = true   # 让模型决定「对面发动效果时，我方能发的这几张里发哪张 / 都不发」（默认开）
+# brain_negate_gate = true   # 让模型决定「对面发动效果时，我方能发的这几张里发哪张 / 都不发」
+#                            # 默认开（用户口径：靠真人对战体感定；镜像自测分不出高下，见 executors/README §3.5）
 # brain_max_tokens = 256     # 答复额度上限；答复只有一个序号或 no;理由，给小一点更稳
 
 [llm]
@@ -55,6 +56,7 @@ summary_model = ""  # 【对局总结】把机读复述写成一段人话；这�
 summary_timeout_ms = 60000  # 【对局总结】等模型的上限（毫秒）。总结额度是 16384 token，思考型模型会先想一大段，给短了会稳定超时（群里看起来就是"没有 AI 总结"）
 decision_model = "deepseek-chat"  # 【AI 决策】阻抗决策层用哪只。**推荐小体量、不思考的那种**：对手回合的等待预算只有 15 秒，会思考的答复要 13 秒
 decision_timeout_ms = 2500  # 【AI 决策】WindBot 等答复的上限（毫秒）；Python 侧自动取这个值再减 400，好让超时由插件先发现并记账
+decision_style = "aggressive"  # 决策档位：conservative / normal / aggressive（也认 保守/平常/激进）；只改提示词，不用重编译 exe
 training_model = ""  # 【训练功能】读卡文推 combo、复盘、写结论用哪只。⚠ 要填**不思考**的（如 deepseek-chat）：宿主对插件的单次模型调用有 30 秒硬超时（cap.call），会思考的模型（本机的 `ds`/`deepseekV4.1flash`）光"想"就超时；留空＝宿主给插件配的那只
 training_timeout_ms = 25000  # 【训练功能】单次等模型的上限（毫秒）。**给不大**：宿主那侧 30 秒就断（cap.call），给 120000 也无效；给 25 秒是为了让失败由插件先发现，并在记录里说清"是模型太慢、该换哪只"
 

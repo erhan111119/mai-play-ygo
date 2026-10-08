@@ -63,6 +63,8 @@ _LOG_TAIL_MAX = 2000
 
 #: 卡组池列名（与 ``duel/deckpool.py`` 的 ``_DECK_COLUMNS`` 对齐；老库可能缺列，
 #: 所以这里按"存在即取"的方式读，缺列给空值）。
+#: ⚠ 这份列表漏一列不会报错、只会让那一列在前端永远是空的（`brain_scope` 就这么丢过一次：
+#: 卡组页的「AI 决策」永远显示"跟随全局"，库里明明存了值）。加列时两边一起加。
 _DECK_COLUMNS = (
     "deck_id",
     "group_id",
@@ -80,6 +82,7 @@ _DECK_COLUMNS = (
     "picked_style",
     "in_random",
     "created_at",
+    "brain_scope",
 )
 
 #: 推演笔记在详情页里给多少行（整份推演可能很长，详情页只要够读个大概）。
@@ -616,6 +619,17 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return {"ok": False, "error": "卡组编号必须是数字"}
         action = action.strip("/")
         group_id = str(body.get("group_id") or "")
+        if action == "settings":
+            scope = body.get("brain_scope")
+            try:
+                message = panel.plugin.schedule_deck_settings(
+                    int(deck_id),
+                    in_random=body.get("in_random") if "in_random" in body else None,
+                    brain_scope=None if scope is None else str(scope),
+                )
+            except Exception as exc:  # noqa: BLE001  失败原因原样给用户看
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "message": message}
         try:
             if action == "random":
                 message = panel.plugin.schedule_deck_action(
@@ -931,6 +945,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                     # 面板上的出牌脚本名：真正上场的是 generated_script（它优先），
                     # 挑样式只是"备选/历史"，两个都给前端，由前端决定怎么显示
                     "style_now": generated or picked or str(row.get("windbot_deck") or ""),
+                    # 每副牌自己的 AI 决策档位（卡组页那个设置）：空串＝跟随全局
+                    "brain_scope": str(row.get("brain_scope") or ""),
                     "created_at": row.get("created_at") or 0,
                     "is_builtin": group_id == "__builtin__",
                     # 缩略图用：卡表里的「头牌」（优先额外卡组里本地真有图的那张）
@@ -1015,6 +1031,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
                     "generated_script": str(row.get("generated_script") or ""),
                     "picked_style": str(row.get("picked_style") or ""),
                     "in_random": bool(row.get("in_random")),
+                    "brain_scope": str(row.get("brain_scope") or ""),
                     "error": summary.get("error", ""),
                 },
             }
@@ -1655,6 +1672,13 @@ label.field > span.info { color:var(--faint); font-size:11px; }
 .deck .nm { font-weight:600; font-size:13.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .deck .ln { display:flex; gap:6px; flex-wrap:wrap; margin-top:5px; }
 .deck .cnt { font-size:11px; color:var(--faint); margin-top:5px; font-variant-numeric:tabular-nums; }
+.deckctl { display:flex; gap:10px; align-items:center; margin-top:7px; flex-wrap:wrap; }
+.switch.sm { font-size:11.5px; gap:6px; }
+.switch.sm input[type=checkbox] { width:30px; height:17px; }
+.switch.sm input[type=checkbox]::after { width:11px; height:11px; }
+.switch.sm input[type=checkbox]:checked::after { transform:translateX(13px); }
+.field.mini { font-size:11px; gap:2px; }
+.field.mini select { min-width:106px; font-size:11.5px; padding:3px 6px; }
 .empty { display:flex; flex-direction:column; align-items:center; gap:10px; padding:48px 20px; color:var(--faint); }
 .empty svg.i { width:34px; height:34px; opacity:.55; }
 .sheet-mask { position:fixed; inset:0; background:rgba(4,6,11,.62); backdrop-filter:blur(3px);
@@ -1917,7 +1941,7 @@ function tab(name){
   document.querySelectorAll("section.view").forEach(s => s.classList.toggle("active", s.id === "view-" + name));
   const titles = {overview:["总览","卡组池、房间与训练状态"],decks:["卡组","群友投稿与内置卡组"],
                   duel:["对局监控","进行中的牌桌（每 2 秒刷新）"],
-                  training:["训练台","跟它说一句要做什么：推演 / 写脚本 / 擂台 / 体检 / 复盘"],
+                  training:["训练台","跟它说一句要做什么：卡组互打 / 编写脚本 / 卡组迭代 / 复盘优化"],
                   logs:["日志","宿主日志（可按关键词过滤）"]};
   const pair = titles[name] || ["面板",""];
   $("page-title").textContent = pair[0]; $("page-sub").textContent = pair[1];
@@ -2019,20 +2043,42 @@ function renderDecks(needle){
   }).join("");
   $("decks-body").innerHTML = html || `<div class="empty">${ICON.search}<div>没有匹配的卡组</div></div>`;
 }
+const BRAIN_SCOPE_LABEL = {"": "跟随全局", off: "不问 AI", target_only: "只问目标", full: "目标+要不要交"};
 function deckCard(deck){
   const chips = [];
-  if (deck.in_random) chips.push('<span class="chip ok">随机池</span>');
   if (deck.generated_script) chips.push(`<span class="chip brand">脚本 ${esc(deck.generated_script)}</span>`);
   else if (deck.picked_style) chips.push(`<span class="chip">样式 ${esc(deck.picked_style)}</span>`);
   else if (deck.style_now) chips.push(`<span class="chip dim">${esc(deck.style_now)}</span>`);
   if (deck.file_missing) chips.push('<span class="chip err">卡表文件丢了</span>');
-  return `<div class="deck" onclick="showDeck('${esc(deck.deck_id)}','${esc(deck.group_id)}')">
+  const scope = deck.brain_scope || "";
+  const scopeClass = scope === "off" ? "dim" : (scope ? "run" : "dim");
+  return `<div class="deck">
     ${art(deck.head_card, "art")}
     <div class="meta">
-      <div class="nm" title="${esc(deck.name)}">${esc(deck.name)}</div>
+      <div class="nm" title="${esc(deck.name)}" onclick="showDeck('${esc(deck.deck_id)}','${esc(deck.group_id)}')">${esc(deck.name)}</div>
       <div class="ln">${chips.join("")}</div>
       <div class="cnt">#${esc(deck.deck_id)}　主 ${esc(deck.main)}·额 ${esc(deck.extra)}·副 ${esc(deck.side)}${deck.contributor ? "　by " + esc(deck.contributor) : ""}</div>
+      <div class="deckctl">
+        <label class="switch sm" title="加入/移出随机池">
+          <input type="checkbox" ${deck.in_random ? "checked" : ""}
+            onchange="deckToggle('${esc(deck.deck_id)}','${esc(deck.group_id)}','random', this.checked)">
+          <span class="sw-text">随机池</span></label>
+        <label class="field mini"><span class="muted">AI 决策</span>
+          <select onchange="deckToggle('${esc(deck.deck_id)}','${esc(deck.group_id)}','brain', this.value)">
+            ${Object.entries(BRAIN_SCOPE_LABEL).map(([value, text]) =>
+              `<option value="${esc(value)}" ${scope === value ? "selected" : ""}>${esc(text)}</option>`).join("")}
+          </select></label>
+      </div>
     </div></div>`;
+}
+async function deckToggle(deckId, group, what, value){
+  const payload = { group_id: group };
+  if (what === "random") payload.in_random = !!value;
+  else payload.brain_scope = String(value);
+  const d = await postApi(`/api/deck/${deckId}/settings`, payload);
+  if (!d.ok) { toast(d.error || "改不了", "err"); loadDecks(); return; }
+  toast(d.message, "ok");
+  loadDecks();
 }
 function openSheet(){ $("deck-sheet").classList.add("on"); $("sheet-mask").classList.add("on"); }
 function closeSheet(){ $("deck-sheet").classList.remove("on"); $("sheet-mask").classList.remove("on"); }
@@ -2066,6 +2112,11 @@ async function showDeck(deckId, group){
     <div class="toolbar" style="margin-top:4px">
       <button class="btn sm" onclick="deckRandom('${esc(deck.deck_id)}','${esc(deck.group_id)}',${deck.in_random ? "false" : "true"})">
         ${deck.in_random ? "移出随机池" : "加入随机池"}</button>
+      <label class="field mini"><span class="muted">AI 决策</span>
+        <select onchange="deckToggle('${esc(deck.deck_id)}','${esc(deck.group_id)}','brain', this.value)">
+          ${Object.entries(BRAIN_SCOPE_LABEL).map(([value, text]) =>
+            `<option value="${esc(value)}" ${(deck.brain_scope || "") === value ? "selected" : ""}>${esc(text)}</option>`).join("")}
+        </select></label>
       <button class="btn danger sm" onclick="deckDelete('${esc(deck.deck_id)}','${esc(deck.group_id)}','${esc(deck.name)}')">删除卡组</button>
     </div>
     ${deck.error ? `<div class="banner warn">${ICON.warn}${esc(deck.error)}</div>` : ""}
@@ -2190,17 +2241,16 @@ function roomBoard(room){
 /* ------------------------------ 训练 ------------------------------ */
 /* 训练台：做成一个"游戏王专用的小 dsh"——上面是对话流（每条 = 一次任务：我要求的 + 它的结果），
    下面是吸底的输入区（选卡组 → 选要写的东西 → 补充要求 → 开始）。 */
+/* 面板上只有这四件事（2026-10-09 用户口径）。推演 combo、脚本体检、读录像都降级成
+   这些任务内部的步骤，不再让用户先想"我该跑哪一个"。 */
 const KIND_HINT = {
-  combo: "读卡表与卡文，写出这副牌的先手/后手展开线。不会打牌、不改任何文件。",
-  write_script: "按卡文 + 已有推演写一份 WindBot 的 C# 出牌脚本并编译（会改动 WindBot 源码树）。",
-  iterate: "自己跑完整条链路：推演 → 写脚本 → 打擂台 → 按结果再改一轮。**会真打牌，很慢**。",
-  arena: "同一副卡表挂两份出牌脚本对打，看哪份更强（判强弱要 ≥80 局/腿）。",
-  script: "卡表 × 自写执行器的静态体检：有没有卡没登记、执行器在不在。不打牌。",
-  replay: "读最近的录像：双方卡表、差异、导出 .ykd，可让模型写复盘要点。",
+  arena: "两副牌各自用自己那份脚本对打，逐局交替座位——看谁的牌组+脚本更硬。",
+  write_script: "读卡文给这副牌写一份 C# 出牌脚本并编译（会自动先推一遍 combo；会改动 WindBot 源码树）。",
+  iterate: "推演 → 写脚本 → 跟另一副牌打 → 按结果再改一轮。**会真打牌，慢**。",
+  review: "读这副牌最近打过的对局记录，指出具体该改哪里（只看不改，不动任何文件）。",
 };
 const KIND_LABEL = {
-  combo: "推演 combo", write_script: "写出牌脚本", iterate: "自动迭代",
-  arena: "打擂台 A/B", script: "脚本体检", replay: "复盘录像",
+  arena: "卡组互打", write_script: "编写脚本", iterate: "卡组迭代", review: "复盘优化",
 };
 let KIND_META = {};
 
@@ -2284,8 +2334,9 @@ function ensureComposer(d, active){
   const kindSel = $("c-kind");
   if (deckSel.options.length !== (d.decks || []).length) {
     const keep = deckSel.value;
-    deckSel.innerHTML = (d.decks||[]).map(x =>
-      `<option value="${esc(x.deck_id)}">${x.is_builtin?"[内置] ":""}${esc(x.name)}（#${esc(x.deck_id)}）</option>`).join("");
+    State.decks = d.decks || [];
+    deckSel.innerHTML = State.decks.map(x =>
+      `<option value="${esc(x.deck_id)}">${x.is_builtin?"[内置] ":""}${esc(x.name)}（#${esc(x.deck_id)}）${x.script ? "｜脚本 " + esc(x.script) : "｜还没脚本"}</option>`).join("");
     if (keep) deckSel.value = keep;
   }
   if (!kindSel.options.length) {
@@ -2294,7 +2345,7 @@ function ensureComposer(d, active){
   kindSel.disabled = !!active || !d.bridge_ready;
   $("btn-send").disabled = !!active || !d.bridge_ready;
   $("btn-send").textContent = active ? "有任务在跑" : "开始";
-  deckSel.onchange = loadDeckWorks;
+  deckSel.onchange = () => { loadDeckWorks(); renderExtraFields(); };
   onKindChange();
   renderExtraFields(active);
   loadDeckWorks();
@@ -2310,40 +2361,33 @@ function onKindChange(){
 }
 function renderExtraFields(active){
   const kind = $("c-kind").value;
-  const meta = KIND_META[kind] || {};
-  const fields = meta.fields || [];
   const box = $("c-extra");
+  const needOpponent = kind === "arena" || kind === "iterate";
+  const mine = $("c-deck").value;
+  const options = (State.decks || [])
+    .filter(x => String(x.deck_id) !== String(mine))
+    .map(x => `<option value="${esc(x.deck_id)}">${x.is_builtin ? "[内置] " : ""}${esc(x.name)}（#${esc(x.deck_id)}）${x.script ? "｜脚本 " + esc(x.script) : "｜还没脚本"}</option>`)
+    .join("");
+  let html = "";
+  if (needOpponent) {
+    html += `<label class="field"><span>对手卡组（用它自己的脚本打）</span>
+      <select id="c-opponent">${options || '<option value="">（池子里没有别的卡组）</option>'}</select></label>`;
+  }
   if (kind === "arena") {
-    box.innerHTML = `<div class="crow2">
-      <label class="field"><span>脚本 A</span><input id="c-style-a" placeholder="如 RaiseMoon"></label>
-      <label class="field"><span>脚本 B</span><input id="c-style-b" placeholder="如 Gen88"></label>
-      <label class="field"><span>局数</span><input id="c-duels" type="number" value="60" min="2"></label></div>`;
-    return;
-  }
-  if (kind === "script") {
-    box.innerHTML = `<div class="crow2">
-      <label class="field"><span>自写执行器名</span><input id="c-style" placeholder="如 KillerTune"></label>
-      <label class="field"><span>卡组编号</span><input id="c-deck-ids" placeholder="如 95,99,88"></label>
-      <label class="field"><span>群号</span><input id="c-group" placeholder="按某群随机池体检"></label></div>`;
-    return;
-  }
-  if (kind === "replay") {
-    box.innerHTML = `<div class="crow2">
-      <label class="field"><span>取最近几份</span><input id="c-latest" type="number" value="5" min="1" max="50"></label></div>`;
-    return;
+    html += `<label class="field"><span>局数（逐局交替座位）</span>
+      <input id="c-duels" type="number" value="60" min="2"></label>`;
   }
   if (kind === "iterate") {
-    box.innerHTML = `<div class="crow2">
-      <label class="field"><span>迭代轮数</span><input id="c-rounds" type="number" value="2" min="1" max="5"></label>
-      <label class="field"><span>每轮局数</span><input id="c-duels" type="number" value="20" min="2"></label></div>`;
-    return;
+    html += `<label class="field"><span>迭代轮数</span><input id="c-rounds" type="number" value="2" min="1" max="5"></label>`;
+    html += `<label class="field"><span>每轮局数</span><input id="c-duels" type="number" value="20" min="2"></label>`;
   }
   if (kind === "write_script") {
-    box.innerHTML = `<div class="crow2" style="grid-template-columns:max-content">
-      <label class="field"><span>生成→编译轮数</span><input id="c-rounds" type="number" value="3" min="1" max="6"></label></div>`;
-    return;
+    html += `<label class="field"><span>生成→编译轮数</span><input id="c-rounds" type="number" value="3" min="1" max="6"></label>`;
   }
-  box.innerHTML = "";
+  if (kind === "review") {
+    html += `<label class="field"><span>复盘最近几局</span><input id="c-latest" type="number" value="3" min="1" max="20"></label>`;
+  }
+  box.innerHTML = html ? `<div class="crow2">${html}</div>` : "";
 }
 async function loadDeckWorks(){
   const deckId = $("c-deck").value;
@@ -2383,17 +2427,12 @@ async function sendTask(){
   const text = $("c-text").value.trim();
   if (text) payload.extra_prompt = text;
   const num = (id) => { const el = $(id); return el && el.value !== "" ? Number(el.value) : undefined; };
-  const val = (id) => { const el = $(id); return el ? el.value.trim() : ""; };
-  if (kind === "arena") {
-    payload.style_a = val("c-style-a"); payload.style_b = val("c-style-b");
-    payload.duels = num("c-duels") ?? 60;
-  }
-  if (kind === "script") {
-    payload.style = val("c-style"); payload.deck_ids = val("c-deck-ids"); payload.group = val("c-group");
-  }
-  if (kind === "replay") payload.latest = num("c-latest") ?? 5;
+  const opponent = $("c-opponent") ? Number($("c-opponent").value) : 0;
+  if (opponent) payload.opponent_deck_id = opponent;
+  if (kind === "arena") payload.duels = num("c-duels") ?? 60;
   if (kind === "iterate") { payload.rounds = num("c-rounds") ?? 2; payload.duels = num("c-duels") ?? 20; }
   if (kind === "write_script") payload.rounds = num("c-rounds") ?? 3;
+  if (kind === "review") payload.latest = num("c-latest") ?? 3;
 
   const d = await postApi("/api/training/start", payload);
   if (!d.ok) { toast(d.error || "起不来", "err"); return; }

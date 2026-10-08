@@ -221,6 +221,7 @@ async def _run_one(
     real_model: str,
     gate: bool,
     baseline: bool,
+    style: str,
     max_duration: float,
     join_timeout: float,
 ) -> DuelOutcome:
@@ -248,7 +249,10 @@ async def _run_one(
         text = str(payload.get("response") or "").strip()
         return text or None
 
-    bridge = BrainBridge(prefix=prefix, generate=generate, card_db=db, logger=logger, timeout=2.1)
+    bridge = BrainBridge(
+        prefix=prefix, generate=generate, card_db=db, logger=logger, timeout=2.1,
+        style=style,   # 决策档位（保守/平常/激进）——A/B 时这是**自变量**，不是提示词细节
+    )
     bridge_task = asyncio.create_task(bridge.run())
     brain_on_bot = brain_seat == "bot"
     # baseline 模式：**两边都不给 BrainFile**（连问答文件都不存在），量的是"这套镜像对局自身的
@@ -378,7 +382,7 @@ async def run(args: argparse.Namespace) -> int:
     if args.baseline:
         print("模式：**基线**（两边都不开决策层，量这套镜像对局的空分布，期望 ≈50%）")
     else:
-        print(f"决策层那一侧：闸门={'开' if args.gate else '关'}｜模型={args.real_model}")
+        print(f"决策层那一侧：闸门={'开' if args.gate else '关'}｜模型={args.real_model}｜档位={args.style}")
     print(f"计划 {args.duels} 局，逐局交替座位……\n")
 
     # **先预热**：首次调用要多付约 1.2 秒（宿主懒加载配置 + 建连），而 A/B 的每一局都很短，
@@ -411,7 +415,7 @@ async def run(args: argparse.Namespace) -> int:
         outcome = await _run_one(
             index=index, brain_seat=brain_seat, deck_style=args.deck_style, deck_path=deck_path,
             paths=paths, windbot_exe=windbot_exe, db=db, logger=logger,
-            real_model=args.real_model, gate=args.gate, baseline=args.baseline,
+            real_model=args.real_model, gate=args.gate, baseline=args.baseline, style=args.style,
             max_duration=args.max_duel_seconds, join_timeout=args.join_timeout,
         )
         tally.add(outcome)
@@ -465,6 +469,11 @@ def main() -> int:
     parser.add_argument("--veiler", type=int, default=15, help="合成卡组里效果遮蒙者的张数")
     parser.add_argument("--imperm", type=int, default=5, help="合成卡组里无限泡影的张数")
     parser.add_argument("--gate", action="store_true", help="打开'要不要交'那一半（A/B 必开）")
+    parser.add_argument(
+        "--style", default="normal",
+        help="决策档位：conservative / normal / aggressive（也认 保守/平常/激进）。"
+             "同一份口径在不同牌组上一正一负，所以档位是 A/B 的自变量之一",
+    )
     parser.add_argument(
         "--baseline", action="store_true",
         help="基线：两边都不开决策层。**先跑它**——基线不是 ~50% 就说明座位/先手带偏，胜率不能直接读",

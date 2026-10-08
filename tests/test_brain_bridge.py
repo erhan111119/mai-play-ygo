@@ -545,6 +545,68 @@ def test_bridge_prompt_degrades_without_card_database() -> None:
     asyncio.run(scenario())
 
 
+def test_decision_style_changes_policy_text_and_accepts_aliases() -> None:
+    """档位（保守/平常/激进）**只换"判断口径"那段**，而且中英别名都认、写错回落到 normal。
+
+    这条护的是用户口径：决策层的"幅度"要能按牌组调（同一份保守口径在合成牌组 +13 点、
+    在真实俱舍 -5.6/-9.4 点），所以档位必须真的改变提示词，而不是只是配置里好看。
+    """
+
+    from duel.brain_bridge import BrainBridge, normalize_decision_style
+
+    assert normalize_decision_style("保守") == "conservative"
+    assert normalize_decision_style("激进") == "aggressive"
+    assert normalize_decision_style("AGGRESSIVE") == "aggressive"
+    assert normalize_decision_style("") == "normal"
+    assert normalize_decision_style("乱写的") == "normal"  # 认不出来回落，不报错
+
+    question = parse_question(CHAIN_QUESTION.format(qid=1))
+    assert question is not None
+    texts = {}
+    for style in ("conservative", "normal", "aggressive"):
+        bridge = BrainBridge(
+            prefix=Path("x"), generate=None, card_db=FakeCardDatabase(), style=style
+        )  # type: ignore[arg-type]
+        assert bridge.style == style
+        prompt = bridge._build_chain_prompt(question) or ""
+        texts[style] = prompt.split("判断口径：")[1].split("⚠ 只按我给的卡文")[0]
+    # 三档必须互不相同，而且激进档要明确写"能拦就拦"、保守档要写"有疑问就不交"
+    assert len(set(texts.values())) == 3
+    assert "能拦就拦" in texts["aggressive"]
+    assert "有疑问就不交" in texts["conservative"]
+    assert "有疑问就不交" not in texts["aggressive"]
+
+
+def test_chain_answer_tolerates_how_the_model_writes_reasons() -> None:
+    """**理由怎么写都要认**：``4;理由`` / ``4 理由：…`` / 换行加理由 / ``都不发：…`` 全都收。
+
+    这是实测踩出来的：原来只按分号切第一段，换一档提示词后模型改成写"序号 + 换行 + 理由："，
+    于是 88/566 = 15.6% 的答复被整条丢弃（那一腿的测量因此不干净）。
+    答复格式会随提示词措辞变，解析器不能假设分隔符。
+    """
+
+    question = {
+        "id": "1",
+        "kind": "chain_choice",
+        "option": "1;a;卡;0;0;desc=-1\n4;b;卡;0;0;desc=-1",
+    }
+    cases = {
+        "4;对手在检索": "4;对手在检索",
+        "4 理由：对手在检索": "4;理由：对手在检索",
+        "4\n\n理由：对手在检索": "4;理由：对手在检索",
+        "4。": "4",
+        "no;只是铺场": "no;只是铺场",
+        "no\n理由：只是铺场": "no;理由：只是铺场",
+        "都不发：只是铺场": "no;只是铺场",
+        "不发": "no",
+    }
+    for raw, expected in cases.items():
+        got = BrainBridge._normalize_answer("chain_choice", raw, question)
+        assert got == expected, f"{raw!r} → {got!r}（期望 {expected!r}）"
+    # 候选里没有的序号仍然要拒（内核下标+1，不保证从 1 连续）
+    assert BrainBridge._normalize_answer("chain_choice", "2", question) is None
+
+
 def main() -> int:
     """无 pytest 环境下逐个执行测试函数。"""
 

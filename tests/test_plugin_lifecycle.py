@@ -912,6 +912,88 @@ async def test_unload_is_fast_and_kills_rooms() -> None:
 # （`test_script_generation_is_serialised` 也在这条口径下去掉了：它测的是"连投几副时生成要排队"，
 # 而投稿已经不再触发任何生成——见上面那条注释。）
 
+async def test_deck_ai_scope_overrides_the_global_brain_switches() -> None:
+    """卡组页里给每副牌设的「AI 决策档位」要真的改这一局决策层开哪半。
+
+    这条是回归测试：档位原来用 `getattr(deck, "brain_scope", "")` 读，而 `StoredDeck`
+    **根本没有这个字段** —— 于是 getattr 永远回落到全局配置，面板上改了档位、
+    开房时却按全局走，用户看到的是"设置了没用"。所以这里既测"档位能写进去、读得回来"
+    （新库也要有这一列），也测它真的映射到 `(问目标, 问要不要交)` 两个开关上。
+    """
+
+    if not _sdk_available():
+        print("      （跳过：未找到 maibot_sdk）")
+        return
+
+    # 从插件模块里拿异常类型：`train.runner` 里有 `from ..duel...` 这种跨层相对导入，
+    # 单独 `import train.runner` 会报"attempted relative import beyond top-level package"
+    # （插件只有以包的形式加载时那些相对导入才成立，宿主就是这么加载它的）
+    TrainingError = load_plugin_module().TrainingError
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instance, _context = make_plugin(root / "data")
+        await instance.on_load()
+        try:
+            pool = instance._deck_pool
+            assert pool is not None, "on_load 该把卡组池建出来"
+
+            def deck_row() -> Any:
+                """读回库里这一行（池子没有"按编号取一副"的接口，从列表里挑）。"""
+
+                return next(item for item in pool.list_decks("123456") if item.deck_id == stored.deck_id)
+
+            stored = pool.add(
+                group_id="123456",
+                display_name="测试牌",
+                contributor_id="u",
+                contributor_name="群友",
+                ydk_text="#main\n100\n!side\n",
+                deck_code="",
+                source_format="ydk",
+                main_count=1,
+                extra_count=0,
+                side_count=0,
+            )
+            # 默认：这副牌没设档位 → 跟随全局（全局是"问目标、不问要不要交"）
+            instance.config.duel.brain_enabled = True
+            instance.config.duel.brain_negate_gate = False
+            assert instance._brain_switches_for(None) == (True, False)
+            assert instance._brain_switches_for(deck_row()) == (True, False)
+
+            # 换成"目标 + 要不要交"：这一副牌自己覆盖全局
+            message = await instance._deck_settings(stored.deck_id, in_random=True, brain_scope="full")
+            assert "AI 决策 full" in message, message
+            assert "随机池开" in message, message
+            assert deck_row().brain_scope == "full"
+            assert deck_row().in_random is True
+            assert instance._brain_switches_for(deck_row()) == (True, True)
+
+            # 两支决策层全关
+            await instance._deck_settings(stored.deck_id, in_random=None, brain_scope="off")
+            assert instance._brain_switches_for(deck_row()) == (False, False)
+
+            # 只问目标
+            await instance._deck_settings(stored.deck_id, in_random=None, brain_scope="target_only")
+            assert instance._brain_switches_for(deck_row()) == (True, False)
+
+            # 清空（面板上"跟随全局"那个选项送的就是空串，不是它的中文标签）
+            message = await instance._deck_settings(stored.deck_id, in_random=None, brain_scope="")
+            assert "跟随全局" in message, message
+            assert deck_row().brain_scope == "", "空串＝跟随全局"
+
+            # 认不出的档位：当场报错，而且**不能**把库里那行改坏
+            try:
+                await instance._deck_settings(stored.deck_id, in_random=None, brain_scope="随便写的")
+            except TrainingError as exc:
+                assert "不认识的 AI 决策档位" in str(exc), exc
+            else:
+                raise AssertionError("认不出的档位不该被写进库")
+            assert deck_row().brain_scope == "", "写失败不该改动已有设置"
+        finally:
+            await instance.on_unload()
+
+
 async def test_generated_script_wins_over_deck_style() -> None:
     """卡组库里的 `generated_script` 要优先于按卡表重猜出来的风格。
 

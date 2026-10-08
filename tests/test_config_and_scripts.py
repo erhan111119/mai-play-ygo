@@ -72,7 +72,9 @@ class StubPlugin:
         self.config = _config_model()
         self.ctx = type("Ctx", (), {"paths": type("P", (), {"data_dir": str(data_dir)})()})()
         self.actions: List[Dict[str, Any]] = []
+        self.settings: List[Dict[str, Any]] = []
         self.raise_on_action = ""
+        self.raise_on_settings = ""
 
     def training_store(self) -> Any:
         return None
@@ -88,6 +90,14 @@ class StubPlugin:
         if self.raise_on_action:
             raise RuntimeError(self.raise_on_action)
         return f"替身：{action} #{deck_id}"
+
+    def schedule_deck_settings(
+        self, deck_id: int, *, in_random: Optional[bool] = None, brain_scope: Optional[str] = None
+    ) -> str:
+        self.settings.append({"deck_id": deck_id, "in_random": in_random, "brain_scope": brain_scope})
+        if self.raise_on_settings:
+            raise RuntimeError(self.raise_on_settings)
+        return f"已保存：替身 #{deck_id}"
 
 
 def _start_panel(webui: Any, plugin: Any, key: str):
@@ -143,6 +153,60 @@ def test_deck_operations_go_through_the_plugin_and_need_confirmation() -> None:
             plugin.raise_on_action = "内置卡组不能删除，只能把它移出随机池"
             status, body = call(port, "POST", "/api/deck/9/delete", secret, {"confirm": True})
             assert body["ok"] is False and "内置卡组" in body["error"], body
+        finally:
+            server.stop_now()
+
+
+def test_deck_settings_endpoint_writes_random_pool_and_ai_scope() -> None:
+    """卡组页每副牌的两个设置（随机池开关 / AI 决策档位）走 `/settings` 到插件。
+
+    这里只验"接线"：面板把两个字段拆开送（只改一个不能顺手覆盖另一个），
+    失败原因原样回给用户。档位取值与到决策层的映射由 `test_plugin_lifecycle.py` 的
+    `test_deck_ai_scope_overrides_the_global_brain_switches` 盯着。
+    """
+
+    webui = _load("webui")
+    import http.client
+
+    def call(port: int, path: str, key: str, payload: Any):
+        body = json.dumps(payload).encode("utf-8")
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            connection.request(
+                "POST", path, body=body, headers={"X-API-Key": key, "Content-Type": "application/json"}
+            )
+            response = connection.getresponse()
+            return response.status, json.loads(response.read().decode("utf-8"))
+        finally:
+            connection.close()
+
+    secret = "e" * 32
+    with tempfile.TemporaryDirectory() as directory:
+        plugin = StubPlugin(Path(directory))
+        server, port = _start_panel(webui, plugin, secret)
+        try:
+            # 只改随机池：档位一律送 None（插件那边就不动它）
+            status, body = call(port, "/api/deck/12/settings", secret, {"in_random": False})
+            assert status == 200 and body["ok"] is True, body
+            assert plugin.settings[-1] == {"deck_id": 12, "in_random": False, "brain_scope": None}
+
+            # 只改档位
+            status, body = call(port, "/api/deck/12/settings", secret, {"brain_scope": "full"})
+            assert body["ok"] is True, body
+            assert plugin.settings[-1] == {"deck_id": 12, "in_random": None, "brain_scope": "full"}
+
+            # 清空档位（面板上"跟随全局"送的就是空串）
+            status, body = call(port, "/api/deck/12/settings", secret, {"brain_scope": ""})
+            assert plugin.settings[-1]["brain_scope"] == "", plugin.settings
+
+            # 插件那层拦下错值时要原样显示原因
+            plugin.raise_on_settings = "不认识的 AI 决策档位：随便写的"
+            status, body = call(port, "/api/deck/12/settings", secret, {"brain_scope": "随便写的"})
+            assert body["ok"] is False and "不认识的 AI 决策档位" in body["error"], body
+
+            # 卡组编号不是数字：直接拒掉
+            status, body = call(port, "/api/deck/abc/settings", secret, {"brain_scope": "off"})
+            assert body["ok"] is False, body
         finally:
             server.stop_now()
 
@@ -612,8 +676,12 @@ def test_script_generator_handles_truncated_and_renamed_output() -> None:
         assert "Gen9Executor" in prompts[2] and "名字" in prompts[2], prompts[2][-300:]
 
 
-def test_runner_offers_the_new_kinds_only_when_the_tree_is_configured() -> None:
-    """面板要能看出"写脚本/自动迭代"现在为什么不能用（缺源码树 vs 房间占着）。"""
+def test_runner_offers_only_the_four_panel_kinds() -> None:
+    """面板上只该看到四项（用户 2026-10-09 口径）：卡组互打 / 编写脚本 / 卡组迭代 / 复盘优化。
+
+    推演 combo、脚本体检、录像复盘降级成**内部步骤**（由这四项自己调用），
+    不再出现在面板上——用户不该先想"我该跑哪一项"。同时还要能看出"现在为什么不能用"
+    （缺源码树 / 房间占着）。"""
 
     runner_module = _load("train.runner")
     store_module = _load("train.store")
@@ -636,9 +704,13 @@ def test_runner_offers_the_new_kinds_only_when_the_tree_is_configured() -> None:
             )
 
         kinds = {item["kind"]: item for item in make(0, lambda: (None, None)).describe_kinds()}
+        assert set(kinds) == {"arena", "write_script", "iterate", "review"}, sorted(kinds)
         assert kinds["write_script"]["ready"] is False
         assert "windbot_src_dir" in kinds["write_script"]["note"], kinds["write_script"]
         assert kinds["iterate"]["ready"] is False
+        # 打牌类的四项里只有两项需要引擎，且都要能"选一副对手卡组"
+        assert kinds["arena"]["fields"][0] == "opponent_deck", kinds["arena"]["fields"]
+        assert kinds["iterate"]["fields"][0] == "opponent_deck", kinds["iterate"]["fields"]
 
         ready_dirs = lambda: (tmp / "src", tmp / "windbot")  # noqa: E731  测试里的小 lambda
         kinds = {item["kind"]: item for item in make(0, ready_dirs).describe_kinds()}
@@ -647,7 +719,7 @@ def test_runner_offers_the_new_kinds_only_when_the_tree_is_configured() -> None:
         kinds = {item["kind"]: item for item in make(1, ready_dirs).describe_kinds()}
         assert kinds["arena"]["ready"] is False and kinds["iterate"]["ready"] is False
         assert "房间" in kinds["iterate"]["note"], kinds["iterate"]["note"]
-        assert kinds["combo"]["needs_engine"] is False and kinds["iterate"]["needs_engine"] is True
+        assert kinds["review"]["needs_engine"] is False and kinds["iterate"]["needs_engine"] is True
 
 
 def main() -> int:
@@ -655,6 +727,7 @@ def main() -> int:
 
     tests = [
         test_deck_operations_go_through_the_plugin_and_need_confirmation,
+        test_deck_settings_endpoint_writes_random_pool_and_ai_scope,
         test_deck_workspace_endpoint_lists_script_and_combo_archives,
         test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards,
         test_rooms_endpoint_still_draws_the_table_before_the_duel_starts,
@@ -663,7 +736,7 @@ def main() -> int:
         test_script_generator_says_exe_is_locked_instead_of_dumping_msbuild,
         test_script_generator_reports_missing_tree_instead_of_pretending,
         test_script_generator_handles_truncated_and_renamed_output,
-        test_runner_offers_the_new_kinds_only_when_the_tree_is_configured,
+        test_runner_offers_only_the_four_panel_kinds,
     ]
     failures: List[str] = []
     for func in tests:

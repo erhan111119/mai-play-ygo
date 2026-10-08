@@ -99,6 +99,32 @@ def test_synthetic_replay_round_trip() -> None:
     assert list(info.decks[0].extra) == extra_a and list(info.decks[1].extra) == extra_b, info.decks
 
 
+def test_deck_without_extra_is_still_found() -> None:
+    """一副**没有额外卡组**的牌（60 张主卡组 + 0 张额外）也要能解出来。
+
+    这是实测抓到的解析器 bug：卡表段的判据里，额外卡组张数写的是 0~15，
+    但"这串是不是卡号"的检查当时写成"张数 <= 0 就不算"，于是额外 0 张的那一段
+    整段被跳过 —— 报告变成"只找到 1 段卡表，录像格式可能变了"，
+    把一副正常的牌（本机真有人这么带）判成了格式问题。
+    """
+
+    tool = load_tool()
+    main_a = [100267017 + index for index in range(60)]
+    main_b = [200267017 + index for index in range(40)]
+    extra_b = [88397661 + index for index in range(15)]
+    blob = build_replay(
+        names=("打憨憨$VzdP8", "憨憨"),
+        decks=((main_a, []), (main_b, extra_b)),
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "no-extra.yrp"
+        path.write_bytes(blob)
+        info = tool.parse_replay(path)
+    assert list(info.decks[0].main) == main_a, info.decks
+    assert list(info.decks[0].extra) == [], info.decks
+    assert list(info.decks[1].extra) == extra_b, info.decks
+
+
 def test_non_replay_file_is_rejected() -> None:
     """格式不对要说清楚并抛错——不猜、不返回空卡表（那样看起来像"这局没带牌"）。"""
 

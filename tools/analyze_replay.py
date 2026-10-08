@@ -116,9 +116,13 @@ def read_u32(data: bytes, offset: int) -> int:
 
 
 def looks_like_cards(data: bytes, offset: int, count: int) -> bool:
-    """``offset`` 起的 ``count`` 个 uint32 是否都像卡号。"""
+    """``offset`` 起的 ``count`` 个 uint32 是否都像卡号（**0 张也算像**）。"""
 
-    if count <= 0 or offset + count * 4 > len(data):
+    # ⚠ ``count == 0`` 必须算"像"：额外卡组可以为空（60 张主卡组、0 张额外的牌很常见，
+    # 本机实测就有）。原来这里写 ``count <= 0`` 返回 False，后果是**整个卡表段被跳过**：
+    # 那份录像只剩另一位玩家的卡表，解析器报"只找到 1 段卡表"，
+    # 看着像"录像格式变了"——其实是把一副正常牌判成了格式问题。
+    if count < 0 or offset + count * 4 > len(data):
         return False
     for index in range(count):
         card_id = read_u32(data, offset + index * 4)
