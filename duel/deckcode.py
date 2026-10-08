@@ -95,7 +95,9 @@ class Deck:
             comment: 写在首行注释里的说明文字，例如卡组名与投稿人。
         """
 
-        lines = [f"#created by MaiBot duel-arena{' - ' + comment if comment else ''}"]
+        # 注释头用**现在的插件名**（合并前写的是 "MaiBot duel-arena"，2026-10-09 清掉）：
+        # 它只是给人看的首行注释（解析时被忽略），但对不上现名会让人误以为是别的插件的产物
+        lines = [f"#created by mai-play-ygo{' - ' + comment if comment else ''}"]
         lines.append("#main")
         lines.extend(str(card_id) for card_id in self.main)
         lines.append("#extra")
