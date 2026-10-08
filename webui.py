@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 
+from .duel.card_images import cache_dir_for
 from .train.analysis import tail_lines
 
 # ---------------------------------------------------------------------------
@@ -79,8 +80,26 @@ _DECK_COLUMNS = (
     "created_at",
 )
 
+#: 推演笔记在详情页里给多少行（整份推演可能很长，详情页只要够读个大概）。
+_GUIDE_PREVIEW_LINES = 200
+
 #: 日志里的 ANSI 颜色码（训练日志来自命令行工具，带颜色码时面板里会花屏）。
 _ANSI_PATTERN = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+#: 卡图接口能给的图片后缀（只认这两种；卡号必须是纯数字，见 `_send_art`）。
+_ART_SUFFIXES = (".jpg", ".png")
+
+#: 卡图在浏览器里的缓存时长（秒）。卡图不会变，给一天；换图靠卡号本身的缓存失效。
+_ART_CACHE_SECONDS = 86400
+
+#: 「头牌」缓存：``(ydk 路径, mtime) → 卡号``。列卡组时要给每副牌配一张缩略图，
+#: 96 副牌每次都重读 .ydk 太浪费（虽然小，但没必要）——按 mtime 失效就够。
+_HEAD_CARD_CACHE: Dict[Tuple[str, float], int] = {}
+_HEAD_CARD_CACHE_MAX = 512
+
+#: 挑「有图的头牌」时最多往下试多少张。给 30 是因为额外卡组通常 15 张、
+#: 主卡组里常见的卡也就那么几种；再多就是浪费 disk stat。
+_HEAD_ART_TRIES = 30
 
 
 def _json_body(raw: str) -> Dict[str, Any]:
@@ -205,6 +224,72 @@ def _read_ydk_summary(path: Path) -> Dict[str, Any]:
     return summary
 
 
+def _group_cards(card_ids: List[str], card_db: Any) -> List[Dict[str, Any]]:
+    """把一列卡号按「同一张卡」聚合起来：``[{"id", "name", "count"}]``，张数多的在前。
+
+    为什么要聚合：.ydk 里一张卡出现 3 次就写 3 行，直接铺成 40 行列表既长又难扫；
+    面板是给人看的，应该一眼看出"这副牌的主力是哪几张"。
+    """
+
+    counts: Dict[int, int] = {}
+    for raw in card_ids:
+        text = str(raw)
+        if not text.isdigit():
+            continue
+        card_id = int(text)
+        counts[card_id] = counts.get(card_id, 0) + 1
+    names = _card_names(card_db, list(counts))
+    entries = [
+        {"id": card_id, "name": names.get(card_id, str(card_id)), "count": count}
+        for card_id, count in counts.items()
+    ]
+    # 张数多的在前；张数一样时按卡号升序（顺序稳定、可预期，别让列表每次刷新都在跳）
+    entries.sort(key=lambda item: (-int(item["count"]), int(item["id"])))
+    return entries
+
+
+def _head_card_of(ydk_path: Path, has_art: Optional[Callable[[int], bool]] = None) -> int:
+    """这副牌的「头牌」卡号（拿它当缩略图）：优先额外卡组的第一张，否则主卡组里张数最多的。
+
+    为什么这么挑：额外卡组才是这副牌的牌面（终端大哥），主卡组第一张往往只是手坑。
+    给了 `has_art` 时**优先挑本地真的有图的那张**（顺着候选往下试有限次）——不这么做，
+    一半卡组的缩略图都会是占位卡背，整页看起来就像图挂了。
+    读不到就返回 0（前端画占位图标，不留空白）。
+    """
+
+    try:
+        stat = ydk_path.stat()
+    except OSError:
+        return 0
+    cache_key = (str(ydk_path), stat.st_mtime)
+    cached = _HEAD_CARD_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    summary = _read_ydk_summary(ydk_path)
+    candidates: List[int] = []
+    for item in summary.get("extra", []):
+        if str(item).isdigit():
+            candidates.append(int(item))
+    counts: Dict[int, int] = {}
+    for item in summary.get("main", []):
+        if str(item).isdigit():
+            card_id = int(item)
+            counts[card_id] = counts.get(card_id, 0) + 1
+    candidates.extend(card_id for card_id, _ in sorted(counts.items(), key=lambda pair: -pair[1]))
+
+    head = candidates[0] if candidates else 0
+    if has_art is not None:
+        for card_id in candidates[:_HEAD_ART_TRIES]:
+            if has_art(card_id):
+                head = card_id
+                break
+    if len(_HEAD_CARD_CACHE) >= _HEAD_CARD_CACHE_MAX:
+        _HEAD_CARD_CACHE.clear()
+    _HEAD_CARD_CACHE[cache_key] = head
+    return head
+
+
 def _tail_log_lines(host_root: Path, lines: int, keyword: str) -> List[str]:
     """取宿主最新日志的尾部若干行，可按关键词过滤（空关键词 = 不过滤）。"""
 
@@ -303,6 +388,16 @@ class _PanelHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_bytes(self, body: bytes, content_type: str, *, max_age: int = 0) -> None:
+        """发一段二进制（卡图走这里）。"""
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", f"private, max-age={int(max_age)}" if max_age else "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_html(self, html_text: str, status: int = 200) -> None:
         body = html_text.encode("utf-8")
         self.send_response(status)
@@ -355,12 +450,18 @@ class _PanelHandler(BaseHTTPRequestHandler):
             if path == "/api/decks":
                 self._send_json(self._api_decks())
                 return
+            if path.startswith("/api/art/"):
+                self._send_art(path[len("/api/art/"):])
+                return
             if path.startswith("/api/deck/"):
                 deck_id = path[len("/api/deck/"):]
                 self._send_json(self._api_deck_detail(deck_id, parse_qs(parsed.query)))
                 return
             if path == "/api/config":
                 self._send_json(self._api_config())
+                return
+            if path == "/api/config/schema":
+                self._send_json(self._api_config_schema())
                 return
             if path == "/api/training":
                 self._send_json(self._api_training())
@@ -563,6 +664,11 @@ class _PanelHandler(BaseHTTPRequestHandler):
         # 不能拿主机日志那套"目录 + app_*.jsonl"的读法去套（第一版写错了，
         # 表现是详情页永远显示"（没有输出）"，而任务其实跑得好好的）
         payload["tail"] = [_strip_ansi(line) for line in tail_lines(run.log_path, _LOG_TAIL_DEFAULT).splitlines()]
+        # combo 推演没有子进程输出，成果是那份推演笔记——把它读进来，
+        # 否则这一类任务的成功记录点开是一页空白（"没有输出"），等于没留下东西
+        guide_path = str(payload.get("summary", {}).get("guide_path") or "")
+        if guide_path:
+            payload["summary"]["guide_text"] = tail_lines(guide_path, _GUIDE_PREVIEW_LINES)
         return {"ok": True, "run": payload}
 
     def _api_decks(self) -> Dict[str, Any]:
@@ -571,6 +677,9 @@ class _PanelHandler(BaseHTTPRequestHandler):
         groups: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
             group_id = str(row.get("group_id") or "") or "(未分组)"
+            ydk_path = Path(str(row.get("ydk_path") or ""))
+            generated = str(row.get("generated_script") or "")
+            picked = str(row.get("picked_style") or "")
             groups.setdefault(group_id, []).append(
                 {
                     "deck_id": row.get("deck_id") or "",
@@ -580,13 +689,50 @@ class _PanelHandler(BaseHTTPRequestHandler):
                     "extra": row.get("extra_count") or 0,
                     "side": row.get("side_count") or 0,
                     "in_random": bool(row.get("in_random")),
-                    "generated_script": str(row.get("generated_script") or ""),
-                    "picked_style": str(row.get("picked_style") or ""),
+                    "generated_script": generated,
+                    "picked_style": picked,
+                    # 面板上的出牌脚本名：真正上场的是 generated_script（它优先），
+                    # 挑样式只是"备选/历史"，两个都给前端，由前端决定怎么显示
+                    "style_now": generated or picked or str(row.get("windbot_deck") or ""),
                     "created_at": row.get("created_at") or 0,
                     "is_builtin": group_id == "__builtin__",
+                    # 缩略图用：卡表里的「头牌」（优先额外卡组里本地真有图的那张）
+                    "head_card": panel.pick_head_card(ydk_path) if ydk_path.is_file() else 0,
+                    # 卡表文件不存在时前端要能直接说"文件没了"，而不是画一张空图
+                    "file_missing": not ydk_path.is_file(),
                 }
             )
-        return {"ok": True, "groups": [{"group_id": key, "decks": value} for key, value in sorted(groups.items())]}
+        return {
+            "ok": True,
+            "groups": [
+                {"group_id": key, "decks": value} for key, value in sorted(groups.items())
+            ],
+        }
+
+    def _send_art(self, raw_id: str) -> None:
+        """发一张卡图（卡号 → 本地图片字节）。
+
+        **只认纯数字卡号**，文件名由卡号拼出来：这样"路径穿越"这类问题从形状上就不成立
+        （用户输入进不了路径，只能是数字）。取图顺序与出图那条链路一致：
+        本地缓存（`temp/card_pics/`）→ 配置的卡图目录 → 备用目录；都没有就 404，
+        前端画一个卡背占位——**不在这里联网**（面板打开要快，缺图交给查房那条链路去补）。
+        """
+
+        card_id = raw_id.strip()
+        if not card_id.isdigit() or len(card_id) > 12:
+            self._send_json({"ok": False, "error": "卡号必须是数字"}, status=400)
+            return
+        panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
+        for path in panel.art_candidates(int(card_id)):
+            try:
+                body = path.read_bytes()
+            except OSError:
+                continue
+            if body:
+                mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+                self._send_bytes(body, mime, max_age=_ART_CACHE_SECONDS)
+                return
+        self._send_json({"ok": False, "error": "这张卡本地没有图"}, status=404)
 
     def _api_deck_detail(self, deck_id: str, query: Dict[str, List[str]]) -> Dict[str, Any]:
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
@@ -597,14 +743,21 @@ class _PanelHandler(BaseHTTPRequestHandler):
             if group_id and str(row.get("group_id") or "") != group_id:
                 continue
             ydk_path = Path(str(row.get("ydk_path") or ""))
-            summary = _read_ydk_summary(ydk_path) if ydk_path.exists() else {"error": f"找不到卡表文件：{ydk_path}"}
-            names = {}
+            summary = (
+                _read_ydk_summary(ydk_path)
+                if ydk_path.exists()
+                else {"main": [], "extra": [], "side": [], "error": f"找不到卡表文件：{ydk_path}"}
+            )
+            names: Dict[str, List[str]] = {}
+            entries: Dict[str, List[Dict[str, Any]]] = {}
             card_db = getattr(panel.plugin, "_card_db", None)
-            if card_db is not None:
-                for zone in ("main", "extra", "side"):
-                    names[zone] = [
-                        _card_name_or_id(card_db, passcode) for passcode in summary.get(zone, [])
-                    ]
+            for zone in ("main", "extra", "side"):
+                ids = [int(item) for item in summary.get(zone, []) if str(item).isdigit()]
+                zone_names = _card_names(card_db, ids)
+                # 卡名列表（按 .ydk 原始顺序，一张卡 3 张就出现 3 次）
+                names[zone] = [zone_names.get(card_id, str(card_id)) for card_id in ids]
+                # 聚合后的清单（新字段）：面板按"卡图 + 卡名 + ×张数"渲染
+                entries[zone] = _group_cards([str(item) for item in summary.get(zone, [])], card_db)
             return {
                 "ok": True,
                 "deck": {
@@ -620,6 +773,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
                         "side": len(summary.get("side", [])),
                     },
                     "cards": names,
+                    "entries": entries,
+                    "head_card": panel.pick_head_card(ydk_path) if ydk_path.is_file() else 0,
                     "generated_script": str(row.get("generated_script") or ""),
                     "picked_style": str(row.get("picked_style") or ""),
                     "in_random": bool(row.get("in_random")),
@@ -639,6 +794,30 @@ class _PanelHandler(BaseHTTPRequestHandler):
             raw["webui"]["api_key"] = "（已隐去）" if raw["webui"].get("api_key") else ""
         return {"ok": True, "config": raw}
 
+    def _api_config_schema(self) -> Dict[str, Any]:
+        """每个配置项的说明（面板拿它把"这一项是干什么的"写在值下面）。
+
+        配置页如果只列 `key = value`，用户看到 `brain_max_tokens = 256` 是没法判断
+        该不该动的；说明本来就写在模型的 `description` 里，这里把它取出来给前端。
+        """
+
+        panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
+        config = getattr(panel.plugin, "config", None)
+        sections: Dict[str, Dict[str, str]] = {}
+        fields = getattr(type(config), "model_fields", None)
+        if not fields:
+            return {"ok": True, "sections": sections}
+        for name in fields:
+            value = getattr(config, name, None)
+            sub_fields = getattr(type(value), "model_fields", None)
+            if not sub_fields:
+                continue
+            sections[name] = {
+                key: str(getattr(info, "description", "") or "")
+                for key, info in sub_fields.items()
+            }
+        return {"ok": True, "sections": sections}
+
     def _api_logs(self, lines: int, keyword: str) -> Dict[str, Any]:
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
         raw_lines = _tail_log_lines(panel.host_root, lines, keyword)
@@ -650,13 +829,43 @@ class _PanelHandler(BaseHTTPRequestHandler):
 
 
 def _card_name_or_id(card_db: Any, passcode: str) -> str:
-    """尽量把卡号翻成中文名；查不到就原样返回卡号。"""
+    """单个卡号 → 卡名；查不到就原样返回卡号（前端的兜底也是这个口径）。"""
 
+    if not str(passcode).isdigit():
+        return str(passcode)
+    return _card_names(card_db, [int(passcode)]).get(int(passcode), str(passcode))
+
+
+def _card_names(card_db: Any, card_ids: List[int]) -> Dict[int, str]:
+    """批量取卡名：尽量一次查询拿全，查不到的卡就不放进结果（调用方自己回落成卡号）。
+
+    ⚠ 用的是 `CardDatabase.card_details`（批量）而不是逐张 `name()`：一副牌 40~55 张，
+    逐张查就是 55 次 SQL；顺手也把"卡库不认识的卡"自然地区分出来了。
+    """
+
+    names: Dict[int, str] = {}
+    wanted = [int(card_id) for card_id in card_ids]
+    if card_db is None or not wanted:
+        return names
     try:
-        name = card_db.get_name(passcode)  # type: ignore[attr-defined]
-    except Exception:  # noqa: BLE001  卡牌库接口差异不该让面板报错
-        name = ""
-    return str(name or passcode)
+        details = card_db.card_details(wanted)
+    except Exception:  # noqa: BLE001  卡库接口差异不该让面板整页报错
+        details = {}
+    for card_id, detail in (details or {}).items():
+        name = str(getattr(detail, "name", "") or "")
+        if name:
+            names[int(card_id)] = name
+    for card_id in wanted:
+        if card_id in names:
+            continue
+        # 批量查询漏掉的（或整批失败时的）个别卡：再单独问一次
+        try:
+            name = card_db.name(card_id)
+        except Exception:  # noqa: BLE001
+            name = None
+        if name:
+            names[card_id] = str(name)
+    return names
 
 
 class _ThreadingPanelServer(ThreadingHTTPServer):
@@ -732,6 +941,44 @@ class WebUIServer:
 
         return self.plugin._training_workspace()
 
+    def art_candidates(self, card_id: int) -> List[Path]:
+        """这张卡**本地**可能有图的几个位置，按优先级：缓存 → 立绘目录 → 备用目录。
+
+        与出图那条链路（`duel/field_image.py` 的 `_read_art` + `duel/card_images.py` 的缓存）
+        保持同一个顺序，免得"面板上有图、发到群里没有"这种对不上的情况。
+        只读配置里的目录，不联网、不建目录。
+        """
+
+        suffixes = _ART_SUFFIXES
+        directories: List[Tuple[Path, Tuple[str, ...]]] = []
+        cache = cache_dir_for()
+        directories.append((cache, suffixes))
+        paths = getattr(self.plugin.config, "paths", None)
+        if paths is not None:
+            directories.append((paths.resolved_card_art_dir(), suffixes))
+            directories.append((paths.resolved_card_art_fallback_dir(), suffixes))
+        candidates: List[Path] = []
+        for directory, order in directories:
+            for suffix in order:
+                candidates.append(Path(directory) / f"{int(card_id)}{suffix}")
+        return candidates
+
+    def has_art(self, card_id: int) -> bool:
+        """本地有没有这张卡的图（只 stat，不读字节）。"""
+
+        for path in self.art_candidates(card_id):
+            try:
+                if path.is_file():
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def pick_head_card(self, ydk_path: Path) -> int:
+        """给一副牌挑缩略图用的卡号（优先挑本地**真的有图**的那张）。"""
+
+        return _head_card_of(ydk_path, self.has_art)
+
     # ---- 生命周期 ----
 
     @property
@@ -804,63 +1051,298 @@ class WebUIServer:
 # ---------------------------------------------------------------------------
 
 _STYLE = """
-:root { color-scheme: dark; }
-* { box-sizing: border-box; }
-body { margin:0; font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
-       background:#14161a; color:#e6e8ee; font-size:14px; }
-a { color:#7db4ff; text-decoration:none; }
-header { display:flex; align-items:center; gap:14px; padding:14px 20px; background:#1b1e24;
-         border-bottom:1px solid #2a2f38; position:sticky; top:0; }
-header h1 { font-size:16px; margin:0; font-weight:600; }
-header .tag { font-size:12px; color:#8b93a3; }
-nav { display:flex; gap:6px; }
-nav button { background:#22262e; color:#c8cddb; border:1px solid #303643; border-radius:6px;
-             padding:6px 12px; cursor:pointer; font-size:13px; }
-  nav button.active { background:#2d5bd7; border-color:#2d5bd7; color:#fff; }
-main { padding:20px; max-width:1200px; margin:0 auto; }
-section { display:none; }
-section.active { display:block; }
-.cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:12px; }
-.card { background:#1b1e24; border:1px solid #2a2f38; border-radius:10px; padding:14px; }
-.card .k { font-size:12px; color:#8b93a3; margin-bottom:6px; }
-.card .v { font-size:20px; font-weight:600; word-break:break-all; }
-table { width:100%; border-collapse:collapse; }
-th, td { text-align:left; padding:8px 10px; border-bottom:1px solid #262b34; font-size:13px; }
-th { color:#8b93a3; font-weight:500; }
-tr:hover td { background:#1a1d23; }
-.muted { color:#8b93a3; }
-.mono { font-family: ui-monospace, Consolas, monospace; font-size:12px; }
-pre { background:#161a20; border:1px solid #262b34; border-radius:8px; padding:12px;
-      overflow:auto; max-height:60vh; font-size:12px; line-height:1.5; }
-input, select, button.primary { font-size:14px; padding:9px 12px; border-radius:8px;
-      border:1px solid #303643; background:#1b1e24; color:#e6e8ee; }
-button.primary { background:#2d5bd7; border-color:#2d5bd7; color:#fff; cursor:pointer; }
-button.primary:disabled { background:#2a2f38; border-color:#303643; color:#6b7280; cursor:not-allowed; }
-button.ghost { background:#22262e; color:#c8cddb; border:1px solid #303643; border-radius:8px;
-               padding:8px 12px; cursor:pointer; font-size:13px; }
-.badge { display:inline-block; font-size:11px; padding:2px 7px; border-radius:999px;
-         border:1px solid #3a4150; color:#9aa3b4; }
-.badge.done { border-color:#2f7d4f; color:#7ee0a2; }
-.badge.running { border-color:#2d5bd7; color:#8fb8ff; }
-.badge.failed { border-color:#7d2f2f; color:#ff9a9a; }
-.badge.cancelled { border-color:#4a4258; color:#b9a6e0; }
-.login { max-width:380px; margin:12vh auto; }
-.login .card { padding:22px; }
-.row { display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap; align-items:center; }
-.kind { border:1px solid #2a2f38; border-radius:10px; padding:14px; margin-bottom:12px; background:#1b1e24; }
-.kind h4 { margin:0 0 4px; font-size:14px; }
-.kind .note { font-size:12px; color:#8b93a3; margin:0 0 10px; }
-.field { display:flex; flex-direction:column; gap:4px; font-size:12px; color:#8b93a3; }
-.field input, .field select { min-width:150px; }
-.banner { padding:10px 12px; border-radius:8px; margin-bottom:14px; font-size:13px; }
-.banner.warn { background:#2b2417; border:1px solid #5c4a1e; color:#f0d090; }
-.banner.err { background:#2b1b1b; border:1px solid #5c2a2a; color:#ffa8a8; }
+/* 设计基调：深色「牌桌」——近黑的蓝灰底 + 一层层抬起来的卡面，紫色为主动作色，
+   状态色只用在状态上。全部内联，不引用任何外网资源（离线也要能打开）。*/
+:root {
+  color-scheme: dark;
+  --bg:#0a0d14;
+  --bg-soft:#0f131d;
+  --panel:#151b27;
+  --panel-2:#1a2130;
+  --line:#232c3d;
+  --line-soft:#1b2231;
+  --text:#e8ecf6;
+  --muted:#8a97b0;
+  --faint:#5d6a83;
+  --brand:#7c6cf6;
+  --brand-2:#a78bfa;
+  --cyan:#4cc9f0;
+  --ok:#3ddc97;
+  --warn:#ffb454;
+  --danger:#ff6b81;
+  --r-lg:16px; --r-md:12px; --r-sm:9px;
+  --shadow:0 10px 30px -12px rgba(0,0,0,.75);
+  --tap: cubic-bezier(.22,.61,.36,1);
+}
+* { box-sizing:border-box; }
+html, body { height:100%; }
+body {
+  margin:0; background:
+    radial-gradient(1100px 620px at 12% -8%, rgba(124,108,246,.16), transparent 62%),
+    radial-gradient(900px 560px at 100% 0%, rgba(76,201,240,.10), transparent 58%),
+    var(--bg);
+  color:var(--text); font-size:14px; line-height:1.55;
+  font-family:-apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+a { color:var(--brand-2); text-decoration:none; }
+a:hover { color:#c4b5fd; }
+::-webkit-scrollbar { width:10px; height:10px; }
+::-webkit-scrollbar-thumb { background:#26304a; border-radius:20px; border:3px solid transparent; background-clip:content-box; }
+::-webkit-scrollbar-thumb:hover { background:#33405f; background-clip:content-box; }
+::-webkit-scrollbar-track { background:transparent; }
+svg.i { width:18px; height:18px; flex:none; fill:none; stroke:currentColor; stroke-width:1.7;
+        stroke-linecap:round; stroke-linejoin:round; }
+
+/* ---- 布局：左侧栏 + 主区 ---- */
+.shell { display:flex; min-height:100vh; }
+.side {
+  width:236px; flex:none; padding:18px 14px; display:flex; flex-direction:column; gap:8px;
+  background:linear-gradient(180deg, rgba(21,27,39,.92), rgba(15,19,29,.92));
+  border-right:1px solid var(--line); backdrop-filter:blur(6px);
+  position:sticky; top:0; height:100vh;
+}
+.brand { display:flex; align-items:center; gap:10px; padding:6px 8px 14px; }
+.brand .mark { width:34px; height:34px; border-radius:11px; flex:none;
+  background:linear-gradient(145deg, var(--brand), #4f46e5 62%, var(--cyan));
+  display:grid; place-items:center; color:#fff; box-shadow:0 6px 18px -8px rgba(124,108,246,.9); }
+.brand .mark svg.i { width:19px; height:19px; stroke-width:1.9; }
+.brand b { font-size:15px; letter-spacing:.2px; display:block; }
+.brand span { font-size:11.5px; color:var(--faint); }
+.side nav { display:flex; flex-direction:column; gap:4px; margin-top:6px; }
+.navlink { display:flex; align-items:center; gap:11px; padding:10px 12px; border-radius:var(--r-md);
+  color:var(--muted); cursor:pointer; border:1px solid transparent; font-size:13.5px;
+  transition:background .16s var(--tap), color .16s var(--tap), transform .16s var(--tap); }
+.navlink:hover { background:rgba(124,108,246,.08); color:var(--text); }
+.navlink.active { color:#fff; background:linear-gradient(100deg, rgba(124,108,246,.22), rgba(76,201,240,.09));
+  border-color:rgba(124,108,246,.34); box-shadow:inset 0 1px 0 rgba(255,255,255,.05); }
+.navlink .n { margin-left:auto; font-size:11px; color:var(--faint); }
+.side .foot { margin-top:auto; padding:10px 8px 2px; font-size:11.5px; color:var(--faint); }
+.side .foot code { color:var(--muted); word-break:break-all; font-size:11px; }
+.main { flex:1; min-width:0; display:flex; flex-direction:column; }
+.topbar { display:flex; align-items:center; gap:12px; padding:16px 26px 12px; }
+.topbar h1 { font-size:19px; margin:0; font-weight:650; letter-spacing:.2px; }
+.topbar .sub { font-size:12.5px; color:var(--faint); }
+.topbar .sp { flex:1; }
+.wrap { padding:0 26px 40px; max-width:1500px; width:100%; }
+section.view { display:none; animation:fade .22s var(--tap); }
+section.view.active { display:block; }
+@keyframes fade { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+
+/* ---- 通用元件 ---- */
+.panel { background:linear-gradient(180deg, var(--panel), var(--panel-2));
+  border:1px solid var(--line); border-radius:var(--r-lg); box-shadow:var(--shadow); }
+.panel > .hd { display:flex; align-items:center; gap:10px; padding:14px 18px; border-bottom:1px solid var(--line-soft); }
+.panel > .hd h3 { margin:0; font-size:14px; font-weight:600; }
+.panel > .hd .sp { flex:1; }
+.panel > .bd { padding:16px 18px; }
+.grid { display:grid; gap:14px; }
+.cols-2 { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+.cols-main { grid-template-columns:minmax(0,1.55fr) minmax(0,1fr); align-items:start; }
+.muted { color:var(--muted); }
+.faint { color:var(--faint); }
+.mono { font-family:ui-monospace, "Cascadia Mono", Consolas, monospace; font-size:12px; }
+.chip { display:inline-flex; align-items:center; gap:5px; font-size:11.5px; padding:3px 9px;
+  border-radius:999px; border:1px solid var(--line); color:var(--muted); background:rgba(255,255,255,.02); white-space:nowrap; }
+.chip svg.i { width:13px; height:13px; }
+.chip.ok { border-color:rgba(61,220,151,.4); color:#7ff0bb; background:rgba(61,220,151,.09); }
+.chip.run { border-color:rgba(124,108,246,.45); color:#c7bdfd; background:rgba(124,108,246,.12); }
+.chip.warn { border-color:rgba(255,180,84,.4); color:#ffd39a; background:rgba(255,180,84,.1); }
+.chip.err { border-color:rgba(255,107,129,.42); color:#ffb3bd; background:rgba(255,107,129,.1); }
+.chip.dim { border-color:var(--line); color:var(--faint); }
+.chip.brand { border-color:rgba(124,108,246,.4); color:#cfc7ff; background:rgba(124,108,246,.12); }
+.btn { display:inline-flex; align-items:center; justify-content:center; gap:7px; cursor:pointer;
+  font-size:13px; font-weight:550; padding:9px 14px; border-radius:var(--r-sm);
+  border:1px solid var(--line); background:var(--panel-2); color:var(--text);
+  transition:transform .14s var(--tap), border-color .16s var(--tap), background .16s var(--tap), opacity .16s; }
+.btn:hover { border-color:#33405f; background:#1f2839; transform:translateY(-1px); }
+.btn:active { transform:none; }
+.btn.primary { background:linear-gradient(100deg, var(--brand), #6d5ce7); border-color:transparent; color:#fff;
+  box-shadow:0 8px 22px -12px rgba(124,108,246,1); }
+.btn.primary:hover { background:linear-gradient(100deg, #8a7bff, #7a68f0); }
+.btn.danger { border-color:rgba(255,107,129,.4); color:#ffb3bd; background:rgba(255,107,129,.08); }
+.btn.danger:hover { background:rgba(255,107,129,.16); border-color:var(--danger); }
+.btn[disabled] { opacity:.45; cursor:not-allowed; transform:none; }
+.btn.sm { padding:6px 11px; font-size:12.5px; }
+input, select, textarea { font-family:inherit; font-size:13.5px; padding:9px 11px; border-radius:var(--r-sm);
+  border:1px solid var(--line); background:#101623; color:var(--text); width:100%;
+  transition:border-color .16s var(--tap), box-shadow .16s var(--tap); }
+input:focus, select:focus, textarea:focus { outline:none; border-color:rgba(124,108,246,.6);
+  box-shadow:0 0 0 3px rgba(124,108,246,.16); }
+label.field { display:flex; flex-direction:column; gap:5px; font-size:11.5px; color:var(--faint); letter-spacing:.2px; }
+label.field > span { display:flex; align-items:center; gap:6px; }
+label.field > span.info { color:var(--faint); font-size:11px; }
+.toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+.toolbar .grow { flex:1; min-width:200px; }
+.switch { display:inline-flex; align-items:center; gap:7px; font-size:12.5px; color:var(--muted); cursor:pointer; user-select:none; }
+.switch input { width:auto; }
+
+/* ---- 概览 ---- */
+.stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(158px, 1fr)); gap:12px; }
+.stat { position:relative; overflow:hidden; padding:15px 16px; border-radius:var(--r-lg);
+  background:linear-gradient(180deg, var(--panel), var(--panel-2)); border:1px solid var(--line); }
+.stat::after { content:""; position:absolute; inset:0 0 auto 0; height:2px;
+  background:linear-gradient(90deg, var(--brand), var(--cyan)); opacity:.55; }
+.stat .k { display:flex; align-items:center; gap:7px; font-size:12px; color:var(--muted); }
+.stat .v { font-size:28px; font-weight:680; letter-spacing:.5px; margin-top:7px; line-height:1.05;
+  font-variant-numeric:tabular-nums; }
+.stat .s { font-size:11.5px; color:var(--faint); margin-top:3px; }
+.kv { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:9px 18px; font-size:13px; }
+.kv dt { color:var(--faint); }
+.kv dd { margin:0; word-break:break-all; }
+.rooms { display:flex; flex-direction:column; gap:8px; }
+.room { display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:var(--r-md);
+  background:#111826; border:1px solid var(--line-soft); }
+.dot { width:8px; height:8px; border-radius:50%; background:var(--ok); box-shadow:0 0 0 4px rgba(61,220,151,.14); }
+
+/* ---- 卡组：卡片栅格 + 抽屉 ---- */
+.grp { margin-bottom:22px; }
+.grp > h3 { display:flex; align-items:center; gap:9px; margin:0 0 10px; font-size:14px; font-weight:600; }
+.grp > h3 .n { font-size:11.5px; color:var(--faint); font-weight:500; }
+.deckgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(228px, 1fr)); gap:13px; }
+.deck { position:relative; display:flex; gap:12px; align-items:center; padding:11px 12px; cursor:pointer;
+  border-radius:var(--r-lg); border:1px solid var(--line); background:linear-gradient(180deg, var(--panel), var(--panel-2));
+  transition:transform .16s var(--tap), border-color .16s var(--tap), box-shadow .16s var(--tap); }
+.deck:hover { transform:translateY(-3px); border-color:rgba(124,108,246,.5);
+  box-shadow:0 16px 34px -18px rgba(124,108,246,.85); }
+.deck .art { width:56px; height:56px; flex:none; border-radius:10px; overflow:hidden; background:#0b101a;
+  border:1px solid var(--line); display:grid; place-items:center; color:var(--faint); }
+.deck .art img { width:100%; height:100%; object-fit:cover; display:block; }
+.deck .art.zoom img { object-fit:contain; }
+.deck .meta { min-width:0; flex:1; }
+.deck .nm { font-weight:600; font-size:13.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.deck .ln { display:flex; gap:6px; flex-wrap:wrap; margin-top:5px; }
+.deck .cnt { font-size:11px; color:var(--faint); margin-top:5px; font-variant-numeric:tabular-nums; }
+.empty { display:flex; flex-direction:column; align-items:center; gap:10px; padding:48px 20px; color:var(--faint); }
+.empty svg.i { width:34px; height:34px; opacity:.55; }
+.sheet-mask { position:fixed; inset:0; background:rgba(4,6,11,.62); backdrop-filter:blur(3px);
+  opacity:0; pointer-events:none; transition:opacity .2s var(--tap); z-index:40; }
+.sheet-mask.on { opacity:1; pointer-events:auto; }
+.sheet { position:fixed; top:0; right:0; height:100vh; width:min(620px, 94vw); z-index:41;
+  background:linear-gradient(180deg, #131926, #0d1119); border-left:1px solid var(--line);
+  transform:translateX(102%); transition:transform .26s var(--tap); display:flex; flex-direction:column;
+  box-shadow:-24px 0 60px -30px #000; }
+.sheet.on { transform:none; }
+.sheet .hd { display:flex; align-items:flex-start; gap:12px; padding:18px 20px 14px; border-bottom:1px solid var(--line-soft); }
+.sheet .hd h3 { margin:0; font-size:17px; }
+.sheet .bd { overflow:auto; padding:16px 20px 30px; }
+.sheet .hero { display:flex; gap:14px; align-items:center; margin-bottom:14px; }
+.sheet .hero .art { width:92px; height:92px; border-radius:12px; overflow:hidden; border:1px solid var(--line);
+  background:#0b101a; display:grid; place-items:center; flex:none; }
+.sheet .hero .art img { width:100%; height:100%; object-fit:cover; }
+.ell { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
+.zone { margin-top:16px; }
+.zone > h4 { display:flex; align-items:center; gap:8px; margin:0 0 9px; font-size:13px; }
+.zone > h4 .n { color:var(--faint); font-weight:500; font-size:11.5px; }
+.cardrow { display:grid; grid-template-columns:repeat(auto-fill, minmax(178px, 1fr)); gap:8px; }
+.crow { display:flex; align-items:center; gap:9px; padding:7px 9px; border-radius:10px;
+  background:#111826; border:1px solid var(--line-soft); transition:border-color .16s var(--tap), transform .16s var(--tap); }
+.crow:hover { border-color:#2f3a52; transform:translateY(-1px); }
+.crow .thumb { width:34px; height:34px; flex:none; border-radius:7px; overflow:hidden; background:#0b101a;
+  border:1px solid var(--line-soft); display:grid; place-items:center; color:var(--faint); }
+.crow .thumb img { width:100%; height:100%; object-fit:cover; display:block; }
+.crow .nm { font-size:12.5px; min-width:0; flex:1; overflow:hidden; display:-webkit-box;
+  -webkit-line-clamp:2; -webkit-box-orient:vertical; line-height:1.35; }.crow .ct { font-size:11.5px; color:var(--brand-2); font-variant-numeric:tabular-nums; }
+
+/* ---- 训练 ---- */
+.kind { border:1px solid var(--line); border-radius:var(--r-lg); padding:15px 16px;
+  background:linear-gradient(180deg, var(--panel), var(--panel-2)); }
+.kind + .kind { margin-top:12px; }
+.kind h4 { margin:0 0 3px; font-size:13.5px; display:flex; align-items:center; gap:8px; }
+.kind .note { font-size:12px; color:var(--faint); margin:0 0 12px; }
+.kind .fields { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:11px; align-items:end; }
+.kind .go { display:flex; justify-content:flex-end; margin-top:12px; }
+.runlist { display:flex; flex-direction:column; gap:9px; }
+.run { display:flex; align-items:center; gap:12px; padding:11px 13px; border-radius:var(--r-md);
+  border:1px solid var(--line-soft); background:#111826; cursor:pointer;
+  transition:border-color .16s var(--tap), background .16s var(--tap), transform .16s var(--tap); }
+.run:hover { border-color:#33405f; background:#141c2b; transform:translateX(2px); }
+.run .rid { font-size:11px; color:var(--faint); }
+.run .ttl { font-weight:550; font-size:13px; }
+.run .sp { flex:1; min-width:0; }
+.run .meta { font-size:11.5px; color:var(--faint); margin-top:3px; }
+.live { border-radius:var(--r-lg); border:1px solid rgba(124,108,246,.36);
+  background:linear-gradient(180deg, rgba(124,108,246,.10), rgba(124,108,246,.03)); padding:15px 16px; margin-bottom:14px; }
+.live .hd { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+.spin { width:14px; height:14px; border-radius:50%; border:2px solid rgba(199,189,253,.35);
+  border-top-color:#c7bdfd; animation:spin 1s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+pre.log { background:#0b0f19; border:1px solid var(--line); border-radius:var(--r-md); padding:13px 14px;
+  overflow:auto; max-height:56vh; font-size:12px; line-height:1.6; margin:0; color:#c9d3e6;
+  font-family:ui-monospace, "Cascadia Mono", Consolas, monospace; white-space:pre-wrap; word-break:break-word; }
+pre.log .lv-error { color:#ff9aa8; } pre.log .lv-warning { color:#ffd39a; }
+pre.log .lv-debug { color:#6f7d95; } pre.log .lv-info { color:#9fe8c8; }
+.banner { display:flex; gap:10px; align-items:flex-start; padding:11px 13px; border-radius:var(--r-md);
+  margin-bottom:12px; font-size:13px; border:1px solid var(--line); background:#111826; }
+.banner svg.i { margin-top:2px; }
+.banner.warn { border-color:rgba(255,180,84,.35); background:rgba(255,180,84,.08); color:#ffd9a6; }
+.banner.err { border-color:rgba(255,107,129,.35); background:rgba(255,107,129,.08); color:#ffbcc4; }
+.toasts { position:fixed; right:22px; bottom:22px; z-index:60; display:flex; flex-direction:column; gap:9px; }
+.toast { min-width:240px; max-width:400px; padding:11px 13px; border-radius:var(--r-md); font-size:13px;
+  background:#161d2b; border:1px solid var(--line); box-shadow:var(--shadow); animation:fade .2s var(--tap); }
+.toast.ok { border-color:rgba(61,220,151,.4); } .toast.err { border-color:rgba(255,107,129,.42); }
+.seg { display:inline-flex; padding:3px; gap:3px; border-radius:999px; border:1px solid var(--line); background:#101623; }
+.seg button { border:none; background:transparent; color:var(--muted); font-size:12.5px; padding:6px 12px;
+  border-radius:999px; cursor:pointer; font-family:inherit; transition:background .16s var(--tap), color .16s var(--tap); }
+.seg button.on { background:rgba(124,108,246,.22); color:#fff; }
+
+/* ---- 配置 ---- */
+.cfgsec { margin-bottom:14px; }
+.cfgsec > .hd h3 { display:flex; align-items:center; gap:9px; }
+.cfggrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:10px 20px; }
+.cfgrow { display:flex; flex-direction:column; gap:3px; padding:9px 11px; border-radius:var(--r-md);
+  background:#111826; border:1px solid var(--line-soft); }
+.cfgrow .k { display:flex; align-items:center; gap:8px; font-size:12.5px; font-weight:550; }
+.cfgrow .v { font-size:12.5px; color:var(--muted); word-break:break-all; }
+.cfgrow .d { font-size:11px; color:var(--faint); margin-top:3px; }
+
+/* ---- 登录 ---- */
+.login { min-height:100vh; display:grid; place-items:center; padding:24px; }
+.login .box { width:100%; max-width:392px; padding:26px 26px 22px; border-radius:20px;
+  background:linear-gradient(180deg, #141a27, #0e131d); border:1px solid var(--line); box-shadow:var(--shadow); }
+.login .mark { width:46px; height:46px; border-radius:14px; margin-bottom:14px;
+  background:linear-gradient(145deg, var(--brand), #4f46e5 62%, var(--cyan)); display:grid; place-items:center;
+  color:#fff; box-shadow:0 10px 26px -12px rgba(124,108,246,1); }
+.login .mark svg.i { width:24px; height:24px; stroke-width:1.8; }
+.login h1 { font-size:19px; margin:0 0 6px; }
+.login p { font-size:12.5px; color:var(--muted); margin:0 0 18px; }
+.login .err { display:flex; gap:8px; align-items:center; font-size:12.5px; color:#ffbcc4;
+  background:rgba(255,107,129,.1); border:1px solid rgba(255,107,129,.35); padding:9px 11px;
+  border-radius:var(--r-sm); margin-bottom:14px; }
+.login .hint { font-size:11.5px; color:var(--faint); margin-top:14px; line-height:1.6; }
+.login .hint code { color:var(--muted); }
+
+@media (max-width: 900px) {
+  .shell { flex-direction:column; }
+  .side { width:100%; height:auto; position:static; flex-direction:row; align-items:center;
+    overflow-x:auto; padding:10px 12px; gap:6px; flex-wrap:nowrap; }
+  .brand { padding:0 8px 0 0; gap:0; }
+  /* 窄屏只留图标：标题字被挤成"一个字一行"比不显示更难认 */
+  .brand > div { display:none; }
+  .side nav { flex-direction:row; margin:0; gap:4px; flex-wrap:nowrap; }
+  .navlink { white-space:nowrap; padding:8px 10px; }
+  .navlink .n { display:none; }
+  .side .foot { display:none; }
+  .topbar, .wrap { padding-left:14px; padding-right:14px; }
+  .cols-main, .cols-2 { grid-template-columns:minmax(0,1fr); }
+  .deckgrid { grid-template-columns:repeat(auto-fill, minmax(170px, 1fr)); }
+  .sheet { width:100vw; }
+}
 """
 
 _SCRIPT = """
 const Key = { value: "" };
+const State = { tab:"overview", decks:null, training:null, logTimer:null, trainTimer:null, logFilter:"", logLevel:"all" };
 function $(id){ return document.getElementById(id); }
-function esc(text){ return String(text==null?"":text).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function esc(text){ return String(text==null?"":text).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function toast(text, kind){
+  const box = $("toasts"); if (!box) return;
+  const el = document.createElement("div");
+  el.className = "toast " + (kind || "");
+  el.textContent = text;
+  box.appendChild(el);
+  setTimeout(() => { el.style.opacity = "0"; setTimeout(() => el.remove(), 300); }, 4200);
+}
 async function api(path){
   const res = await fetch(path, { headers: Key.value ? { "X-API-Key": Key.value } : {} });
   if (res.status === 401) { location.href = "/login"; throw new Error("unauthorized"); }
@@ -869,295 +1351,544 @@ async function api(path){
 async function postApi(path, payload){
   const headers = { "Content-Type": "application/json" };
   if (Key.value) headers["X-API-Key"] = Key.value;
-  const res = await fetch(path, { method: "POST", headers: headers, body: JSON.stringify(payload || {}) });
+  const res = await fetch(path, { method:"POST", headers, body: JSON.stringify(payload || {}) });
   if (res.status === 401) { location.href = "/login"; throw new Error("unauthorized"); }
   return await res.json();
 }
+function art(cardId, cls){
+  if (!cardId) return `<div class="${cls}">${ICON.back}</div>`;
+  return `<div class="${cls}"><img loading="lazy" src="/api/art/${esc(cardId)}" alt=""
+     onerror="this.parentNode.innerHTML='${ICON.back.replace(/'/g, "&#39;")}'"></div>`;
+}
+const ICON = {
+  back: '<svg class="i" viewBox="0 0 24 24"><rect x="3.5" y="3.5" width="17" height="17" rx="3"/><path d="M8 8h8v8H8z"/></svg>',
+  deck: '<svg class="i" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="15" rx="2.2"/><path d="M8 3h10a2 2 0 0 1 2 2v13"/><path d="M7.5 11h4"/></svg>',
+  train: '<svg class="i" viewBox="0 0 24 24"><path d="M12 3v3M6.5 5.5l2 2M17.5 5.5l-2 2"/><rect x="4" y="10" width="16" height="10" rx="3"/><path d="M9 15h6"/></svg>',
+  logs: '<svg class="i" viewBox="0 0 24 24"><path d="M5 4h14v16H5z"/><path d="M8.5 9h7M8.5 12.5h7M8.5 16h4"/></svg>',
+  gear: '<svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.2M12 18.8V21M4.2 7.5l1.9 1.1M17.9 15.4l1.9 1.1M4.2 16.5l1.9-1.1M17.9 8.6l1.9-1.1"/></svg>',
+  home: '<svg class="i" viewBox="0 0 24 24"><path d="M4 10.5 12 4l8 6.5V20H4z"/><path d="M10 20v-5h4v5"/></svg>',
+  play: '<svg class="i" viewBox="0 0 24 24"><path d="M7 5l12 7-12 7z"/></svg>',
+  stop: '<svg class="i" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+  refresh: '<svg class="i" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20 4v4h-4"/></svg>',
+  search: '<svg class="i" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5 20 20"/></svg>',
+  warn: '<svg class="i" viewBox="0 0 24 24"><path d="M12 4.5 20.5 19h-17z"/><path d="M12 10v4M12 16.5v.01"/></svg>',
+  info: '<svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8v.01"/></svg>',
+  chart: '<svg class="i" viewBox="0 0 24 24"><path d="M5 19V9M12 19V5M19 19v-7"/></svg>',
+  spark: '<svg class="i" viewBox="0 0 24 24"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/></svg>',
+  key: '<svg class="i" viewBox="0 0 24 24"><circle cx="8.5" cy="14.5" r="3.5"/><path d="M11 12 20 3M17 6l2.5 2.5"/></svg>',
+};
+function statusLabel(status){ return ({running:"跑着", done:"成功", failed:"失败", cancelled:"已停止"})[status] || status; }
+function statusClass(status){ return ({running:"run", done:"ok", failed:"err", cancelled:"warn"})[status] || "dim"; }
+function statusChip(status){ return `<span class="chip ${statusClass(status)}">${esc(statusLabel(status))}</span>`; }
+function shortTime(stamp){ return String(stamp || "").slice(5); }
+
 function tab(name){
-  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
-  document.querySelectorAll("section").forEach(s => s.classList.toggle("active", s.id === "tab-" + name));
+  State.tab = name;
+  document.querySelectorAll(".navlink").forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+  document.querySelectorAll("section.view").forEach(s => s.classList.toggle("active", s.id === "view-" + name));
+  const titles = {overview:["总览","卡组池、房间与训练状态"],decks:["卡组","群友投稿与内置卡组"],
+                  training:["训练功能","推演 / 擂台 / 体检 / 复盘"],logs:["日志","宿主日志（可按关键词过滤）"],
+                  config:["配置","当前生效的插件配置（只读）"]};
+  const pair = titles[name] || ["面板",""];
+  $("page-title").textContent = pair[0]; $("page-sub").textContent = pair[1];
   if (name === "overview") loadOverview();
   if (name === "decks") loadDecks();
   if (name === "training") loadTraining();
   if (name === "logs") loadLogs();
   if (name === "config") loadConfig();
 }
+function stopTimers(){
+  if (State.logTimer) { clearInterval(State.logTimer); State.logTimer = null; }
+  if (State.trainTimer) { clearInterval(State.trainTimer); State.trainTimer = null; }
+}
+
+/* ------------------------------ 总览 ------------------------------ */
 async function loadOverview(){
   const d = await api("/api/status");
   if (!d.ok) return;
-  $("ov-cards").innerHTML = [
-    ["已注册卡组", d.decks.total],
-    ["随机池", d.decks.in_random],
-    ["有专属脚本", d.decks.with_script],
-    ["已挑样式", d.decks.with_style],
-    ["进行中房间", (d.rooms||[]).length],
-  ].map(([k,v]) => `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join("");
   const counts = d.training.counts || {};
-  const statusText = Object.keys(counts).length
-    ? Object.entries(counts).map(([k,v]) => `${statusLabel(k)} ${v}`).join("　")
-    : "还没有训练记录";
-  $("ov-training").innerHTML = `<table><tbody>
-     <tr><td class="muted">训练功能</td><td>${d.training.enabled ? "已启用" : "已关闭（training.enabled = false）"}</td></tr>
-     <tr><td class="muted">记录</td><td>${esc(statusText)}</td></tr>
-     <tr><td class="muted">训练模型</td><td>${esc(d.training.model)}</td></tr>
-     <tr><td class="muted">工作目录</td><td class="mono">${esc(d.training.workspace)}</td></tr>
-     <tr><td class="muted">单次擂台上限</td><td>${esc(d.training.max_duels_per_run)} 局</td></tr>
-     </tbody></table>`;
-  $("ov-webui").innerHTML = `<table><tbody>
-     <tr><td class="muted">面板地址</td><td class="mono">${esc(d.webui.url)}</td></tr>
-     <tr><td class="muted">监听</td><td class="mono">${esc(d.webui.host)}:${esc(d.webui.port)}</td></tr>
-     <tr><td class="muted">密钥来源</td><td>${esc(d.webui.key_source)}</td></tr>
-     <tr><td class="muted">密钥文件</td><td class="mono">${esc(d.webui.key_file || "（由配置或环境变量提供）")}</td></tr>
-     <tr><td class="muted">启动时间</td><td>${esc(d.webui.started_at)}</td></tr>
-     <tr><td class="muted">数据目录</td><td class="mono">${esc(d.plugin.data_dir)}</td></tr>
-     </tbody></table>`;
+  const running = counts.running || 0;
+  const trainSub = [counts.done ? `成功 ${counts.done}` : "", counts.failed ? `失败 ${counts.failed}` : ""]
+    .filter(Boolean).join("　") || "还没有记录";
+  $("ov-stats").innerHTML = [
+    ["已注册卡组", d.decks.total, ICON.deck, d.decks.groups + " 个来源"],
+    ["随机池", d.decks.in_random, ICON.spark, "能随机抽到"],
+    ["专属脚本", d.decks.with_script, ICON.gear, "自写执行器"],
+    ["进行中房间", (d.rooms||[]).length, ICON.play, (d.rooms||[]).length ? "正在打" : "空闲"],
+    ["训练任务", running ? running : (counts.done || 0), ICON.train, running ? "正在跑" : trainSub],
+  ].map(([k,v,ic,sub]) => `<div class="stat"><div class="k">${ic}${esc(k)}</div>
+      <div class="v">${esc(v)}</div><div class="s">${esc(sub)}</div></div>`).join("");
+
+  const rooms = d.rooms || [];
+  $("ov-rooms").innerHTML = rooms.length
+    ? `<div class="rooms">${rooms.map(r => `<div class="room"><span class="dot"></span>
+        <b>${esc(r.deck_name || "未记录卡组")}</b>
+        <span class="faint">群 ${esc(r.group_id || "-")}</span>
+        <span class="sp" style="flex:1"></span>
+        <span class="mono faint">${esc(r.stream_id)}</span></div>`).join("")}</div>`
+    : `<div class="empty">${ICON.play}<div>现在没有进行中的对局</div></div>`;
+
+  const trainRows = Object.keys(counts).length
+    ? Object.entries(counts).map(([k,v]) => `<span class="chip ${statusClass(k)}">${esc(statusLabel(k))} ${esc(v)}</span>`).join(" ")
+    : `<span class="faint">还没有训练记录</span>`;
+  $("ov-training").innerHTML = `<dl class="kv">
+      <dt>状态</dt><dd>${d.training.enabled ? '<span class="chip ok">已启用</span>' : '<span class="chip dim">已关闭</span>'}</dd>
+      <dt>记录</dt><dd style="display:flex;gap:6px;flex-wrap:wrap">${trainRows}</dd>
+      <dt>训练模型</dt><dd><span class="chip brand">${esc(d.training.model)}</span></dd>
+      <dt>单次擂台</dt><dd>最多 ${esc(d.training.max_duels_per_run)} 局</dd>
+      <dt>工作目录</dt><dd class="mono faint">${esc(d.training.workspace)}</dd>
+    </dl>`;
+
+  $("ov-webui").innerHTML = `<dl class="kv">
+      <dt>面板地址</dt><dd><a id="panel-url" href="${esc(d.webui.url)}" target="_blank" rel="noreferrer">${esc(d.webui.url)}</a></dd>
+      <dt>监听</dt><dd class="mono">${esc(d.webui.host)}:${esc(d.webui.port)}</dd>
+      <dt>密钥来源</dt><dd>${esc(d.webui.key_source)}</dd>
+      <dt>密钥文件</dt><dd class="mono faint">${esc(d.webui.key_file || "（由配置或环境变量提供）")}</dd>
+      <dt>启动于</dt><dd>${esc(d.webui.started_at)}</dd>
+      <dt>数据目录</dt><dd class="mono faint">${esc(d.plugin.data_dir)}</dd>
+    </dl>`;
+  // 侧栏底部也写上面板地址：端口改了以后，用户第一眼要看的就是"现在到底在哪个端口"
+  const side = $("side-url");
+  if (side) { side.textContent = d.webui.url; side.href = d.webui.url; }
+  loadRecentRuns();
 }
-function statusLabel(status){
-  return ({running:"跑着", done:"成功", failed:"失败", cancelled:"已停止"})[status] || status;
+
+async function loadRecentRuns(){
+  const box = $("ov-runs");
+  if (!box) return;
+  const d = await api("/api/training");
+  if (!d.ok) { box.innerHTML = `<div class="faint">读不到训练记录</div>`; return; }
+  const runs = (d.runs || []).slice(0, 4);
+  box.innerHTML = runs.length ? `<div class="runlist">${runs.map(r => `
+      <div class="run" onclick="showRun('${esc(r.run_id)}')">
+        <div class="sp"><div class="ttl">${esc(r.title)}</div>
+          <div class="meta">${esc(r.started_at)}${r.duration_seconds==null?"":"　"+esc(r.duration_seconds)+"s"}</div></div>
+        ${statusChip(r.status)}</div>`).join("")}</div>`
+    : `<div class="faint">还没有训练记录——去训练页起一个 combo 推演试试。</div>`;
 }
-function statusBadge(status){
-  return `<span class="badge ${esc(status)}">${esc(statusLabel(status))}</span>`;
-}
+
+/* ------------------------------ 卡组 ------------------------------ */
 async function loadDecks(){
   const d = await api("/api/decks");
   if (!d.ok) return;
-  if (!d.groups.length) { $("decks-body").innerHTML = `<p class="muted">卡组池是空的。</p>`; return; }
-  $("decks-body").innerHTML = d.groups.map(g => `
-    <h3>${g.group_id === "__builtin__" ? "内置卡组" : "群 " + esc(g.group_id)} <span class="muted">（${g.decks.length} 副）</span></h3>
-    <table><thead><tr><th>编号</th><th>名称</th><th>投稿人</th><th>主/额外/副</th><th>随机池</th><th>专属脚本</th><th>挑样式</th><th></th></tr></thead>
-    <tbody>${g.decks.map(x => `<tr>
-      <td class="mono">${esc(x.deck_id)}</td>
-      <td>${esc(x.name)}</td><td class="muted">${esc(x.contributor)}</td>
-      <td class="mono">${x.main}/${x.extra}/${x.side}</td>
-      <td>${x.in_random ? "是" : "否"}</td>
-      <td class="mono">${esc(x.generated_script || "-")}</td>
-      <td class="mono">${esc(x.picked_style || "-")}</td>
-      <td><a href="#" onclick="showDeck('${esc(x.deck_id)}','${esc(g.group_id)}');return false;">详情</a></td>
-    </tr>`).join("")}</tbody></table>`).join("");
-  $("deck-detail").innerHTML = "";
+  State.decks = d.groups || [];
+  renderDecks("");
+  $("deck-search").oninput = (event) => renderDecks(event.target.value.trim().toLowerCase());
 }
+function renderDecks(needle){
+  const groups = State.decks || [];
+  const hit = (deck) => !needle || String(deck.name).toLowerCase().includes(needle)
+      || String(deck.deck_id) === needle || String(deck.style_now || "").toLowerCase().includes(needle);
+  const html = groups.map(g => {
+    const decks = (g.decks || []).filter(hit);
+    if (!decks.length) return "";
+    const title = g.group_id === "__builtin__" ? "内置卡组" : (g.group_id === "__optimized__" ? "调优产物" : "群 " + g.group_id);
+    return `<div class="grp"><h3>${ICON.deck}${esc(title)}<span class="n">${decks.length} 副</span></h3>
+      <div class="deckgrid">${decks.map(deckCard).join("")}</div></div>`;
+  }).join("");
+  $("decks-body").innerHTML = html || `<div class="empty">${ICON.search}<div>没有匹配的卡组</div></div>`;
+}
+function deckCard(deck){
+  const chips = [];
+  if (deck.in_random) chips.push('<span class="chip ok">随机池</span>');
+  if (deck.generated_script) chips.push(`<span class="chip brand">脚本 ${esc(deck.generated_script)}</span>`);
+  else if (deck.picked_style) chips.push(`<span class="chip">样式 ${esc(deck.picked_style)}</span>`);
+  else if (deck.style_now) chips.push(`<span class="chip dim">${esc(deck.style_now)}</span>`);
+  if (deck.file_missing) chips.push('<span class="chip err">卡表文件丢了</span>');
+  return `<div class="deck" onclick="showDeck('${esc(deck.deck_id)}','${esc(deck.group_id)}')">
+    ${art(deck.head_card, "art")}
+    <div class="meta">
+      <div class="nm" title="${esc(deck.name)}">${esc(deck.name)}</div>
+      <div class="ln">${chips.join("")}</div>
+      <div class="cnt">#${esc(deck.deck_id)}　主 ${esc(deck.main)}·额 ${esc(deck.extra)}·副 ${esc(deck.side)}${deck.contributor ? "　by " + esc(deck.contributor) : ""}</div>
+    </div></div>`;
+}
+function openSheet(){ $("deck-sheet").classList.add("on"); $("sheet-mask").classList.add("on"); }
+function closeSheet(){ $("deck-sheet").classList.remove("on"); $("sheet-mask").classList.remove("on"); }
 async function showDeck(deckId, group){
+  $("sheet-title").textContent = "载入中…";
+  $("sheet-body").innerHTML = "";
+  openSheet();
   const d = await api(`/api/deck/${encodeURIComponent(deckId)}?group=${encodeURIComponent(group)}`);
-  if (!d.ok) { $("deck-detail").innerHTML = `<p class="muted">${esc(d.error)}</p>`; return; }
+  if (!d.ok) { $("sheet-title").textContent = "打不开"; $("sheet-body").innerHTML = `<div class="banner err">${ICON.warn}${esc(d.error)}</div>`; return; }
   const deck = d.deck;
-  const zone = (title, items) => items && items.length
-      ? `<h4>${title}（${items.length}）</h4><div class="mono muted">${items.map(esc).join("、")}</div>` : "";
-  $("deck-detail").innerHTML = `<div class="card">
-    <h3>${esc(deck.name)}</h3>
-    <p class="muted mono">${esc(deck.ydk_path)}</p>
-    ${deck.error ? `<p class="muted">${esc(deck.error)}</p>` : ""}
-    ${zone("主卡组", deck.cards.main)}
-    ${zone("额外卡组", deck.cards.extra)}
-    ${zone("副卡组", deck.cards.side)}
-  </div>`;
+  const chips = [
+    deck.in_random ? '<span class="chip ok">随机池</span>' : '<span class="chip dim">不进随机</span>',
+    deck.generated_script ? `<span class="chip brand">脚本 ${esc(deck.generated_script)}</span>` : "",
+    deck.picked_style ? `<span class="chip">挑样式 ${esc(deck.picked_style)}</span>` : "",
+    deck.contributor ? `<span class="chip">投稿 ${esc(deck.contributor)}</span>` : "",
+  ].join(" ");
+  const zone = (label, key) => {
+    const rows = (deck.entries && deck.entries[key]) || [];
+    if (!rows.length) return "";
+    const total = (deck.counts && deck.counts[key]) || rows.length;
+    return `<div class="zone"><h4>${esc(label)}<span class="n">${esc(total)} 张 / ${rows.length} 种</span></h4>
+      <div class="cardrow">${rows.map(c => `<div class="crow">
+        ${art(c.id, "thumb")}<div class="nm" title="${esc(c.name)}">${esc(c.name)}</div>
+        <div class="ct">×${esc(c.count)}</div></div>`).join("")}</div></div>`;
+  };
+  $("sheet-title").textContent = deck.name || `卡组 #${deck.deck_id}`;
+  $("sheet-body").innerHTML = `
+    <div class="hero">${art(deck.head_card, "art")}
+      <div style="min-width:0"><div class="ln" style="display:flex;gap:6px;flex-wrap:wrap">${chips}</div>
+        <div class="faint mono ell" style="margin-top:8px;font-size:11.5px" title="${esc(deck.ydk_path)}">#${esc(deck.deck_id)}　${esc(deck.ydk_path)}</div></div></div>
+    ${deck.error ? `<div class="banner warn">${ICON.warn}${esc(deck.error)}</div>` : ""}
+    ${zone("主卡组", "main")}${zone("额外卡组", "extra")}${zone("副卡组", "side")}`;
 }
-let trainingTimer = null;
+
+/* ------------------------------ 训练 ------------------------------ */
 async function loadTraining(){
   const d = await api("/api/training");
-  if (!d.ok) { $("training-body").innerHTML = `<p class="muted">${esc(d.error||"读不到训练数据")}</p>`; return; }
+  if (!d.ok) { $("training-body").innerHTML = `<div class="banner err">${ICON.warn}${esc(d.error||"读不到训练数据")}</div>`; return; }
   const banners = [];
-  if (!d.enabled) banners.push(`<div class="banner warn">训练功能在配置里关着（training.enabled = false）：这一页只能看历史记录。</div>`);
-  if (d.enabled && !d.bridge_ready) banners.push(`<div class="banner err">训练执行器没建起来——看插件日志里“训练功能”那一行找原因。</div>`);
+  if (!d.enabled) banners.push(`<div class="banner warn">${ICON.info}训练功能在配置里关着（<span class="mono">training.enabled = false</span>）：这一页只能看历史记录。</div>`);
+  if (d.enabled && !d.bridge_ready) banners.push(`<div class="banner err">${ICON.warn}训练执行器没建起来——看插件日志里"训练功能"那一行找原因。</div>`);
   $("training-banners").innerHTML = banners.join("");
 
   const active = d.active;
-  if (active) {
-    $("training-active").innerHTML = `<div class="kind">
-      <h4>正在跑：${esc(active.title)} ${statusBadge(active.status)}</h4>
-      <p class="note">${esc(active.kind_title)}｜起了 ${esc(active.started_at)}｜${active.duration_seconds==null?"":esc(active.duration_seconds)+" 秒"}｜编号 ${esc(active.run_id)}</p>
-      <button class="ghost" onclick="stopTraining()">停掉</button>
-      <pre>${esc((active.tail||[]).join("\\n")) || "（还没有输出）"}</pre>
-    </div>`;
-  } else {
-    $("training-active").innerHTML = `<p class="muted">现在没有任务在跑。</p>`;
-  }
+  $("training-active").innerHTML = active ? `<div class="live">
+      <div class="hd"><span class="spin"></span><b>${esc(active.title)}</b>${statusChip(active.status)}
+        <span class="faint" style="font-size:12px">起了 ${esc(active.started_at)}${active.duration_seconds==null?"":"　"+esc(active.duration_seconds)+" 秒"}</span>
+        <span style="flex:1"></span>
+        <button class="btn danger sm" onclick="stopTraining()">${ICON.stop}停止</button></div>
+      <pre class="log" id="live-log">${esc((active.tail||[]).join("\\n")) || "（还没有输出）"}</pre></div>`
+    : `<div class="banner">${ICON.info}现在没有任务在跑。</div>`;
 
   const deckOptions = (d.decks||[]).map(x =>
     `<option value="${esc(x.deck_id)}">${x.is_builtin?"[内置] ":""}${esc(x.name)}（#${esc(x.deck_id)}）</option>`).join("");
   $("training-forms").innerHTML = (d.kinds||[]).map(k => {
-    const disabled = (!k.ready || active || !k.bridge_ready) ? "disabled" : "";
-    const rows = [];
+    const disabled = (!k.ready || active || !d.bridge_ready) ? "disabled" : "";
+    const fields = [];
     if (k.fields.includes("deck")) {
-      rows.push(`<label class="field">卡组<select id="f-${k.kind}-deck">${deckOptions}</select></label>`);
+      fields.push(`<label class="field"><span>卡组</span><select id="f-${k.kind}-deck">${deckOptions}</select></label>`);
     }
     if (k.fields.includes("duels")) {
-      rows.push(`<label class="field">局数<input id="f-${k.kind}-duels" type="number" value="${d.max_duels_per_run}" min="2" max="${d.max_duels_per_run}"></label>`);
+      fields.push(`<label class="field"><span>局数（逐局交替座位）</span>
+        <input id="f-${k.kind}-duels" type="number" value="${esc(d.max_duels_per_run)}" min="2" max="${esc(d.max_duels_per_run)}"></label>`);
     }
     if (k.fields.includes("style_a")) {
-      rows.push(`<label class="field">脚本 A<input id="f-${k.kind}-style-a" placeholder="如 RaiseMoon"></label>`);
-      rows.push(`<label class="field">脚本 B<input id="f-${k.kind}-style-b" placeholder="如 Gen88"></label>`);
+      fields.push(`<label class="field"><span>脚本 A</span><input id="f-${k.kind}-style-a" placeholder="如 RaiseMoon"></label>`);
+      fields.push(`<label class="field"><span>脚本 B</span><input id="f-${k.kind}-style-b" placeholder="如 Gen88"></label>`);
     }
     if (k.fields.includes("style")) {
-      rows.push(`<label class="field">自写执行器名<input id="f-${k.kind}-style" placeholder="如 KillerTune；留空则按卡组编号"><span class="muted">查的是插件 executors/ 里那份源码；WindBot 自带的那些没有源码文件，查不到</span></label>`);
-      rows.push(`<label class="field">卡组编号<input id="f-${k.kind}-deck-ids" placeholder="如 95,99,88"></label>`);
-      rows.push(`<label class="field">群号<input id="f-${k.kind}-group" placeholder="按某群的随机池体检"></label>`);
+      fields.push(`<label class="field"><span>自写执行器名</span><input id="f-${k.kind}-style" placeholder="如 KillerTune">
+        <span class="info">查的是插件 executors/ 里的源码；WindBot 自带的没有源码文件</span></label>`);
+      fields.push(`<label class="field"><span>卡组编号</span><input id="f-${k.kind}-deck-ids" placeholder="如 95,99,88"></label>`);
+      fields.push(`<label class="field"><span>群号</span><input id="f-${k.kind}-group" placeholder="按某群随机池体检"></label>`);
     }
     if (k.fields.includes("latest")) {
-      rows.push(`<label class="field">取最近几份<input id="f-${k.kind}-latest" type="number" value="5" min="1" max="50"></label>`);
-      rows.push(`<label class="field">对比卡组编号<input id="f-${k.kind}-deck" placeholder="可留空"></label>`);
+      fields.push(`<label class="field"><span>取最近几份</span><input id="f-${k.kind}-latest" type="number" value="5" min="1" max="50"></label>`);
+      fields.push(`<label class="field"><span>对比卡组编号</span><input id="f-${k.kind}-deck" placeholder="可留空"></label>`);
     }
     return `<div class="kind">
-      <h4>${esc(k.title)}</h4>
-      <p class="note">${esc(k.note || "")}${k.needs_engine ? "｜会真的起对局，房间里有人时不能跑" : ""}</p>
-      <div class="row">${rows.join("")}<button class="primary" ${disabled} onclick="startTraining('${k.kind}')">开始</button></div>
+      <h4>${ICON.train}${esc(k.title)}${k.needs_engine ? '<span class="chip warn">会起对局</span>' : '<span class="chip dim">只读</span>'}</h4>
+      <p class="note">${esc(k.note || "")}${k.needs_engine ? "　房间里有人在打时不能跑（会抢内核与端口）" : ""}</p>
+      <div class="fields">${fields.join("")}</div>
+      <div class="go"><button class="btn primary" ${disabled} onclick="startTraining('${k.kind}')">${ICON.play}开始</button></div>
     </div>`;
   }).join("");
 
   const runs = d.runs || [];
-  $("training-runs").innerHTML = runs.length ? `<table>
-      <thead><tr><th>编号</th><th>种类</th><th>标题</th><th>状态</th><th>开始</th><th>耗时</th><th>结论</th></tr></thead>
-      <tbody>${runs.map(r => `<tr>
-        <td class="mono">${esc(r.run_id)}</td>
-        <td>${esc(r.kind_title)}</td>
-        <td>${esc(r.title)}</td>
-        <td>${statusBadge(r.status)}</td>
-        <td class="mono">${esc(r.started_at)}</td>
-        <td class="mono">${r.duration_seconds==null?"-":esc(r.duration_seconds)+"s"}</td>
-        <td><a href="#" onclick="showRun('${esc(r.run_id)}');return false;">详情</a></td>
-      </tr>`).join("")}</tbody></table>` : `<p class="muted">还没有训练记录。</p>`;
+  $("training-runs").innerHTML = runs.length ? `<div class="runlist">${runs.map(r => {
+    const summary = r.summary || {};
+    const note = summary.conclusion ? String(summary.conclusion).slice(0, 90)
+      : (r.error ? String(r.error).slice(0, 90)
+      : (summary.conclusion_error ? "结论没生成：" + String(summary.conclusion_error).slice(0, 70)
+      : (summary.exit_code === 0 ? "（没有结论）" : "")));
+    return `<div class="run" onclick="showRun('${esc(r.run_id)}')">
+      <span class="mono rid">${esc(r.run_id)}</span>
+      <div class="sp"><div class="ttl">${esc(r.title)}</div>
+        <div class="meta">${esc(r.kind_title)}　${esc(r.started_at)}${r.duration_seconds==null?"":"　"+esc(r.duration_seconds)+"s"}${note ? "　·　"+esc(note) : ""}</div></div>
+      ${statusChip(r.status)}</div>`;
+  }).join("")}</div>` : `<div class="empty">${ICON.train}<div>还没有训练记录</div></div>`;
   $("training-run-detail").innerHTML = "";
 
-  if (active && !trainingTimer) trainingTimer = setInterval(loadTraining, 5000);
-  if (!active && trainingTimer) { clearInterval(trainingTimer); trainingTimer = null; }
+  if (active && !State.trainTimer) State.trainTimer = setInterval(() => { if (State.tab === "training") loadTraining(); }, 5000);
+  if (!active && State.trainTimer) { clearInterval(State.trainTimer); State.trainTimer = null; }
 }
 async function showRun(runId){
   const d = await api(`/api/training/run/${encodeURIComponent(runId)}`);
-  if (!d.ok) { $("training-run-detail").innerHTML = `<p class="muted">${esc(d.error)}</p>`; return; }
-  const run = d.run;
-  const summary = run.summary || {};
-  const warnings = summary.warnings || [];
+  if (!d.ok) { toast(d.error || "打不开这条记录", "err"); return; }
+  const run = d.run, summary = run.summary || {};
   const parts = [];
-  if (run.error) parts.push(`<div class="banner err">${esc(run.error)}</div>`);
-  if (summary.conclusion) parts.push(`<h4>结论</h4><p>${esc(summary.conclusion)}</p>`);
-  if (summary.conclusion_error) parts.push(`<div class="banner warn">结论没生成：${esc(summary.conclusion_error)}</div>`);
-  if (warnings.length) parts.push(`<h4>校验疑点</h4><ul>${warnings.map(w=>`<li>${esc(w)}</li>`).join("")}</ul>`);
-  if (summary.guide_path) parts.push(`<p class="muted mono">推演已存档：${esc(summary.guide_path)}</p>`);
-  parts.push(`<h4>输出尾巴</h4><pre>${esc((run.tail||[]).join("\\n")) || "（没有输出）"}</pre>`);
-  $("training-run-detail").innerHTML = `<div class="kind"><h4>${esc(run.title)} ${statusBadge(run.status)}</h4>
-    <p class="note mono">${esc(JSON.stringify(run.params))}</p>${parts.join("")}</div>`;
+  if (run.error) parts.push(`<div class="banner err">${ICON.warn}${esc(run.error)}</div>`);
+  if (summary.conclusion) parts.push(`<h4 style="margin:6px 0 6px;font-size:13.5px">结论</h4><p style="margin:0">${esc(summary.conclusion)}</p>`);
+  if (summary.conclusion_error) parts.push(`<div class="banner warn">${ICON.info}结论没生成：${esc(summary.conclusion_error)}</div>`);
+  const warnings = summary.warnings || [];
+  if (warnings.length) parts.push(`<h4 style="margin:14px 0 6px;font-size:13.5px">校验疑点</h4>
+      <ul style="margin:0;padding-left:20px;font-size:12.5px">${warnings.map(w=>`<li>${esc(w)}</li>`).join("")}</ul>`);
+  if (summary.guide_path) parts.push(`<p class="faint mono ell" style="font-size:11.5px" title="${esc(summary.guide_path)}">推演存档：${esc(summary.guide_path)}</p>`);
+  if (summary.guide_text) parts.push(`<h4 style="margin:14px 0 6px;font-size:13.5px">推演笔记</h4>
+      <pre class="log">${esc(summary.guide_text)}</pre>`);
+  parts.push(`<h4 style="margin:14px 0 6px;font-size:13.5px">输出尾巴</h4>
+      <pre class="log">${esc((run.tail||[]).join("\\n")) || "（这类任务没有子进程输出——看上面的推演笔记/结论）"}</pre>`);
+  $("sheet-title").innerHTML = `${esc(run.title)} ${statusChip(run.status)}`;
+  $("sheet-body").innerHTML = `<div class="faint mono" style="font-size:11.5px;margin-bottom:10px">${esc(JSON.stringify(run.params))}　起 ${esc(run.started_at)}${run.duration_seconds==null?"":"　耗时 "+esc(run.duration_seconds)+"s"}</div>${parts.join("")}`;
+  openSheet();
 }
-function trainingField(kind, name){
-  const el = $(`f-${kind}-${name}`);
-  return el ? el.value.trim() : "";
-}
+function fieldValue(kind, name){ const el = $(`f-${kind}-${name}`); return el ? el.value.trim() : ""; }
 async function startTraining(kind){
-  const payload = { kind: kind };
-  const deck = trainingField(kind, "deck");
+  const payload = { kind };
+  const deck = fieldValue(kind, "deck");
   if (deck) payload.deck_id = Number(deck);
   if (kind === "arena") {
-    payload.duels = Number(trainingField(kind, "duels") || 60);
-    payload.style_a = trainingField(kind, "style-a");
-    payload.style_b = trainingField(kind, "style-b");
+    payload.duels = Number(fieldValue(kind, "duels") || 60);
+    payload.style_a = fieldValue(kind, "style-a");
+    payload.style_b = fieldValue(kind, "style-b");
   }
   if (kind === "script") {
-    payload.style = trainingField(kind, "style");
-    payload.deck_ids = trainingField(kind, "deck-ids");
-    payload.group = trainingField(kind, "group");
+    payload.style = fieldValue(kind, "style");
+    payload.deck_ids = fieldValue(kind, "deck-ids");
+    payload.group = fieldValue(kind, "group");
   }
   if (kind === "replay") {
-    payload.latest = Number(trainingField(kind, "latest") || 5);
-    const compare = trainingField(kind, "deck");
+    payload.latest = Number(fieldValue(kind, "latest") || 5);
+    const compare = fieldValue(kind, "deck");
     if (compare) payload.deck_id = Number(compare);
   }
   const d = await postApi("/api/training/start", payload);
-  if (!d.ok) { $("training-banners").innerHTML = `<div class="banner err">${esc(d.error)}</div>`; return; }
+  if (!d.ok) { toast(d.error || "起不来", "err"); return; }
+  toast(`已起任务：${d.run.title}`, "ok");
   loadTraining();
 }
 async function stopTraining(){
   const d = await postApi("/api/training/stop", {});
-  if (!d.ok) { $("training-banners").innerHTML = `<div class="banner err">${esc(d.error)}</div>`; return; }
+  if (!d.ok) { toast(d.error || "停不下来", "err"); return; }
+  toast(d.stopped ? "已发出停止信号" : "没有在跑的任务", "ok");
   loadTraining();
+}
+
+/* ------------------------------ 日志 ------------------------------ */
+function levelOf(line){
+  const m = line.match(/\\[(TRACE|DEBUG|INFO|WARNING|WARN|ERROR|CRITICAL)\\]/);
+  if (!m) return "info";
+  const lv = m[1];
+  if (lv === "ERROR" || lv === "CRITICAL") return "error";
+  if (lv === "WARNING" || lv === "WARN") return "warning";
+  if (lv === "DEBUG" || lv === "TRACE") return "debug";
+  return "info";
+}
+function paintLogs(lines){
+  const keep = [];
+  for (const line of lines) {
+    const lv = levelOf(line);
+    if (State.logLevel === "error" && lv !== "error") continue;
+    if (State.logLevel === "warning" && lv !== "error" && lv !== "warning") continue;
+    keep.push(`<span class="lv-${lv}">${esc(line)}</span>`);
+  }
+  $("log-pre").innerHTML = keep.length ? keep.join("\\n") : "（没有匹配的日志）";
 }
 async function loadLogs(){
   const lines = $("log-lines").value || 200;
-  const filter = $("log-filter").value || "";
-  const d = await api(`/api/logs?lines=${encodeURIComponent(lines)}&filter=${encodeURIComponent(filter)}`);
-  $("log-pre").textContent = d.ok ? (d.lines.join("\\n") || "（没有匹配的日志）") : d.error;
+  const keyword = $("log-filter").value || "";
+  const d = await api(`/api/logs?lines=${encodeURIComponent(lines)}&filter=${encodeURIComponent(keyword)}`);
+  if (!d.ok) { $("log-pre").textContent = d.error; return; }
+  paintLogs(d.lines || []);
 }
+function setLevel(level){
+  State.logLevel = level;
+  document.querySelectorAll("#log-levels button").forEach(b => b.classList.toggle("on", b.dataset.level === level));
+  loadLogs();
+}
+
+/* ------------------------------ 配置 ------------------------------ */
+const CFG_ICON = {plugin:ICON.info, paths:ICON.deck, duel:ICON.play, llm:ICON.spark, wiki:ICON.search,
+                  training:ICON.train, webui:ICON.gear};
 async function loadConfig(){
   const d = await api("/api/config");
-  $("config-pre").textContent = d.ok ? JSON.stringify(d.config, null, 2) : d.error;
+  if (!d.ok) { $("config-body").innerHTML = `<div class="banner err">${ICON.warn}${esc(d.error)}</div>`; return; }
+  const cfg = d.config || {};
+  const sections = Object.keys(cfg);
+  $("config-body").innerHTML = sections.map(name => {
+    const block = cfg[name];
+    let rows = "";
+    if (block && typeof block === "object" && !Array.isArray(block)) {
+      const descs = (State.schema && State.schema[name]) || {};
+      rows = Object.entries(block).map(([key, value]) => {
+        const shown = Array.isArray(value) ? (value.length ? value.join("、") : "（空）")
+          : (value === "" ? "（空）" : (value === true ? "开" : (value === false ? "关" : value)));
+        const desc = descs[key] ? `<div class="d">${esc(descs[key])}</div>` : "";
+        return `<div class="cfgrow"><div class="k">${esc(key)}</div>
+          <div class="v">${esc(shown)}</div>${desc}</div>`;
+      }).join("");
+    } else {
+      rows = `<div class="cfgrow"><div class="v">${esc(JSON.stringify(block))}</div></div>`;
+    }
+    return `<div class="panel cfgsec"><div class="hd"><h3>${CFG_ICON[name] || ICON.info}${esc(name)}</h3></div>
+      <div class="bd"><div class="cfggrid">${rows}</div></div></div>`;
+  }).join("");
 }
-document.addEventListener("DOMContentLoaded", () => {
+async function loadSchema(){
+  try {
+    const d = await api("/api/config/schema");
+    State.schema = (d && d.ok && d.sections) ? d.sections : null;
+  } catch (e) { State.schema = null; }
+}
+
+/* ------------------------------ 启动 ------------------------------ */
+document.addEventListener("DOMContentLoaded", async () => {
   const params = new URLSearchParams(location.search);
   const fromQuery = params.get("key");
-  if (fromQuery) { Key.value = fromQuery; }
-  document.querySelectorAll("nav button").forEach(b => b.onclick = () => tab(b.dataset.tab));
-  if ($("btn-logs")) $("btn-logs").onclick = loadLogs;
+  if (fromQuery) Key.value = fromQuery;
+  document.querySelectorAll(".navlink").forEach(b => b.onclick = () => tab(b.dataset.tab));
+  if ($("btn-logs-refresh")) $("btn-logs-refresh").onclick = loadLogs;
+  if ($("btn-logs-live")) $("btn-logs-live").onchange = (event) => {
+    if (State.logTimer) { clearInterval(State.logTimer); State.logTimer = null; }
+    if (event.target.checked) State.logTimer = setInterval(() => { if (State.tab === "logs") loadLogs(); }, 4000);
+  };
+  if ($("btn-training-refresh")) $("btn-training-refresh").onclick = loadTraining;
+  if ($("btn-overview-refresh")) $("btn-overview-refresh").onclick = loadOverview;
+  if ($("log-filter")) $("log-filter").addEventListener("keydown", (e) => { if (e.key === "Enter") loadLogs(); });
+  if ($("deck-search")) { /* 卡组页载入后再挂，见 loadDecks */ }
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSheet(); });
+  await loadSchema();
   tab("overview");
 });
 """
+
+def _icon_sprite() -> str:
+    """把 JS 里那套图标定义搬进页面（`ICON` 是 JS 常量，登录页只用得到其中两个）。
+
+    图标全部内联成 SVG，**不引任何外网资源**：面板在断网的机器上也要能正常打开。
+    """
+
+    return (
+        '<svg class="i" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="15" rx="2.2"/>'
+        '<path d="M8 3h10a2 2 0 0 1 2 2v13"/><path d="M7.5 11h4"/></svg>'
+    )
 
 
 def _login_page(error: str) -> str:
     """登录页：只问密钥，不透露其它信息。"""
 
-    message = f'<p style="color:#ff8a8a">{error}</p>' if error else ""
+    message = (
+        f'<div class="err"><svg class="i" viewBox="0 0 24 24"><path d="M12 4.5 20.5 19h-17z"/>'
+        f'<path d="M12 10v4M12 16.5v.01"/></svg>{error}</div>'
+        if error
+        else ""
+    )
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>麦麦玩游戏王 · 面板登录</title><style>{_STYLE}</style></head>
-<body><div class="login"><div class="card">
-<h1 style="margin-top:0;font-size:17px">麦麦玩游戏王 · 控制面板</h1>
-<p class="muted">请输入面板密钥（在插件配置 <span class="mono">webui.api_key</span>，
-或数据目录的 <span class="mono">{KEY_FILE_NAME}</span>，或环境变量
-<span class="mono">YGO_WEBUI_KEY</span>）。</p>
-{message}
-<form method="post" action="/login">
-<input type="password" name="key" placeholder="面板密钥" style="width:100%;margin-bottom:10px" autofocus>
-<button class="primary" type="submit" style="width:100%">进入</button>
-</form>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>麦麦玩游戏王 · 登录</title><style>{_STYLE}</style></head>
+<body><div class="login"><div class="box">
+  <div class="mark">{_icon_sprite()}</div>
+  <h1>麦麦玩游戏王</h1>
+  <p>输入面板密钥就能进来。面板只在本机监听，看的是卡组池、对局与训练任务。</p>
+  {message}
+  <form method="post" action="/login">
+    <label class="field"><span>面板密钥</span>
+      <input type="password" name="key" placeholder="粘贴密钥" autofocus autocomplete="current-password"></label>
+    <button class="btn primary" type="submit" style="width:100%;margin-top:14px">进入面板</button>
+  </form>
+  <div class="hint">密钥在插件配置 <code>webui.api_key</code>、数据目录的
+    <code>{KEY_FILE_NAME}</code>，或环境变量 <code>YGO_WEBUI_KEY</code> 里。</div>
 </div></div></body></html>"""
 
 
 def _app_page() -> str:
-    """主体单页：概览 / 卡组 / 日志 / 设置。"""
+    """主体单页：侧栏 + 五个视图（总览 / 卡组 / 训练 / 日志 / 配置）。"""
 
     return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>麦麦玩游戏王 · 控制面板</title><style>{_STYLE}</style></head>
 <body>
-<header>
-  <h1>麦麦玩游戏王</h1>
-  <span class="tag">控制面板</span>
-  <nav>
-    <button data-tab="overview" class="active">概览</button>
-    <button data-tab="decks">卡组</button>
-    <button data-tab="training">训练</button>
-    <button data-tab="logs">日志</button>
-    <button data-tab="config">配置</button>
-  </nav>
-  <span style="flex:1"></span>
-  <a href="/api/logout" class="muted">退出</a>
-</header>
-<main>
-  <section id="tab-overview" class="active">
-    <div class="cards" id="ov-cards"></div>
-    <h3>训练功能</h3><div id="ov-training"></div>
-    <h3>面板与运行环境</h3><div id="ov-webui"></div>
-  </section>
-  <section id="tab-decks">
-    <div id="decks-body"><p class="muted">加载中…</p></div>
-    <div id="deck-detail"></div>
-  </section>
-  <section id="tab-training">
-    <div id="training-banners"></div>
-    <div id="training-active"><p class="muted">加载中…</p></div>
-    <h3>起一个任务</h3>
-    <div id="training-forms"></div>
-    <h3>最近的任务</h3>
-    <div id="training-runs"></div>
-    <div id="training-run-detail"></div>
-  </section>
-  <section id="tab-logs">
-    <div class="row">
-      <input id="log-lines" type="number" value="200" min="20" max="2000" style="width:110px">
-      <input id="log-filter" placeholder="关键词过滤（如 WebUI、房间、错误）" style="flex:1;min-width:220px">
-      <button class="primary" id="btn-logs">刷新</button>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <div class="mark">{_icon_sprite()}</div>
+      <div><b>麦麦玩游戏王</b><span>控制面板</span></div>
     </div>
-    <pre id="log-pre">加载中…</pre>
-  </section>
-  <section id="tab-config">
-    <p class="muted">当前生效配置（密钥已隐去；本页只读，要改配置请到麦麦的插件配置页）。</p>
-    <pre id="config-pre">加载中…</pre>
-  </section>
-</main>
+    <nav>
+      <div class="navlink active" data-tab="overview"><svg class="i" viewBox="0 0 24 24"><path d="M4 10.5 12 4l8 6.5V20H4z"/><path d="M10 20v-5h4v5"/></svg>总览</div>
+      <div class="navlink" data-tab="decks"><svg class="i" viewBox="0 0 24 24"><rect x="3" y="6" width="12" height="15" rx="2.2"/><path d="M8 3h10a2 2 0 0 1 2 2v13"/><path d="M7.5 11h4"/></svg>卡组</div>
+      <div class="navlink" data-tab="training"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v3M6.5 5.5l2 2M17.5 5.5l-2 2"/><rect x="4" y="10" width="16" height="10" rx="3"/><path d="M9 15h6"/></svg>训练</div>
+      <div class="navlink" data-tab="logs"><svg class="i" viewBox="0 0 24 24"><path d="M5 4h14v16H5z"/><path d="M8.5 9h7M8.5 12.5h7M8.5 16h4"/></svg>日志</div>
+      <div class="navlink" data-tab="config"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.2M12 18.8V21M4.2 7.5l1.9 1.1M17.9 15.4l1.9 1.1M4.2 16.5l1.9-1.1M17.9 8.6l1.9-1.1"/></svg>配置</div>
+    </nav>
+    <div class="foot">面板只监听本机。<br><a id="side-url" href="http://127.0.0.1:17911">载入中…</a></div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <div><h1 id="page-title">总览</h1><div class="sub" id="page-sub"></div></div>
+      <span class="sp"></span>
+      <a class="btn sm" href="/api/logout">退出</a>
+    </div>
+
+    <div class="wrap">
+      <section class="view active" id="view-overview">
+        <div class="stats" id="ov-stats"></div>
+        <div class="grid cols-main" style="margin-top:14px">
+          <div>
+            <div class="panel"><div class="hd"><h3>进行中的对局</h3><span class="sp"></span>
+                <button class="btn sm" id="btn-overview-refresh">刷新</button></div>
+              <div class="bd" id="ov-rooms"></div></div>
+            <div class="panel" style="margin-top:14px"><div class="hd"><h3>面板与运行环境</h3></div>
+              <div class="bd" id="ov-webui"></div></div>
+          </div>
+          <div class="panel"><div class="hd"><h3>训练功能</h3></div>
+            <div class="bd" id="ov-training"></div></div>
+          <div class="panel" style="margin-top:14px"><div class="hd"><h3>最近的任务</h3><span class="sp"></span>
+              <a class="btn sm" href="#" onclick="tab('training');return false;">去训练页</a></div>
+            <div class="bd" id="ov-runs"></div></div>
+        </div>
+      </section>
+
+      <section class="view" id="view-decks">
+        <div class="toolbar">
+          <div class="grow"><label class="field"><span>搜索</span>
+            <input id="deck-search" placeholder="按卡组名 / 编号 / 脚本名过滤"></label></div>
+        </div>
+        <div id="decks-body"><div class="empty">加载中…</div></div>
+      </section>
+
+      <section class="view" id="view-training">
+        <div id="training-banners"></div>
+        <div id="training-active"></div>
+        <div class="grid cols-main">
+          <div>
+            <div class="panel" style="margin-bottom:14px"><div class="hd"><h3>起一个任务</h3>
+                <span class="sp"></span><span class="faint" style="font-size:12px">同一时刻只跑一个</span></div>
+              <div class="bd" id="training-forms"></div></div>
+          </div>
+          <div class="panel"><div class="hd"><h3>最近的任务</h3><span class="sp"></span>
+              <button class="btn sm" id="btn-training-refresh">刷新</button></div>
+            <div class="bd" id="training-runs"></div></div>
+        </div>
+        <div id="training-run-detail"></div>
+      </section>
+
+      <section class="view" id="view-logs">
+        <div class="toolbar">
+          <div class="seg" id="log-levels">
+            <button class="on" data-level="all" onclick="setLevel('all')">全部</button>
+            <button data-level="warning" onclick="setLevel('warning')">警告以上</button>
+            <button data-level="error" onclick="setLevel('error')">只看错误</button>
+          </div>
+          <div class="grow"><input id="log-filter" placeholder="关键词过滤（如 WebUI、房间、训练）"></div>
+          <label class="field" style="width:110px"><span>行数</span>
+            <input id="log-lines" type="number" value="200" min="20" max="2000"></label>
+          <button class="btn" id="btn-logs-refresh">刷新</button>
+          <label class="switch"><input type="checkbox" id="btn-logs-live">自动刷新</label>
+        </div>
+        <pre class="log" id="log-pre">加载中…</pre>
+      </section>
+
+      <section class="view" id="view-config">
+        <div class="banner"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8v.01"/></svg>
+          这一页只读：要改配置请到麦麦的插件配置页（WebUI → 插件 → 本插件）。密钥已隐去。</div>
+        <div id="config-body">加载中…</div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div class="sheet-mask" id="sheet-mask" onclick="closeSheet()"></div>
+<aside class="sheet" id="deck-sheet">
+  <div class="hd"><h3 id="sheet-title">详情</h3><span style="flex:1"></span>
+    <button class="btn sm" onclick="closeSheet()">关闭</button></div>
+  <div class="bd" id="sheet-body"></div>
+</aside>
+<div class="toasts" id="toasts"></div>
 <script>{_SCRIPT}</script>
 </body></html>"""

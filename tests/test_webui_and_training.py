@@ -865,6 +865,142 @@ async def _stop_now_kills_the_tree_within_unload_budget() -> None:
         )
 
 
+def test_webui_art_endpoint_serves_local_art_only_for_numeric_ids() -> None:
+    """卡图接口：只认数字卡号、只发本地有的图、没有就 404（**不联网**）。
+
+    这条护栏针对的是"用户输入进路径"这类问题：卡号必须是纯数字、文件名由卡号拼出来，
+    所以 `../` 那类输入从形状上就不成立。另外面板要快——缺图不在这里联网补，
+    交给查房那条链路（`duel/card_images.py`）慢慢补。
+    """
+
+    webui = _load("webui")
+    secret = "a" * 32
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        art_dir = root / "Art"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        (art_dir / "12345.jpg").write_bytes(b"\xff\xd8\xff\xe0fake-jpeg")
+        (art_dir / "22222.png").write_bytes(b"\x89PNG\r\n\x1a\nfake-png")
+        (art_dir / "33333.txt").write_text("不是图", encoding="utf-8")
+
+        plugin = StubPlugin(root / "data")
+        plugin.config.paths.card_art_dir = str(art_dir)
+        plugin.config.paths.card_art_fallback_dir = str(art_dir)
+        server, port = _start_panel(webui, plugin, secret)
+        headers = {"X-API-Key": secret}
+        try:
+            status, _body, reply = _http(port, "GET", "/api/art/12345", headers=headers)
+            assert status == 200, status
+            assert reply.get("Content-Type") == "image/jpeg", reply
+            assert "max-age" in reply.get("Cache-Control", ""), reply
+
+            status, _body, reply = _http(port, "GET", "/api/art/22222", headers=headers)
+            assert status == 200 and reply.get("Content-Type") == "image/png", reply
+
+            # 本地没有这张卡的图 → 404（前端画占位卡背）
+            status, _body, _reply = _http(port, "GET", "/api/art/99999", headers=headers)
+            assert status == 404, status
+            # 本地有同名 txt 也不该被当成图发出去
+            status, _body, _reply = _http(port, "GET", "/api/art/33333", headers=headers)
+            assert status == 404, status
+            # 非数字（含路径穿越的样子）一律 400/404，绝不拼进文件名
+            for bad in ("..%2F..%2Fetc", "abc", "12345.jpg"):
+                status, _body, _reply = _http(port, "GET", f"/api/art/{bad}", headers=headers)
+                assert status in (400, 404), (bad, status)
+            # 卡图接口同样要密钥
+            status, _body, _reply = _http(port, "GET", "/api/art/12345")
+            assert status == 401, status
+        finally:
+            server.stop_now()
+
+
+def test_deck_names_and_head_cards_come_from_the_card_db() -> None:
+    """卡组接口给的是**卡名**而不是卡号；头牌优先挑本地有图的那张。
+
+    两个都踩过：卡名那处调了不存在的 `card_db.get_name()`（异常被吞掉 → 整页显示卡号），
+    头牌那处固定取额外卡组第一张（结果一半卡组的缩略图是占位卡背，看着像图全挂了）。
+    """
+
+    webui = _load("webui")
+    secret = "b" * 32
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        data_dir = root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        art_dir = root / "Art"
+        art_dir.mkdir(parents=True, exist_ok=True)
+        # 只给"第二张额外卡"准备图：头牌应该因此跳过第一张
+        (art_dir / "5002.jpg").write_bytes(b"\xff\xd8\xff\xe0fake")
+
+        deck_text = "#main\n" + "\n".join(str(1000 + i) for i in range(3)) + "\n#extra\n5001\n5002\n!side\n"
+        deckpool = _load("duel.deckpool")
+        pool = deckpool.DeckPool(data_dir)
+        try:
+            pool.add(
+                group_id="111",
+                display_name="测试牌",
+                contributor_id="u",
+                contributor_name="群友",
+                ydk_text=deck_text,
+                deck_code="",
+                source_format="ydk",
+                main_count=3,
+                extra_count=2,
+                side_count=0,
+            )
+        finally:
+            # 一定要关：Windows 上没关连接，临时目录清理会报"文件正在使用"，
+            # 而那个报错会把真正的失败原因（比如参数写错）盖掉
+            pool.close()
+
+        plugin = StubPlugin(data_dir)
+        plugin.config.paths.card_art_dir = str(art_dir)
+        plugin.config.paths.card_art_fallback_dir = str(art_dir)
+        plugin._card_db = FakeCardDb(
+            {1000 + i: f"主卡{1000 + i}" for i in range(3)} | {5001: "额额外一", 5002: "额额外二"}
+        )
+
+        server, port = _start_panel(webui, plugin, secret)
+        headers = {"X-API-Key": secret}
+        try:
+            status, body, _reply = _http(port, "GET", "/api/decks", headers=headers)
+            deck = json.loads(body)["groups"][0]["decks"][0]
+            assert deck["head_card"] == 5002, f"头牌该挑本地有图的那张：{deck['head_card']}"
+
+            status, body, _reply = _http(
+                port, "GET", f"/api/deck/{deck['deck_id']}?group=111", headers=headers
+            )
+            detail = json.loads(body)["deck"]
+            names = [entry["name"] for entry in detail["entries"]["main"]]
+            assert all(name.startswith("主卡") for name in names), names
+            assert [entry["name"] for entry in detail["entries"]["extra"]] == ["额额外一", "额额外二"]
+            assert detail["entries"]["main"][0]["count"] == 1
+            assert detail["head_card"] == 5002
+        finally:
+            server.stop_now()
+            # 面板的请求是在**自己的线程**里跑的（daemon 线程，停服务时不会被 join），
+            # 刚发出去的那次请求可能还在读 deck_pool.db。等它收尾再删临时目录，
+            # 否则 Windows 上会报"文件正在使用"——那不是被测代码泄漏句柄，是测试自己的时序。
+            time.sleep(0.4)
+
+
+def test_panel_has_no_external_asset_references() -> None:
+    """面板的页面不引任何外网资源（断网也要能打开）。
+
+    这条锁的是"顺手挂个 CDN 图标/字体"这种改动：面板跑在国内的机器上，
+    外网字体一挂就是几秒白屏，而它本来只是看卡组与训练状态的小工具。
+    只允许 `/api/...` 这种同源地址与内联的 svg/data URI。
+    """
+
+    webui = _load("webui")
+    for html in (webui._login_page(""), webui._app_page()):
+        assert "//cdn" not in html, html[:200]
+        assert "http://" not in html.split("</style>")[0] or "127.0.0.1" in html, "样式里不该有外部地址"
+        for marker in ("fonts.googleapis", "unpkg", "jsdelivr", "cdnjs"):
+            assert marker not in html, f"页面里出现了外部资源：{marker}"
+    assert "<svg" in webui._app_page(), "图标应该是内联 svg"
+
+
 def main() -> int:
     """逐个执行测试；协程测试用 asyncio.run 驱动。"""
 
@@ -874,6 +1010,9 @@ def main() -> int:
         test_webui_port_conflict_reports_instead_of_raising,
         test_webui_training_endpoints_reach_the_plugin,
         test_training_store_lifecycle,
+        test_webui_art_endpoint_serves_local_art_only_for_numeric_ids,
+        test_deck_names_and_head_cards_come_from_the_card_db,
+        test_panel_has_no_external_asset_references,
         test_kill_tree_uses_taskkill_with_tree_flag,
         test_deck_digest_and_combo_check_catch_cards_outside_the_deck,
         test_combo_tolerates_non_json_reply_but_says_so,
