@@ -97,6 +97,8 @@ class FieldState:
     zones: Dict[ZoneKey, int] = field(default_factory=dict)
     #: (座位, 区域) -> 现在有几张卡；只有墓地/除外/额外三个区域（`PlayerField` 的三个计数字段读它）
     _stacks: Dict[Tuple[int, int], int] = field(default_factory=dict, repr=False)
+    #: 每个座位**见过的卡**（卡号 → 出现次数）：查房图靠它在没拿到对面卡组名时"看牌猜卡组"
+    _seen: Dict[int, Dict[int, int]] = field(default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         """把初始生命值填进两个座位。"""
@@ -106,6 +108,11 @@ class FieldState:
 
     def apply(self, event: DuelEvent) -> None:
         """吃下一条事件，更新局面。"""
+
+        # 见过的卡（每个座位一份）：查房图靠它"看牌猜卡组"（对面卡组名内核不给）
+        if event.card_id and event.player in (0, 1):
+            seat_seen = self._seen.setdefault(event.player, {})
+            seat_seen[event.card_id] = seat_seen.get(event.card_id, 0) + 1
 
         if event.kind == "lp_update":
             # 内核直接下发的权威数值。注意它不是每次掉血都会发（实测很多对局一条都没有），
@@ -198,9 +205,18 @@ class FieldState:
             elif location in SPELL_ZONES:
                 player.spells += 1
 
+    def seen_ids(self, seat: int, *, limit: int = 60) -> List[int]:
+        """这个座位**见过的卡号**（按出现次数从多到少，取前 `limit` 个）。
+
+        用处：查房图上"对面用的是哪副牌"内核不给，只能按双方见过的卡名猜（见
+        `duel/field_image.py` 的 `_archetype_guess`）。
+        """
+
+        seen = self._seen.get(seat, {})
+        return [card_id for card_id, _count in sorted(seen.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]]
+
     def slot_of(self, card_id: int) -> Optional[Tuple[int, int]]:
         """这张卡在哪个格位（``(区域号, 序号)``）；不在场上就返回 ``None``。"""
-
         for (controller, location, sequence), value in self.zones.items():
             del controller
             if value.card_id == card_id:

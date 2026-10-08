@@ -305,6 +305,38 @@ def test_long_card_name_shrinks_instead_of_being_cut() -> None:
     assert f"font-size:{long_size}px" in html, long_size
 
 
+def test_view_defaults_to_warmed_cache_and_guesses_opponent_deck() -> None:
+    """线上那条链路（`plugin.py` 的 `/查房`）**不传** `pic_dir` / `their_deck` 时也要出真卡图 + 对面卡组名。
+
+    2026-10-09 线上实测的两个毛病：卡图没渲染（`pic_dir` 默认 `None` → 整张图退化成兜底卡面）、
+    对面卡组名空着（没人传 `their_deck`，而内核根本不给对面的卡组名——只能看牌猜）。
+    """
+
+    import inspect
+    import types
+
+    from duel import card_images
+    from duel.fieldstate import FieldState
+
+    # ① `pic_dir` 的默认值必须就是自动预热那份缓存（改回 None 就等于"线上没有卡图"）
+    default = inspect.signature(view_from_state).parameters["pic_dir"].default
+    assert Path(default) == Path(card_images.DEFAULT_CACHE_DIR), default
+
+    # ② 见过的卡 → 猜主题词（≥3 张不同卡共享的 2~4 字片段）
+    from duel.field_image import _archetype_guess
+
+    assert _archetype_guess(["卡通目录", "完美世界 卡通世界", "卡通黑魔术师", "漫画猫"]) == "卡通"
+    assert _archetype_guess(["闪刀姬=零露", "闪刀起动-连刀", "闪刀亚式-双纽闪门"]) == "闪刀"
+    assert _archetype_guess(["无限泡影", "增殖的G"]) == "", "同名词太少就不猜"
+
+    # ③ `FieldState` 要按座位记住见过的卡（猜卡组靠它）
+    state = FieldState(start_lp=8000)
+    for card_id in (111, 111, 222):
+        state.apply(types.SimpleNamespace(kind="move", player=1, card_id=card_id, value=0, data=[0, 0, 0, 1, 4, 0, 1]))
+    assert state.seen_ids(1) == [111, 222], state.seen_ids(1)   # 出现次数多的在前
+    assert state.seen_ids(0) == []
+
+
 def test_html_contains_lp_turn_and_phase() -> None:
     """整张图上要有双方 LP、回合与阶段（查房图自带这些信息，群里不用再看文字）。"""
 
@@ -335,6 +367,7 @@ def _run_all() -> int:
         test_fallback_keeps_link_rating_readable,
         test_full_image_card_gets_stats_overlay_and_defence_rotation,
         test_opponent_cards_face_the_other_way,
+        test_view_defaults_to_warmed_cache_and_guesses_opponent_deck,
         test_stack_counts_are_rendered,
         test_full_card_image_wins_over_drawn_frame,
         test_long_card_name_shrinks_instead_of_being_cut,

@@ -27,7 +27,8 @@
 
 from __future__ import annotations
 
-from .card_images import request_async as _request_card_pic
+from .card_images import DEFAULT_CACHE_DIR, request_async as _request_card_pic
+from .cards import CardDatabase  # noqa: F401  类型提示用（卡名/卡种由调用方注入 details_of）
 
 import base64
 import hashlib
@@ -275,11 +276,39 @@ def _kind_of(type_text: str) -> str:
 
 
 #: 名字条可用宽度（卡面 64 − 卡框左右各 3 − 名字条左右各 4）
-_NAME_BOX_WIDTH = CARD_WIDTH - 6 - 8
-#: 名字字号：基准 / 单行允许的最小值 / 多行允许的最小值
+_NAME_BOX_WIDTH = CARD_WIDTH - 6 - 8#: 名字字号：基准 / 单行允许的最小值 / 多行允许的最小值
 _NAME_FONT_BASE = 9.5
 _NAME_FONT_MIN_SINGLE = 7.0
 _NAME_FONT_MIN_ANY = 6.0
+
+
+def _archetype_guess(names: Sequence[str], *, min_cards: int = 3) -> str:
+    """按"见过的卡名"猜这副牌的主题词（查房图上给对面标个卡组名用）。
+
+    **为什么要猜**（2026-10-09 用户："没有读取对面的卡组名"）：对面的构筑是隐藏信息，内核只在卡
+    露出来之后才把卡号给我们，所以"卡组名"这个东西根本拿不到；但同一副牌的主题词会反复出现在卡名里
+    （「卡通目录 / 完美世界 卡通世界 / 卡通黑魔术师」→「卡通」；「闪刀姬=零露 / 闪刀起动-连刀」→「闪刀」）。
+    这里统计 2~4 字的片段，取"出现在 ≥`min_cards` 张**不同**卡里、且（命中张数, 片段长度）最大"的那个。
+
+    猜不出来（同名词太少）返回空串——图上只写"已见 N 张"，不硬编一个名字。
+    """
+
+    hits: Dict[str, set] = {}
+    for name in names:
+        text = str(name)
+        for size in (2, 3, 4):
+            for start in range(0, max(0, len(text) - size + 1)):
+                token = text[start : start + size]
+                if token.strip() != token or not token.isprintable():
+                    continue
+                hits.setdefault(token, set()).add(text)
+    best, best_key = "", (0, 0)
+    for token, cards in hits.items():
+        if len(cards) < min_cards:
+            continue
+        if (len(cards), len(token)) > best_key:
+            best, best_key = token, (len(cards), len(token))
+    return best.rstrip("△▲·・-— 　")     # 主题词尾巴上的符号（「异解△」这种）顺手剪掉
 
 
 def _name_box(name: str) -> Tuple[float, int, int]:
@@ -305,7 +334,7 @@ def _name_box(name: str) -> Tuple[float, int, int]:
     return _NAME_FONT_MIN_ANY, 3, int(round(_NAME_FONT_MIN_ANY * 1.28)) * 3
 
 
-def card_full_uri(card_id: int, *, pic_dir: Optional[Path] = None) -> str:
+def card_full_uri(card_id: int, *, pic_dir: Optional[Path] = DEFAULT_CACHE_DIR) -> str:
     """**整卡卡图**的 data URI（本机缓存里那张 `<卡号>.jpg`）；没有就返回空串。
 
     图和立绘走同一套缩放（`_shrink_art`）：整卡图按卡面宽度缩到显示尺寸，一张十几 KB。
@@ -700,16 +729,42 @@ def view_from_state(
     art_fallback_dir: Path = DEFAULT_ART_FALLBACK,
     details_of: Optional[Callable[[int], object]] = None,
     current_seat: Optional[int] = None,
-    pic_dir: Optional[Path] = None,
+    # 整卡图缓存：**默认就用自动预热那份**（`duel/card_images.py`）——调用方不传也能出真卡图
+    pic_dir: Optional[Path] = DEFAULT_CACHE_DIR,
 ) -> FieldView:
     """把记录器的 `FieldState` 翻译成一张图的输入。
 
     `details_of(card_id)` 返回带 `name` / `type_text` / `stats` / `effect` 的对象（通常是
     `CardDatabase.card_details` 的逐张版本）；不传就只显示卡号。`current_seat` 是**现在轮到谁**。
-    `pic_dir` 是**整卡卡图的缓存目录**（`duel/card_images.py`）——有它就优先用整卡图渲染。
+    `their_deck` 留空时会**按"看牌猜卡组"**填一个（`FieldState.seen_ids()` + `details_of`）。
     """
 
     zones_of = field_state.zones_of          # type: ignore[attr-defined]
+
+    def deck_label(target_seat: int, given: str) -> str:
+        """这一侧显示的卡组名：**给定了就用给定的**（我们这侧是 `room.deck_name`）；
+        没给定（对面就是这种情况——内核不给对面卡组名）就按见过的卡名**看牌猜一个**。"""
+
+        if given.strip():
+            return given
+        seen_of = getattr(field_state, "seen_ids", None)
+        if seen_of is None or details_of is None:
+            return ""
+        names: List[str] = []
+        for card_id in seen_of(target_seat):
+            try:
+                detail = details_of(card_id)
+            except Exception:  # noqa: BLE001  猜个名字而已，查不到就跳过
+                detail = None
+            name = str(getattr(detail, "name", "") or "")
+            if name:
+                names.append(name)
+        if not names:
+            return ""
+        guess = _archetype_guess(names)
+        if guess:
+            return f"{guess}（看牌猜，已见 {len(names)} 张）"
+        return f"已见 {len(names)} 张"
 
     def side_of(target_seat: int, label: str, deck: str) -> SideView:
         cards = zones_of(target_seat)
@@ -748,8 +803,8 @@ def view_from_state(
         subtitle=subtitle,
         turn=int(getattr(field_state, "turn_count", 0) or 0),
         phase=phase,
-        top=side_of(opponent_seat, their_label, their_deck),
-        bottom=side_of(seat, our_label, our_deck),
+        top=side_of(opponent_seat, their_label, deck_label(opponent_seat, their_deck)),
+        bottom=side_of(seat, our_label, deck_label(seat, our_deck)),
     )
 
 
@@ -758,7 +813,10 @@ def to_card_view(
     details_of: Optional[Callable[[int], object]] = None,
     art_dir: Path = DEFAULT_ART_DIR,
     art_fallback_dir: Path = DEFAULT_ART_FALLBACK,
-    pic_dir: Optional[Path] = None,
+    # 整卡图缓存：**默认就用自动预热那份**（`duel/card_images.py` 的 DEFAULT_CACHE_DIR）。
+    # ⚠ 别再改回 None：调用方（`plugin.py` 的 `/查房`）没传这个参数时，None 会让整张图
+    # 全部退化成"名字 + 攻守"的兜底卡面（2026-10-09 线上就是这么表现的："卡图没有正确渲染"）。
+    pic_dir: Optional[Path] = DEFAULT_CACHE_DIR,
 ) -> Optional[CardView]:
     """`ZoneCard` → `CardView`（里侧的卡不读任何卡图：反正要画卡背）。"""
 
