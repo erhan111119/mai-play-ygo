@@ -716,6 +716,7 @@ class ActiveRoom:
         group_id: str,
         task: asyncio.Task,
         deck_name: str = "",
+        deck_id: int = 0,
     ) -> None:
         self.session = session
         self.stream_id = stream_id
@@ -726,6 +727,12 @@ class ActiveRoom:
 
         ``/查房`` 要跨所有对话流列房间，光报"某处有个房间"没有意义——
         群友问的是"谁在打、用的哪副牌"，所以创建房间时就把卡组名记在这里。
+        """
+        self.deck_id = deck_id
+        """这一局用的是卡组池里哪一副（0＝没对上池子，用的是自带卡组）。
+
+        对局结束后要按它写训练记录：「复盘优化」是按**这一副牌**取最近几局的，
+        光有卡组名匹配不可靠（池子里真有重名的牌，比如三副"码丽丝111"）。
         """
 
 
@@ -1324,14 +1331,16 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                     f"房间开不起来：{exc}。请检查插件配置里的 ygopro 路径与工作目录。",
                 )
 
-            task = asyncio.create_task(self._run_room(session, stream_id, group_id))
+            deck_label = deck.display_name if deck is not None else DEFAULT_WINDBOT_DECK
+            deck_id = deck.deck_id if deck is not None else 0
+            task = asyncio.create_task(self._run_room(session, stream_id, group_id, deck_id=deck_id))
             # ⚠ 这里原来会记住"最近一次开过房的群"（`_invite_stream_id`），供主动约战与常驻房
             # 把消息发到真实聊天流；这两项已按 2026-10-07 用户口径删除，所以这行没了。
             # 卡组名一并记进房间：`/查房` 跨群列房间时要能说清每个房间是哪副牌
             # （没找到投稿卡组时用的是机器人自带卡组，与上面的日志同一口径）
             deck_label = deck.display_name if deck is not None else DEFAULT_WINDBOT_DECK
             self._rooms[stream_id] = ActiveRoom(
-                session, stream_id, group_id, task, deck_name=deck_label
+                session, stream_id, group_id, task, deck_name=deck_label, deck_id=deck_id
             )
 
             announcement = self._compose_open_message(
@@ -2288,13 +2297,18 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
     # 卡牌清单那份口径本身是通用工具，留在 `duel/cards.py` 的 `collect_card_info()`
     # （原来那两支 CLI——写打法数据 / 写展开流程——也一起删了，所以现在没有人调它）。
 
-    def _record_room_duel(self, stream_id: str, group_id: str, result_data: Dict[str, object]) -> None:
+    def _record_room_duel(
+        self, stream_id: str, group_id: str, result_data: Dict[str, object], deck_id: int = 0
+    ) -> None:
         """把这一局房间对局写进训练记录（`kind=duel`），给「复盘优化」当素材。
 
         为什么不解析录像：`.yrp` 里**只有玩家的应答，没有内核的提问**，逐动作复盘根本做不出来
         （`tools/analyze_replay.py` 的模块头写着这条）。而这边的记录器是**活着看到全部报文**的，
         回合数、双方动作数、召唤/特召/发动/盖放/攻击、伤害、用过的卡都在手里——
         这比录像强得多，所以对局一结束就把它落库。
+
+        ``deck_id`` 必须带上：「复盘优化」是按这副牌的编号找最近几局的（`_recent_duels`），
+        只记卡组名的话那份记录谁也匹配不上，用户看到的永远是"还没有对局记录"。
 
         写失败只记日志：这是训练功能的素材，不该影响对局播报。
         """
@@ -2307,7 +2321,12 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             log_dir = self._training_workspace() / "logs"
             log_dir.mkdir(parents=True, exist_ok=True)
             log_path = log_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-duel.log"
-            record = store.create("duel", title, {"stream_id": stream_id, "group_id": group_id}, log_path)
+            record = store.create(
+                "duel",
+                title,
+                {"stream_id": stream_id, "group_id": group_id, "deck_id": int(deck_id)},
+                log_path,
+            )
             store.finish(record.run_id, "done", summary=dict(result_data))
         except Exception:  # noqa: BLE001  记录失败不该影响播报
             if self._logger is not None:
@@ -2335,7 +2354,9 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
     # ------------------------------------------------------------------ 房间完成处理
 
-    async def _run_room(self, session: DuelSession, stream_id: str, group_id: str) -> None:
+    async def _run_room(
+        self, session: DuelSession, stream_id: str, group_id: str, *, deck_id: int = 0
+    ) -> None:
         """在后台等一局打完，然后播报结果并写进机器人上下文。"""
 
         outcome = OUTCOME_ABORTED
@@ -2352,7 +2373,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             # 打完就记一条：复盘优化要有"这一局到底发生了什么"才能说问题。
             # 只有真的打完（不是没人来/超时收摊）才记。
             if outcome == OUTCOME_FINISHED:
-                self._record_room_duel(stream_id, group_id, result_data)
+                self._record_room_duel(stream_id, group_id, result_data, deck_id=deck_id)
             report = self._compose_result_message(outcome, summary)
             if outcome == OUTCOME_FINISHED:
                 # 打完的总结交给模型写成一段人话，再由插件直接发到群里。

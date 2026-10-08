@@ -1356,6 +1356,55 @@ async def test_finished_duel_summary_goes_through_the_model() -> None:
             await instance.on_unload()
 
 
+async def test_finished_room_duel_lands_in_the_review_material() -> None:
+    """每局打完要落一条 `kind=duel` 记录，而且**带着卡组编号**——复盘优化靠它取最近几局。
+
+    这条是回归测试：第一版只把 `stream_id` / `group_id` 写进参数，而「复盘优化」是按
+    这副牌的编号筛的（`_recent_duels`），于是那份记录谁也匹配不上，
+    用户点"复盘优化"永远得到"还没有对局记录"。所以这里既查记录存在，也查能按编号取回来。
+    """
+
+    if not _sdk_available():
+        print("      （跳过：未找到 maibot_sdk）")
+        return
+
+    with tempfile.TemporaryDirectory() as directory:
+        instance, _context = make_plugin(Path(directory))
+        await instance.on_load()
+        try:
+            store = instance.training_store()
+            assert store is not None, "训练开着时该有记录库"
+
+            await instance._run_room(
+                _StubSession(
+                    outcome="finished",
+                    summary=["麦麦 获胜（对手 LP 归零）"],
+                    result={"winner_name": "麦麦", "turns": 5, "deck_name": "青眼白龙"},
+                ),
+                "stream-1",
+                "111",
+                deck_id=88,
+            )
+            duels = store.list_recent(limit=10, kind="duel")
+            assert len(duels) == 1, [record.title for record in duels]
+            assert "青眼白龙" in duels[0].title, duels[0].title
+            assert duels[0].params["deck_id"] == 88, duels[0].params
+            assert duels[0].summary["turns"] == 5, duels[0].summary
+
+            runner = instance.training_runner()
+            assert runner is not None, "训练开着时该有执行器"
+            assert [record.run_id for record in runner._recent_duels(88, 3)] == [duels[0].run_id]
+            assert runner._recent_duels(99, 3) == [], "别的牌的对局不能算进这副牌"
+
+            # 没人进来 / 中途收摊不算素材（只记真的打完的）
+            await instance._run_room(
+                _StubSession(outcome="no_player", summary=[], result={}), "stream-2", "111", deck_id=88
+            )
+            assert len(store.list_recent(limit=10, kind="duel")) == 1
+        finally:
+            await instance.on_unload()
+
+
 async def test_taunt_lines_and_summary_prompt_config_reach_consumers() -> None:
     """台词池与总结提示词这两个配置项要真的送到用它们的地方（2026-10-07 用户要求可配）。
 
