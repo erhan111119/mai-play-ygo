@@ -26,19 +26,48 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set,
 import json
 import logging
 import re
-
-#: combo 推演的答复额度。要写先手/后手两条线 + 每步说明 + JSON 外壳，给小了会被截断成坏 JSON。
-COMBO_MAX_TOKENS = 8192
+#: combo 推演**每次**答复的额度。分两次问（先写主线、再写要点），每次都给小额度——
+#: 这不是省 token，是被宿主的硬超时逼出来的：插件调模型走的是 `cap.call`，
+#: **单次调用 30 秒就断**（实测跑出来的原文：`[E_TIMEOUT] 请求 cap.call 超时 (30000ms)`）。
+#: 一次要 8192 token 的答复，思考型模型光想就超 30 秒；拆小之后才有机会落在窗口内。
+COMBO_MAX_TOKENS = 1600
 
 #: 写结论的答复额度（一段话，不需要长）。
-SUMMARY_MAX_TOKENS = 2048
+SUMMARY_MAX_TOKENS = 1200
 
 #: 喂给模型的卡文上限：单张效果截断长度、整副卡表的字符上限。
-MAX_EFFECT_CHARS = 400
-MAX_DIGEST_CHARS = 24000
+#: 卡表给太长同样是"读得久"的问题：输入越长，同一只模型回得越慢。
+MAX_EFFECT_CHARS = 300
+MAX_DIGEST_CHARS = 12000
 
 #: 写结论时给模型看多少行 stdout。
-OUTPUT_TAIL_LINES = 200
+OUTPUT_TAIL_LINES = 120
+
+#: 调用失败时的排查提示（按错误内容挑一条贴上去）。
+#: 为什么值得专门写：这两条都是实测踩出来的，光看 `[E_TIMEOUT] 请求 cap.call 超时`
+#: 完全不知道该改什么——而它们各自只需要改一行配置。
+_FAILURE_HINTS: Tuple[Tuple[str, str], ...] = (
+    (
+        "cap.call",
+        "宿主对插件的单次模型调用有 30 秒硬超时（插件改不了）："
+        "训练模型请填一只**不思考**的（如 deepseek-chat；`ds` / `deepseekV4.1flash` 这类会思考的会撞上）",
+    ),
+    (
+        "空内容",
+        "答复是空的通常说明额度被思考吃光了：换一只关掉思考的模型，"
+        "或在 model_config.toml 里给它加 `extra_params = {thinking = {type = \"disabled\"}}`",
+    ),
+)
+
+
+def failure_hint(error: str) -> str:
+    """给失败原因配一句"该改哪里"（没有对应提示就返回空串）。"""
+
+    text = str(error or "")
+    for needle, hint in _FAILURE_HINTS:
+        if needle in text:
+            return hint
+    return ""
 
 
 class AnalysisError(RuntimeError):
@@ -179,31 +208,40 @@ def build_deck_digest(
 # combo 推演
 # ---------------------------------------------------------------------------
 
-_COMBO_SYSTEM = """你在为「游戏王」的一副卡组写推演笔记，读者是准备给它写自动出牌脚本的人。
+_COMBO_MAIN_SYSTEM = """你在为「游戏王」的一副卡组写推演笔记，读者是准备给它写自动出牌脚本的人。
+
+这一轮**只写主线**：先手与后手各一条，把最想做的事情按顺序写清楚。
 
 要求：
 1. **只能用下面卡表里出现的卡**。你需要哪些卡就写哪些，但一张都不能是卡表之外的——
    包括"通常召唤出来的怪兽"也必须来自卡表。
-2. **不要凭记忆写效果**：卡文已经给你了，只能按卡文写；卡文截断或缺失时，把这一点写进
-   `uncertain`，不要猜。
+2. **不要凭记忆写效果**：卡文已经给你了，只能按卡文写；卡文截断或缺失的地方不要猜。
 3. 先手与后手分开写（对手先手时会把手坑/无效系留给你，链路不一样）。
 4. 每一步要说清「用哪张卡、做什么、场上/墓地变成什么样」，不要写"展开一套"这种空话。
-5. 输出**只有 JSON**，不要解释、不要 markdown 代码块围栏。
+5. 主线控制在 2~3 条、每条不超过 8 步——这一轮只要骨架，细节下一轮再说。
+6. 输出**只有 JSON**，不要解释、不要 markdown 代码块围栏。
 
 JSON 结构：
 {
   "summary": "一句话：这副牌的核心目标",
   "lines": [
-    {
-      "name": "先手主线",
-      "hand": ["需要起手的卡名"],
-      "cards": ["这条线用到的所有卡名"],
-      "steps": ["第 1 步…", "第 2 步…"]
-    }
-  ],
-  "notes": ["通用要点，例如某张卡要留到什么时候"],
-  "uncertain": ["卡文不足或你不确定的地方"]
+    {"name": "先手主线", "hand": ["需要起手的卡名"], "cards": ["这条线用到的卡名"],
+     "steps": ["第 1 步…", "第 2 步…"]}
+  ]
 }
+"""
+
+_COMBO_NOTES_SYSTEM = """你在为「游戏王」的一副卡组写推演笔记。主线已经写好了（见下），
+这一轮**只补充要点与不确定的地方**，不要重写主线。
+
+要求：
+1. 卡名只能用卡表里有的（卡表已给你）。
+2. `notes` 写 3~6 条通用要点（例如某张卡要留到什么时候、哪一步最怕被打断）。
+3. `uncertain` 写卡文不足、或你不确定的地方（没有就写空数组，不要编）。
+4. 输出**只有 JSON**，不要解释、不要 markdown 代码块围栏。
+
+JSON 结构：
+{"notes": ["…"], "uncertain": ["…"]}
 """
 
 
@@ -271,7 +309,12 @@ async def derive_combo(
     model: str,
     logger: Optional[logging.Logger] = None,
 ) -> ComboResult:
-    """让模型读卡表写推演笔记。
+    """让模型读卡表写推演笔记（**分两轮问**，每轮都小）。
+
+    为什么要分开：插件调模型走 `cap.call`，宿主对单次调用有 30 秒硬超时。
+    一轮里要 8000 token 的答复，思考型模型光"想"就超时（实测就是这么失败的），
+    所以拆成"先写主线，再补要点"两次小请求。第二次失败不算整个任务失败：
+    主线已经拿到了，把缺的那半如实记进 warning。
 
     Args:
         generate: 发请求的协程，签名 ``generate(prompt, model, max_tokens) -> str``；
@@ -281,31 +324,42 @@ async def derive_combo(
         logger: 日志器。
 
     Raises:
-        AnalysisError: 模型不可用、被拒绝、或回复为空。
+        AnalysisError: 主线这一轮就失败（模型不可用、被拒绝、回复为空）。
     """
 
-    prompt = f"{_COMBO_SYSTEM}\n\n{digest}\n\n请按上面的 JSON 结构输出这副卡组的推演笔记。"
+    warnings: List[str] = []
+    main_prompt = f"{_COMBO_MAIN_SYSTEM}\n\n{digest}\n\n请按上面的 JSON 结构输出这副卡组的主线。"
     try:
-        raw = await generate(prompt, model, COMBO_MAX_TOKENS)
+        raw = await generate(main_prompt, model, COMBO_MAX_TOKENS)
     except Exception as exc:  # noqa: BLE001  统一成 AnalysisError，让调用方把它记成一次失败的任务
-        raise AnalysisError(f"调用模型失败：{exc}") from exc
+        raise AnalysisError(_with_hint(f"调用模型失败：{exc}")) from exc
     text = str(raw or "").strip()
     if not text:
-        raise AnalysisError("模型返回了空内容（额度被思考吃光，或那只模型不能用）")
+        raise AnalysisError(
+            _with_hint("模型返回了空内容（额度被思考吃光，或那只模型不能用）")
+        )
     guide = _extract_json(text)
-    warnings: List[str] = []
     if guide is None:
         warnings.append("模型没按 JSON 输出，原文已存档，但没有结构化字段可校验")
-        result = ComboResult(
-            guide={"summary": text, "lines": [], "notes": [], "uncertain": []},
-            raw=text,
-            digest=digest,
-            warnings=warnings,
-            model=model,
-        )
+        guide = {"summary": text, "lines": [], "notes": [], "uncertain": []}
     else:
         warnings.extend(_check_card_names(guide, known_names))
-        result = ComboResult(guide=guide, raw=text, digest=digest, warnings=warnings, model=model)
+
+    notes = await _derive_notes(
+        generate,
+        digest=digest,
+        summary=str(guide.get("summary") or ""),
+        lines=guide.get("lines") or [],
+        model=model,
+    )
+    if isinstance(notes, str):
+        warnings.append(notes)
+    else:
+        guide["notes"] = notes.get("notes") or []
+        guide["uncertain"] = notes.get("uncertain") or []
+    result = ComboResult(
+        guide=guide, raw=text, digest=digest, warnings=warnings, model=model
+    )
     if logger is not None:
         logger.info(
             "combo 推演完成：%s 行主线、%s 条待确认、%s 条校验疑点",
@@ -314,6 +368,44 @@ async def derive_combo(
             len(result.warnings),
         )
     return result
+
+
+async def _derive_notes(
+    generate: Callable[..., Any],
+    *,
+    digest: str,
+    summary: str,
+    lines: Sequence[Any],
+    model: str,
+) -> Any:
+    """第二轮：补要点与待确认项。
+
+    返回解析出来的 dict；这一轮失败时返回**一句说明**（字符串），由调用方记进 warning——
+    主线已经拿到了，不该因为补料失败把整份推演丢掉。
+    """
+
+    outline = json.dumps({"summary": summary, "lines": lines}, ensure_ascii=False)[:4000]
+    prompt = (
+        f"{_COMBO_NOTES_SYSTEM}\n\n{digest}\n\n已写好的主线：\n{outline}\n\n请补充要点与待确认项。"
+    )
+    try:
+        raw = await generate(prompt, model, SUMMARY_MAX_TOKENS)
+    except Exception as exc:  # noqa: BLE001  第二轮失败只影响"要点"，不影响主线
+        return _with_hint(f"要点这一轮没写成：{exc}（主线已存档）")
+    text = str(raw or "").strip()
+    if not text:
+        return "要点这一轮没写成：模型返回了空内容（主线已存档）"
+    parsed = _extract_json(text)
+    if parsed is None:
+        return "要点这一轮没按 JSON 输出，已跳过（主线已存档）"
+    return parsed
+
+
+def _with_hint(message: str) -> str:
+    """给错误信息补一句"该改哪里"（没有对应提示就原样返回）。"""
+
+    hint = failure_hint(message)
+    return f"{message}｜提示：{hint}" if hint else message
 
 
 # ---------------------------------------------------------------------------

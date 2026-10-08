@@ -510,6 +510,78 @@ def test_empty_model_reply_is_an_error_not_an_empty_guide() -> None:
         raise AssertionError("空回复应该抛 AnalysisError")
 
 
+def test_timeout_failure_says_what_to_change() -> None:
+    """失败信息要带"该改哪里"：宿主对插件的单次调用有 30 秒硬超时，光看超时不知道怎么办。
+
+    这条是**实测**出来的：真机上跑 combo 推演，第一次就撞上
+    `[E_TIMEOUT] 请求 cap.call 超时 (30000ms)`——模型那只（`ds`）会思考，一次要 8000 token
+    的答复光"想"就超 30 秒。提示必须指向"换一只不思考的模型"这个动作，否则用户只能干瞪眼。
+    """
+
+    analysis = _load("train.analysis")
+    hint = analysis.failure_hint("[E_TIMEOUT] 请求 cap.call 超时 (30000ms)")
+    assert "30 秒" in hint and "deepseek-chat" in hint, hint
+    assert analysis.failure_hint("别的问题") == ""
+
+    async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+        del prompt, model, max_tokens
+        raise RuntimeError("[E_TIMEOUT] 请求 cap.call 超时 (30000ms)")
+
+    try:
+        asyncio.run(
+            analysis.derive_combo(
+                fake_generate, deck_name="x", digest="d", known_names=set(), model="", logger=None
+            )
+        )
+    except analysis.AnalysisError as exc:
+        assert "30 秒" in str(exc) and "deepseek-chat" in str(exc), exc
+    else:
+        raise AssertionError("超时应该抛 AnalysisError")
+
+
+def test_combo_keeps_the_main_lines_when_the_notes_round_fails() -> None:
+    """推演分两轮问；第二轮（要点）失败不该把第一轮的主线一起丢掉。
+
+    为什么要分两轮：宿主单次调用 30 秒上限，一轮里要 8000 token 的答复必然超时。
+    主线是真正有用的那半，要点是补充——所以第二轮失败只记一条 warning。
+    """
+
+    analysis = _load("train.analysis")
+    calls: List[str] = []
+
+    async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+        del model, max_tokens
+        calls.append(prompt)
+        if len(calls) == 1:
+            assert "主线" in prompt, prompt[:120]
+            return json.dumps(
+                {
+                    "summary": "以墓地资源滚起来",
+                    "lines": [
+                        {"name": "先手主线", "hand": ["灰流丽"], "cards": ["灰流丽"], "steps": ["停手"]}
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        assert "要点" in prompt, prompt[:120]
+        raise RuntimeError("[E_TIMEOUT] 请求 cap.call 超时 (30000ms)")
+
+    result = asyncio.run(
+        analysis.derive_combo(
+            fake_generate,
+            deck_name="x",
+            digest="d",
+            known_names={"灰流丽"},
+            model="",
+            logger=None,
+        )
+    )
+    assert len(calls) == 2, calls
+    assert result.guide["lines"][0]["name"] == "先手主线"
+    assert any("要点" in warn for warn in result.warnings), result.warnings
+    assert "以墓地资源滚起来" in result.text()
+
+
 # ---------------------------------------------------------------------------
 # 训练执行器
 # ---------------------------------------------------------------------------
@@ -806,6 +878,8 @@ def main() -> int:
         test_deck_digest_and_combo_check_catch_cards_outside_the_deck,
         test_combo_tolerates_non_json_reply_but_says_so,
         test_empty_model_reply_is_an_error_not_an_empty_guide,
+        test_timeout_failure_says_what_to_change,
+        test_combo_keeps_the_main_lines_when_the_notes_round_fails,
         _combo_case,
         _combo_rejects_unknown_deck,
         _arena_refused_while_room_is_active,

@@ -102,6 +102,10 @@ SETTING_BOT_NAME = "in_game_bot_name"
 # 写错不会有任何报错，WindBot 会静默换成随机卡组——所以这里用已验证存在的名字。
 DEFAULT_WINDBOT_DECK = "Blue-Eyes"
 
+#: 决策层预热最多等多久（秒）。预热只是"把冷启动开销提前付掉"，不该让开局被它拖住；
+#: 超时就放弃，正式提问有自己的超时与熔断兜底。
+_WARMUP_LIMIT_SECONDS = 8.0
+
 # ⚠ 这里原来有三样与"AI 自动打牌/常驻房"有关的东西，2026-10-07 用户口径精简掉了：
 # 常驻房（`persist_room` / `persist_room_port` 配置 + `PERSIST_STREAM` / `PERSIST_GROUP`
 # / `PERSIST_RETRY_SECONDS` 三个常量）、计划感知执行器名 `PLAN_AWARE_STYLE`
@@ -366,11 +370,13 @@ class LlmConfig(PluginConfigBase):
         ),
     )
     training_timeout_ms: int = Field(
-        default=120000,
+        default=25000,
         description=(
-            "【训练功能】单次等模型的上限（毫秒，默认 120000）。"
-            "训练是后台任务、不占对局时间，所以给得比总结还宽；"
-            "给这个值是为了让「模型卡住」这件事能变成一条失败的训练记录，而不是让任务永远挂着"
+            "【训练功能】单次等模型的上限（毫秒，默认 25000）。"
+            "**给不大**：宿主对插件的单次模型调用有 30 秒硬超时（`cap.call`，插件改不了，"
+            "实测原文是 `[E_TIMEOUT] 请求 cap.call 超时 (30000ms)`），写比它大没有意义。"
+            "插件把上限设在 25 秒，是为了让失败由插件先发现，并在记录里写清"
+            "「是模型太慢」以及该换哪只模型；训练任务是后台任务，失败一条不影响对局"
         ),
     )
 
@@ -869,19 +875,29 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
     def _restart_train_runner(self) -> None:
         """（重）建训练功能那一层：记录库 + 执行器。
 
-        配置热更新时也走这里：模型、工作目录、局数上限都可能变，而 runner 是"一进程一套
-        子进程"的东西，重建比原地改字段更不容易留下半旧半新的状态。**正在跑的任务会被停掉**
-        （记录留成"被手动停止"），这是有意的——换了工作目录还接着往旧目录写才是灾难。
+        配置热更新时也走这里，但**只有"真的动到执行器"的改动才重建**：工作目录、
+        单次局数上限、启用/关闭。其余配置（改个总结模型、改面板端口、改挑衅台词……）
+        只把模型名推过去、**保留正在跑的任务**——擂台一跑就是几十分钟，
+        为一次无关的配置保存把它掐掉，用户会以为"这功能自己崩了"（实测踩过）。
+        工作目录变了必须重建：换了目录还往旧目录写结果才是更坏的结果。
         """
 
-        if self._train_runner is not None:
-            self._train_runner.stop_now()
+        workspace = self._training_workspace()
+        max_duels = int(self.config.training.max_duels_per_run)
+        current = self._train_runner
+        if current is not None and self.config.training.enabled:
+            if current.workspace == workspace and current.max_duels == max_duels:
+                current.set_training_model(self.config.llm.training_model)
+                if self._logger is not None:
+                    self._logger.debug("训练功能的配置没动到执行器，保留正在跑的任务")
+                return
+        if current is not None:
+            current.stop_now()
             self._train_runner = None
         if not self.config.training.enabled:
             self._train_store = None
             self._logger.info("训练功能已在配置里关闭：面板只读历史，不受理新任务")
             return
-        workspace = self._training_workspace()
         self._train_store = TrainingStore(workspace / "training.db")
         interrupted = self._train_store.mark_interrupted()
         if interrupted:
@@ -1151,7 +1167,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             # 起来之后再补就晚了（WindBot 一进房就开始打）。
             # 老口径的"逐步问 AI"删在这条之前（2026-10-07）；现在这条只服务阻抗时点，
             # 展开期一步都不问，见 `duel/brain_bridge.py` 与 `Game/AI/NegateDecision.cs`。
-            brain_prefix = self._start_room_brain(stream_id)
+            brain_prefix = await self._start_room_brain(stream_id)
             config = self._build_session_config(stream_id, brain_prefix)
             session = DuelSession(
                 config,
@@ -2464,8 +2480,13 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         directory.mkdir(parents=True, exist_ok=True)
         return directory / f"room_{uuid.uuid4().hex[:12]}"
 
-    def _start_room_brain(self, stream_id: str) -> Optional[Path]:
-        """起这一局的答复任务，返回问答前缀；不起时返回 None（调用方据此不起决策层）。"""
+    async def _start_room_brain(self, stream_id: str) -> Optional[Path]:
+        """起这一局的答复任务，返回问答前缀；不起时返回 None（调用方据此不起决策层）。
+
+        **是 async 的、而且会在开房之前把预热走完**：预热与第一次提问撞在一起时，那条提问会
+        被在途的预热拖过等待上限（实测：走插件真实链路的一局里唯一一次提问就是这个原因超时的）。
+        预热本身最多等 ``_WARMUP_LIMIT_SECONDS``，超时就放弃（正式提问有熔断兜底）。
+        """
 
         duel = self.config.duel
         if not (duel.brain_enabled or duel.brain_negate_gate):
@@ -2488,10 +2509,19 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         )
         task = asyncio.create_task(bridge.run(), name=f"mai-play-ygo-brain-{stream_id}")
         self._brains[stream_id] = (bridge, task)
-        # 预热一次：**首次调用要多付约 1.2 秒**（宿主懒加载模型配置 + 建连），实测第一次
-        # 提问因此会撞上 WindBot 的等待上限（2.5 秒）而白等一次。开局到有人进房通常有十几秒，
-        # 正好用来把这笔开销量掉；预热失败只记日志，不影响对局（真出问题时正式提问会自己熔断）。
-        asyncio.create_task(self._warmup_brain(stream_id))
+        # 预热一次并**等它走完再开房**：首次调用要多付约 1.2 秒（宿主懒加载模型配置 + 建连），
+        # 而 WindBot 一进房就开始打——不预热则一局的第一次提问最容易白等。
+        # ⚠ 但也不能把它挂成"后台任务"就算了：那样它会和第一次正式提问**在途撞车**，
+        # 反而把那次提问拖过等待上限（走插件真实链路的一局里就是这样超时掉的）。
+        # 所以这里 await，并且加一个上限——预热本身不值得让开局等太久。
+        try:
+            await asyncio.wait_for(self._warmup_brain(stream_id), timeout=_WARMUP_LIMIT_SECONDS)
+        except asyncio.TimeoutError:
+            if self._logger is not None:
+                self._logger.warning(
+                    "决策层预热超过 %.0f 秒仍未返回，不再等它（正式提问有自己的超时与熔断）",
+                    _WARMUP_LIMIT_SECONDS,
+                )
         if self._logger is not None:
             self._logger.info(
                 "阻抗决策层已启动：前缀 %s｜目标选择 %s｜闸门 %s｜模型 %s｜等答复上限 %.1fs",

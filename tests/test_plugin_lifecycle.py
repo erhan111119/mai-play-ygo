@@ -2045,6 +2045,52 @@ def test_train_runner_is_built_with_the_configured_workspace() -> None:
         asyncio_module.run(run())
 
 
+async def test_config_save_keeps_a_running_training_task() -> None:
+    """配置热更新只在"动到执行器"时才重建训练层，别的改动不能把在跑的任务掐掉。
+
+    这条是实测踩出来的：擂台一跑几十分钟，而宿主**每次保存配置都会推一次热更新**——
+    如果每次都重建 runner（`stop_now` 会连子进程树一起杀），用户改个总结模型就会看到
+    "任务失败：插件重载或上次卸载时中断"。所以只有
+    工作目录 / 局数上限 / 启用开关变了才重建，其余只把模型名推过去。
+    """
+
+    if not _sdk_available():
+        print("      （跳过：未找到 maibot_sdk）")
+        return
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instance, _context = make_plugin(
+            root / "data", {"plugin": {"enabled": True, "config_version": "1.0.0"}}
+        )
+        await instance.on_load()
+        try:
+            runner = instance.training_runner()
+            assert runner is not None
+            stopped: List[str] = []
+            runner.stop_now = lambda: stopped.append("stop")  # type: ignore[method-assign]
+
+            # 1) 只改模型：不重建、不打断
+            instance.config.llm.training_model = "另一只"
+            await instance.on_config_update("self", {}, "1.2.0")
+            assert not stopped, "改模型不该把在跑的任务掐掉"
+            assert instance.training_runner() is runner, "不该重建执行器"
+            assert runner._model_name() == "另一只", "模型名要推过去"
+
+            # 2) 改工作目录：必须重建（换了目录还往旧目录写结果才是灾难）
+            instance.config.training.workspace = str(root / "another")
+            await instance.on_config_update("self", {}, "1.2.0")
+            assert stopped, "换工作目录必须停掉旧执行器"
+
+            # 3) 关掉训练功能：执行器与记录库都收掉
+            instance.config.training.enabled = False
+            await instance.on_config_update("self", {}, "1.2.0")
+            assert instance.training_runner() is None
+            assert instance.training_store() is None
+        finally:
+            await instance.on_unload()
+
+
 def main() -> int:
     """逐个执行测试；协程测试用 asyncio.run 驱动。"""
 
