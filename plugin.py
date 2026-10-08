@@ -1029,7 +1029,6 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             api_key=api_key,
             key_source=key_source,
             logger=self._logger,
-            config_path=Path(__file__).resolve().parent / "config.toml",
         )
         if server.start():
             self._webui = server

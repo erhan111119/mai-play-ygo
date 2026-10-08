@@ -261,7 +261,8 @@ def test_webui_requires_key_and_serves_pages() -> None:
             assert status == 302, status
             assert "Set-Cookie" in headers_back, headers_back
             # 5) 各接口都能出数据（卡组池是空的也不能报错）
-            for path in ("/api/decks", "/api/training", "/api/config", "/api/logs"):
+            # （原来这里还有 `/api/config`：配置页因 bug 太多删掉了，接口一并去掉）
+            for path in ("/api/decks", "/api/training", "/api/rooms", "/api/logs"):
                 status, body, _headers = _http(port, "GET", path, headers=headers)
                 assert status == 200, (path, status, body[:200])
                 assert json.loads(body)["ok"] is True, (path, body[:200])

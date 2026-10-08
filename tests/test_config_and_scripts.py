@@ -1,13 +1,14 @@
-"""配置写回与训练新能力（写脚本 / 自动迭代）的测试。
+"""面板上的卡组操作、对局监控接口，以及「写脚本」生成器的测试。
 
-三块：
+两块：
 
-1. **`configedit`**：面板改配置必须"只碰那一行、保住注释、校验不过不落盘"——
-   写坏配置文件等于把用户的环境弄挂，这几条一条都不能松。
-2. **卡组操作与对局监控接口**：改随机池 / 删卡组要走插件的入口（真机上是事件循环），
+1. **卡组操作与对局监控接口**：改随机池 / 删卡组要走插件的入口（真机上是事件循环），
    删除不可逆所以必须显式确认；`/api/rooms` 要能把牌桌摊平（里侧不泄卡号）。
-3. **写脚本**：生成器用假的模型回调 + 假的源码树跑通"生成 → 编译失败回喂 → 成功"，
+2. **写脚本**：生成器用假的模型回调 + 假的源码树跑通"生成 → 编译失败回喂 → 成功"，
    以及"编译始终失败"时不把坏文件留在源码树里（留了会毒死之后每一轮编译）。
+
+（这里原来还有一组「面板改配置」的用例。那一页因为 bug 太多按用户口径删掉了，
+`configedit.py` 与它的用例一并删除；文件名先留着不改，免得丢掉 git 历史。）
 """
 
 from __future__ import annotations
@@ -49,118 +50,15 @@ def _load(module_name: str):
     return importlib.import_module(f"{_PACKAGE}.{module_name}")
 
 
-def _config_model() -> Any:
-    """插件配置模型（校验与渲染都拿它当真相）。"""
-
-    return _load("plugin").MaiPlayYgoConfig()
-
-
-# ---------------------------------------------------------------------------
-# configedit
-# ---------------------------------------------------------------------------
-
-SAMPLE_CONFIG = """\
-# 麦麦玩游戏王 · 本机配置
-#
-# 这份的注释必须留着——它是给部署者看的说明书。
-
-[plugin]
-enabled = true  # 是否启用插件
-config_version = "1.2.0"  # 配置版本
-
-[duel]
-bot_name = "憨憨"  # 对局中显示的名字
-taunt_lines = []  # 挑衅台词池（留空用内置 20 句）
-
-[llm]
-# 模型：只写模型名
-summary_model = ""  # 对局总结用哪只
-decision_model = "deepseek-chat"  # 决策层用哪只——"#"号在引号里不算注释
-"""
-
-
-def test_config_edit_replaces_only_touched_lines() -> None:
-    """改一项就只动那一行：注释、空行、其它键、节顺序全部原样。"""
-
-    configedit = _load("configedit")
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / "config.toml"
-        path.write_text(SAMPLE_CONFIG, encoding="utf-8")
-        model = _config_model()
-        changed = configedit.apply_values(
-            path, {"duel": {"bot_name": "小憨", "taunt_lines": ["别急", "我看着呢"]}}, model
-        )
-        text = path.read_text(encoding="utf-8")
-        assert 'bot_name = "小憨"  # 对局中显示的名字' in text, text
-        assert 'taunt_lines = ["别急", "我看着呢"]  # 挑衅台词池（留空用内置 20 句）' in text, text
-        assert text.count("# 这份的注释必须留着") == 1, "注释被吃掉了"
-        assert 'decision_model = "deepseek-chat"' in text, "没碰的键不该被改写"
-        assert sorted(changed) == [
-            'duel.bot_name="小憨"',
-            'duel.taunt_lines=["别急", "我看着呢"]',
-        ], changed
-
-
-def test_config_edit_rejects_bad_values_without_touching_the_file() -> None:
-    """校验不过就**一个字都不写**：写一半比不写更糟（用户看到的是"有些改了有些没改"）。"""
-
-    configedit = _load("configedit")
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / "config.toml"
-        path.write_text(SAMPLE_CONFIG, encoding="utf-8")
-        model = _config_model()
-        before = path.read_text(encoding="utf-8")
-        for payload in (
-            {"duel": {"bot_name": "x", "brain_timeout_ms": "不是数字"}},
-            {"nope": {"bot_name": "x"}},
-            {"duel": {"no_such_key": 1}},
-            {"duel": {"bot_name": "带\n换行"}},
-        ):
-            try:
-                configedit.apply_values(path, payload, model)
-            except configedit.ConfigEditError:
-                pass
-            else:
-                raise AssertionError(f"这批改动不该通过：{payload}")
-        assert path.read_text(encoding="utf-8") == before, "校验失败时文件被动了"
-
-
-def test_config_edit_inserts_keys_that_are_not_written_yet() -> None:
-    """文件里没有的键要插进对应的节（而不是新建一个重名的节，那会让 TOML 直接非法）。"""
-
-    configedit = _load("configedit")
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / "config.toml"
-        path.write_text(SAMPLE_CONFIG, encoding="utf-8")
-        model = _config_model()
-        configedit.apply_values(path, {"training": {"enabled": True, "max_duels_per_run": 40}}, model)
-        text = path.read_text(encoding="utf-8")
-        assert "[training]" in text and "max_duels_per_run = 40" in text, text
-        import tomllib
-
-        parsed = tomllib.loads(text)
-        assert parsed["training"]["max_duels_per_run"] == 40, parsed["training"]
-        assert parsed["duel"]["bot_name"] == "憨憨", "原有内容被破坏"
-        assert text.count("[duel]") == 1 and text.count("[llm]") == 1, text
-
-
-def test_config_edit_reports_missing_keys() -> None:
-    """没写进文件的项要能列出来（面板标"默认值"用）。"""
-
-    configedit = _load("configedit")
-    with tempfile.TemporaryDirectory() as directory:
-        path = Path(directory) / "config.toml"
-        path.write_text(SAMPLE_CONFIG, encoding="utf-8")
-        model = _config_model()
-        missing = configedit.missing_keys(path, ["duel", "training"], model)
-        assert "bot_name" not in missing["duel"], missing["duel"]
-        assert "listen_port" in missing["duel"], missing["duel"]
-        assert "enabled" in missing["training"], missing["training"]
-
-
 # ---------------------------------------------------------------------------
 # 卡组操作 / 对局监控接口
 # ---------------------------------------------------------------------------
+
+
+def _config_model() -> Any:
+    """插件配置模型（替身拿它当一份像样的配置对象）。"""
+
+    return _load("plugin").MaiPlayYgoConfig()
 
 
 class StubPlugin:
@@ -560,10 +458,6 @@ def main() -> int:
     """逐个执行测试；协程测试用 asyncio.run 驱动。"""
 
     tests = [
-        test_config_edit_replaces_only_touched_lines,
-        test_config_edit_rejects_bad_values_without_touching_the_file,
-        test_config_edit_inserts_keys_that_are_not_written_yet,
-        test_config_edit_reports_missing_keys,
         test_deck_operations_go_through_the_plugin_and_need_confirmation,
         test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards,
         test_script_generator_writes_compiles_and_reports_attempts,

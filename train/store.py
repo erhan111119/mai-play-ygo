@@ -49,6 +49,12 @@ KIND_TITLES: Dict[str, str] = {
 #: 会真的开对局的种类——房间里有人时不许起（见 `train.runner`）。
 KINDS_USING_ENGINE = frozenset({KIND_ARENA, KIND_ITERATE})
 
+#: **要独占 WindBot 可执行文件/进程**的种类：除了打牌的，还有"写脚本"——它要
+#: `dotnet build` 重编 `bin/Release/WindBot.exe`，而正在打的那局 WindBot 占着这个文件，
+#: Windows 上根本覆盖不了（实测编译会以"文件正被另一个进程使用"失败）。
+#: 同一类约束，所以用同一个门：房间有人在打就拒绝启动。
+KINDS_NEEDING_QUIET = frozenset({KIND_ARENA, KIND_ITERATE, KIND_WRITE_SCRIPT})
+
 # ---- 任务状态 ---------------------------------------------------------------
 
 STATUS_RUNNING = "running"

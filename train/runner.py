@@ -49,7 +49,7 @@ from .store import (
     KIND_SCRIPT,
     KIND_TITLES,
     KIND_WRITE_SCRIPT,
-    KINDS_USING_ENGINE,
+    KINDS_NEEDING_QUIET,
     STATUS_CANCELLED,
     STATUS_DONE,
     STATUS_FAILED,
@@ -175,8 +175,10 @@ class TrainingRunner:
         cards_ready = bool(card_db is not None and getattr(card_db, "available", False))
         rooms = self._active_rooms()
         engine_note = ""
+        quiet_note = ""
         if rooms:
             engine_note = f"现在有 {rooms} 个房间在打，擂台会抢进程与端口，等打完再开"
+            quiet_note = f"现在有 {rooms} 个房间在打，它的 WindBot 占着要重编的那个 exe，等打完再写"
         source_dir, windbot_dir = self._windbot_dirs()
         script_ready = bool(source_dir) and bool(windbot_dir)
         script_note = "" if script_ready else "要配 paths.windbot_src_dir（写脚本要编译进 WindBot）"
@@ -192,8 +194,8 @@ class TrainingRunner:
             {
                 "kind": KIND_WRITE_SCRIPT,
                 "title": KIND_TITLES[KIND_WRITE_SCRIPT],
-                "ready": cards_ready and script_ready,
-                "note": script_note or "读卡文+combo 写 C# 并编译（会改动 WindBot 源码树）",
+                "ready": cards_ready and script_ready and not rooms,
+                "note": quiet_note or script_note or "读卡文+combo 写 C# 并编译（会改动 WindBot 源码树）",
                 "needs_engine": False,
                 "fields": ["deck", "extra_prompt", "rounds"],
             },
@@ -240,19 +242,29 @@ class TrainingRunner:
             TrainingError: 种类不认识、已有任务在跑、房间占用着对局资源、参数或文件不对。
         """
 
+        def busy_note(target: str, rooms: int) -> str:
+            """房间占用时拒绝启动的说明。两种占用原因不一样，得说清是哪一种。"""
+
+            if target == KIND_WRITE_SCRIPT:
+                return (
+                    f"现在有 {rooms} 个房间在打：写脚本要 `dotnet build` 重编 WindBot.exe，"
+                    "而那一局正占着这个文件（Windows 上覆盖不了），等这局打完再写"
+                )
+            return (
+                f"现在有 {rooms} 个房间在打：{KIND_TITLES.get(target, target)}会再起一套 "
+                "ygopro + WindBot，抢进程与端口会把真人那局打坏。等这局结束再来"
+            )
+
         if kind not in KIND_TITLES:
             raise TrainingError(f"不认识的训练种类：{kind}")
         if self.busy:
             active = self.store.get(self._run_id)
             label = f"{active.kind_title}（{self._run_id}）" if active else self._run_id
             raise TrainingError(f"已经有一个任务在跑：{label}；等它跑完或先停掉它")
-        if kind in KINDS_USING_ENGINE:
+        if kind in KINDS_NEEDING_QUIET:
             rooms = self._active_rooms()
             if rooms:
-                raise TrainingError(
-                    f"现在有 {rooms} 个房间在打：擂台会再起一套 ygopro + WindBot，"
-                    "抢进程与端口会把真人那局打坏。等这局结束再来"
-                )
+                raise TrainingError(busy_note(kind, rooms))
 
         # 先做参数校验与卡表解析（同步、很快），这一步抛错不会留下"半个任务"的记录
         argv, title, resolved = self._plan(kind, params)

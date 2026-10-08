@@ -42,7 +42,6 @@ import time
 from .duel.card_images import cache_dir_for
 from .duel.fieldstate import MONSTER_ZONE, SPELL_ZONES
 from .train.analysis import tail_lines
-from .configedit import ConfigEditError, apply_values, missing_keys
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -84,9 +83,6 @@ _DECK_COLUMNS = (
 
 #: 推演笔记在详情页里给多少行（整份推演可能很长，详情页只要够读个大概）。
 _GUIDE_PREVIEW_LINES = 200
-
-#: 插件根目录（配置文件就在它下面：宿主盯着的就是插件目录里的 `config.toml`）。
-_PLUGIN_ROOT = Path(__file__).resolve().parent
 
 #: 日志里的 ANSI 颜色码（训练日志来自命令行工具，带颜色码时面板里会花屏）。
 _ANSI_PATTERN = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -462,12 +458,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 deck_id = path[len("/api/deck/"):]
                 self._send_json(self._api_deck_detail(deck_id, parse_qs(parsed.query)))
                 return
-            if path == "/api/config":
-                self._send_json(self._api_config())
-                return
-            if path == "/api/config/schema":
-                self._send_json(self._api_config_schema())
-                return
             if path == "/api/rooms":
                 self._send_json(self._api_rooms())
                 return
@@ -507,9 +497,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/training/stop":
                 self._send_json(self._post_training_stop(_json_body(raw)))
-                return
-            if path == "/api/config":
-                self._send_json(self._post_config(_json_body(raw)))
                 return
             if path.startswith("/api/deck/"):
                 self._send_json(self._post_deck(path, _json_body(raw)))
@@ -555,33 +542,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "stopped": bool(stopped)}
-
-    def _post_config(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        """把面板上改的配置写回 `config.toml`（宿主会热更新，不需要重启插件）。
-
-        **校验不过就一个字都不写**：先拿配置模型验一遍（`configedit.apply_values`），
-        任何一项不合法整批放弃——写一半比不写更糟，用户看到的是"有些项改了有些没改"。
-        """
-
-        panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
-        values = body.get("values")
-        if not isinstance(values, dict):
-            return {"ok": False, "error": "要提交的内容格式不对（应给 values: {节: {键: 值}}）"}
-        config_path = panel.config_path
-        try:
-            changed = apply_values(config_path, values, panel.plugin.config)
-        except ConfigEditError as exc:
-            return {"ok": False, "error": str(exc)}
-        except Exception as exc:  # noqa: BLE001  写文件失败也要说清楚，不能默默吞掉
-            return {"ok": False, "error": f"写配置失败：{exc}"}
-        if panel.logger is not None:
-            panel.logger.info("面板改了配置：%s", "；".join(changed))
-        return {
-            "ok": True,
-            "changed": changed,
-            "config_path": str(config_path),
-            "message": "已写入 config.toml，宿主会热更新（面板端口/密钥若被改动，面板会重启一次）",
-        }
 
     def _post_deck(self, path: str, body: Dict[str, Any]) -> Dict[str, Any]:
         """卡组操作：加入/移出随机池、删除。
@@ -901,48 +861,6 @@ class _PanelHandler(BaseHTTPRequestHandler):
             }
         return {"ok": False, "error": f"找不到卡组：{deck_id}"}
 
-    def _api_config(self) -> Dict[str, Any]:
-        panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
-        plugin = panel.plugin
-        try:
-            raw = plugin.config.model_dump()
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": f"读取配置失败：{exc}"}
-        if isinstance(raw.get("webui"), dict):
-            raw["webui"]["api_key"] = "（已隐去）" if raw["webui"].get("api_key") else ""
-        # 哪些项还没写进 config.toml（面板上标成「默认值」，免得用户以为改动没生效）
-        try:
-            missing = missing_keys(
-                panel.config_path, [name for name in raw if isinstance(raw[name], dict)], plugin.config
-            )
-        except Exception:  # noqa: BLE001  读不到就算了，不影响看配置
-            missing = {}
-        return {"ok": True, "config": raw, "missing": missing, "config_path": str(panel.config_path)}
-
-    def _api_config_schema(self) -> Dict[str, Any]:
-        """每个配置项的说明（面板拿它把"这一项是干什么的"写在值下面）。
-
-        配置页如果只列 `key = value`，用户看到 `brain_max_tokens = 256` 是没法判断
-        该不该动的；说明本来就写在模型的 `description` 里，这里把它取出来给前端。
-        """
-
-        panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
-        config = getattr(panel.plugin, "config", None)
-        sections: Dict[str, Dict[str, str]] = {}
-        fields = getattr(type(config), "model_fields", None)
-        if not fields:
-            return {"ok": True, "sections": sections}
-        for name in fields:
-            value = getattr(config, name, None)
-            sub_fields = getattr(type(value), "model_fields", None)
-            if not sub_fields:
-                continue
-            sections[name] = {
-                key: str(getattr(info, "description", "") or "")
-                for key, info in sub_fields.items()
-            }
-        return {"ok": True, "sections": sections}
-
     def _api_logs(self, lines: int, keyword: str) -> Dict[str, Any]:
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
         raw_lines = _tail_log_lines(panel.host_root, lines, keyword)
@@ -1090,7 +1008,6 @@ class WebUIServer:
         api_key: str,
         key_source: str,
         logger: Optional[logging.Logger] = None,
-        config_path: Optional[Path] = None,
     ) -> None:
         self.plugin = plugin
         self.host = host
@@ -1098,8 +1015,6 @@ class WebUIServer:
         self.api_key = api_key
         self.key_source = key_source
         self.logger = logger
-        #: 要改的配置文件。默认就是插件目录下的 `config.toml`（宿主盯着的就是这一份）。
-        self.config_path = Path(config_path) if config_path else _PLUGIN_ROOT / "config.toml"
 
         self._server: Optional[_ThreadingPanelServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -1501,14 +1416,6 @@ pre.log .lv-debug { color:#6f7d95; } pre.log .lv-info { color:#9fe8c8; }
 .side-ft { display:flex; gap:6px; flex-wrap:wrap; }
 
 /* ---- 配置 ---- */
-.cfgsec { margin-bottom:14px; }
-.cfgsec > .hd h3 { display:flex; align-items:center; gap:9px; }
-.cfggrid { display:grid; grid-template-columns:repeat(auto-fit, minmax(280px, 1fr)); gap:10px 20px; }
-.cfgrow { display:flex; flex-direction:column; gap:3px; padding:9px 11px; border-radius:var(--r-md);
-  background:#111826; border:1px solid var(--line-soft); }
-.cfgrow .k { display:flex; align-items:center; gap:8px; font-size:12.5px; font-weight:550; }
-.cfgrow .v { font-size:12.5px; color:var(--muted); word-break:break-all; }
-.cfgrow .d { font-size:11px; color:var(--faint); margin-top:3px; }
 
 /* ---- 登录 ---- */
 .login { min-height:100vh; display:grid; place-items:center; padding:24px; }
@@ -1603,7 +1510,7 @@ function tab(name){
   const titles = {overview:["总览","卡组池、房间与训练状态"],decks:["卡组","群友投稿与内置卡组"],
                   duel:["对局监控","进行中的牌桌（每 2 秒刷新）"],
                   training:["训练功能","推演 / 写脚本 / 擂台 / 体检 / 复盘"],
-                  logs:["日志","宿主日志（可按关键词过滤）"],config:["配置","改完写回 config.toml，宿主自动热更新"]};
+                  logs:["日志","宿主日志（可按关键词过滤）"]};
   const pair = titles[name] || ["面板",""];
   $("page-title").textContent = pair[0]; $("page-sub").textContent = pair[1];
   if (name === "overview") loadOverview();
@@ -1611,7 +1518,6 @@ function tab(name){
   if (name === "duel") { loadDuel(); startDuelLive(); }
   if (name === "training") loadTraining();
   if (name === "logs") loadLogs();
-  if (name === "config") loadConfig();
   if (name !== "duel" && DUEL_TIMER) { clearInterval(DUEL_TIMER); DUEL_TIMER = null; }
 }
 function stopTimers(){
@@ -2035,100 +1941,6 @@ function setLevel(level){
   loadLogs();
 }
 
-/* ------------------------------ 配置（可改） ------------------------------ */
-const CFG_ICON = {plugin:ICON.info, paths:ICON.deck, duel:ICON.play, llm:ICON.spark, wiki:ICON.search,
-                  training:ICON.train, webui:ICON.gear};
-const CFG_LABEL = {plugin:"插件", paths:"运行环境", duel:"对局", llm:"模型", wiki:"百科检索",
-                   training:"训练功能", webui:"面板"};
-/* 这几项在面板里只读：路径列的是相对插件目录的写法、密钥给输入框容易被旁观看到，
-   想改去麦麦的插件配置页（那里有完整说明）。其余项都能在这里改。 */
-const CFG_READONLY = new Set(["plugin.config_version", "webui.api_key"]);
-let CFG_DIRTY = {};
-
-async function loadConfig(){
-  const d = await api("/api/config");
-  if (!d.ok) { $("config-body").innerHTML = `<div class="banner err">${ICON.warn}${esc(d.error)}</div>`; return; }
-  const cfg = d.config || {};
-  const missing = d.missing || {};
-  CFG_DIRTY = {};
-  $("config-body").innerHTML = Object.keys(cfg).map(name => {
-    const block = cfg[name];
-    if (!block || typeof block !== "object" || Array.isArray(block)) return "";
-    const descs = (State.schema && State.schema[name]) || {};
-    const rows = Object.entries(block).map(([key, value]) => {
-      const path = `${name}.${key}`;
-      const desc = descs[key] ? `<div class="d">${esc(descs[key])}</div>` : "";
-      const notWritten = (missing[name] || []).includes(key)
-        ? '<span class="chip dim" title="这一项还没写进 config.toml，显示的是代码里的默认值">默认值</span>' : "";
-      if (CFG_READONLY.has(path)) {
-        return `<div class="cfgrow"><div class="k">${esc(key)}${notWritten}</div>
-          <div class="v">${esc(Array.isArray(value) ? value.join("、") : value)}</div>${desc}</div>`;
-      }
-      return `<div class="cfgrow"><div class="k">${esc(key)}${notWritten}</div>
-        ${renderControl(path, value)}${desc}</div>`;
-    }).join("");
-    return `<div class="panel cfgsec"><div class="hd"><h3>${CFG_ICON[name] || ICON.info}${esc(CFG_LABEL[name] || name)}</h3>
-      <span class="sp"></span><span class="faint mono" style="font-size:11.5px">[${esc(name)}]</span></div>
-      <div class="bd"><div class="cfggrid">${rows}</div></div></div>`;
-  }).join("");
-  updateSaveBar();
-}
-function renderControl(path, value){
-  const id = `cfg-${path.replace(/\\./g, "-")}`;
-  if (typeof value === "boolean") {
-    return `<label class="switch"><input type="checkbox" id="${esc(id)}" data-path="${esc(path)}"
-      ${value ? "checked" : ""} onchange="markDirty(this)"><span class="sw-text">${value ? "开" : "关"}</span></label>`;
-  }
-  if (typeof value === "number") {
-    return `<input type="number" id="${esc(id)}" data-path="${esc(path)}" value="${esc(value)}" step="any" oninput="markDirty(this)">`;
-  }
-  if (Array.isArray(value)) {
-    return `<textarea id="${esc(id)}" data-path="${esc(path)}" rows="2" data-list="1"
-      placeholder="一行一条" oninput="markDirty(this)">${esc(value.join("\\n"))}</textarea>`;
-  }
-  const text = String(value);
-  if (text.length > 40 || text.includes("\\n")) {
-    return `<textarea id="${esc(id)}" data-path="${esc(path)}" rows="3" oninput="markDirty(this)">${esc(text)}</textarea>`;
-  }
-  return `<input id="${esc(id)}" data-path="${esc(path)}" value="${esc(text)}" placeholder="（空）" oninput="markDirty(this)">`;
-}
-function markDirty(el){
-  const path = el.dataset.path;
-  if (!path) return;
-  if (el.type === "checkbox") {
-    CFG_DIRTY[path] = el.checked;
-    const label = el.parentNode.querySelector(".sw-text");
-    if (label) label.textContent = el.checked ? "开" : "关";
-  } else if (el.dataset.list) {
-    CFG_DIRTY[path] = el.value.split("\\n").map(s => s.trim()).filter(s => s !== "");
-  } else {
-    CFG_DIRTY[path] = el.value;
-  }
-  updateSaveBar();
-}
-function updateSaveBar(){
-  const count = Object.keys(CFG_DIRTY).length;
-  $("cfg-dirty").textContent = count ? `有 ${count} 项改动待保存` : "没有改动";
-  $("btn-config-save").disabled = count === 0;
-}
-async function saveConfig(){
-  const values = {};
-  for (const [path, value] of Object.entries(CFG_DIRTY)) {
-    const [section, key] = path.split(".");
-    (values[section] = values[section] || {})[key] = value;
-  }
-  const d = await postApi("/api/config", { values });
-  if (!d.ok) { toast(d.error || "保存失败", "err"); return; }
-  toast(`已写入 config.toml：${(d.changed || []).length} 项，宿主会自动热更新`, "ok");
-  loadSchema().then(loadConfig);
-}
-async function loadSchema(){
-  try {
-    const d = await api("/api/config/schema");
-    State.schema = (d && d.ok && d.sections) ? d.sections : null;
-  } catch (e) { State.schema = null; }
-}
-
 /* ------------------------------ 启动 ------------------------------ */
 document.addEventListener("DOMContentLoaded", async () => {
   const params = new URLSearchParams(location.search);
@@ -2147,7 +1959,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   if ($("log-filter")) $("log-filter").addEventListener("keydown", (e) => { if (e.key === "Enter") loadLogs(); });
   if ($("deck-search")) { /* 卡组页载入后再挂，见 loadDecks */ }
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSheet(); });
-  await loadSchema();
   tab("overview");
 });
 """
@@ -2210,7 +2021,6 @@ def _app_page() -> str:
       <div class="navlink" data-tab="duel"><svg class="i" viewBox="0 0 24 24"><path d="M4 6h16M4 18h16"/><rect x="5" y="8" width="6" height="8" rx="1.5"/><rect x="13" y="8" width="6" height="8" rx="1.5"/></svg>对局</div>
       <div class="navlink" data-tab="training"><svg class="i" viewBox="0 0 24 24"><path d="M12 3v3M6.5 5.5l2 2M17.5 5.5l-2 2"/><rect x="4" y="10" width="16" height="10" rx="3"/><path d="M9 15h6"/></svg>训练</div>
       <div class="navlink" data-tab="logs"><svg class="i" viewBox="0 0 24 24"><path d="M5 4h14v16H5z"/><path d="M8.5 9h7M8.5 12.5h7M8.5 16h4"/></svg>日志</div>
-      <div class="navlink" data-tab="config"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 3v2.2M12 18.8V21M4.2 7.5l1.9 1.1M17.9 15.4l1.9 1.1M4.2 16.5l1.9-1.1M17.9 8.6l1.9-1.1"/></svg>配置</div>
     </nav>
     <div class="foot">面板只监听本机。<br><a id="side-url" href="http://127.0.0.1:17911">载入中…</a></div>
   </aside>
@@ -2290,23 +2100,6 @@ def _app_page() -> str:
         <pre class="log" id="log-pre">加载中…</pre>
       </section>
 
-      <section class="view" id="view-config">
-        <div class="panel" style="margin-bottom:14px"><div class="hd">
-            <h3>配置</h3>
-            <span class="sp"></span>
-            <span class="faint" id="cfg-dirty">没有改动</span>
-            <button class="btn sm" onclick="loadConfig()">重新载入</button>
-            <button class="btn primary sm" id="btn-config-save" onclick="saveConfig()" disabled>保存</button>
-          </div>
-          <div class="bd" style="padding-top:0">
-            <div class="faint" style="font-size:12px">
-              改动会写进插件目录的 <span class="mono">config.toml</span>（<b>原有注释与排版保留</b>），
-              宿主会自动热更新——不用重启插件。校验不通过时一个字都不会写入。
-              <span id="cfg-path" class="mono"></span>
-            </div>
-          </div></div>
-        <div id="config-body">加载中…</div>
-      </section>
     </div>
   </div>
 </div>

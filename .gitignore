@@ -29,6 +29,9 @@ clients/windbot/MaiBotPlans/
 clients/windbot/Decks/AI_Gen*.ydk
 clients/windbot/Decks/AI_MirrorDeck.ydk
 clients/windbot/Decks/AI_PlanAware.ydk
+# 「写脚本」失败时留档的那份代码（`train/scriptgen.py` 的 FailedScripts/）：跑一次就有一份，
+# 是给人排查看的，不该进仓库
+clients/windbot/FailedScripts/
 # 卡图不进版本库（太大、版权归属不明）：要用就把 paths.card_art_dir 指到你客户端的卡图目录
 clients/art/
 
