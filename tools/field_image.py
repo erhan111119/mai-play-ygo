@@ -54,7 +54,12 @@ def parse_args() -> argparse.Namespace:
 def demo_view(
     details_of: Optional[Callable[[int], object]], art_dir: Path, art_fallback: Path
 ) -> FieldView:
-    """一张演示局面：尽量铺满（各种召唤种类的怪 + 里侧 + 空位 + 牌堆计数），检查排版与兜底。"""
+    """一张演示局面：尽量铺满（各种召唤种类的怪 + 里侧 + 空位 + 牌堆计数），检查排版与兜底。
+
+    ⚠ 演示的卡**按卡种自动摆到该去的行**（见下面的 `put`）：真人局里位置来自 recorder 的报文，
+    不会摆错；但演示是我们手写的卡号，写错就会出现"羽毛扫站在怪兽区"这种假象
+    （2026-10-08 用户就是被这个骗到了）——所以这里用卡种判一次，摆错直接抛 AssertionError。
+    """
 
     def card(card_id: int, *, face_up: bool = True, attack: bool = True) -> CardView:
         detail = details_of(card_id) if details_of else None
@@ -76,30 +81,59 @@ def demo_view(
             art=card_art_uri(card_id, art_dir=art_dir, fallback_dir=art_fallback) if face_up else "",
         )
 
-    us = SideView(label="憨憨", lp=6200, deck="闪刀姬", is_turn=True, grave=4, banished=1, extra_count=2)
-    us.monsters[0] = card(76072561)                  # 连接怪
-    us.monsters[1] = card(63288573, attack=False)    # 守备怪
-    us.monsters[2] = card(9753964)                   # 超量怪（阶级星）
-    us.monsters[3] = card(18144506)                  # 同调怪
-    us.spells[1] = card(9726840)
-    us.spells[3] = card(34433770)
-    us.field_zone = card(33700664)
-    us.extra = card(84815190)                        # 我方额外怪兽区
+    sides = {
+        "me": SideView(label="憨憨", lp=6200, deck="闪刀姬", is_turn=True, grave=4, banished=1, extra_count=2),
+        "them": SideView(label="嘻嘻$aN9sW", lp=3100, deck="异解", grave=7, banished=2, extra_count=1),
+    }
 
-    them = SideView(label="嘻嘻$aN9sW", lp=3100, deck="异解", grave=7, banished=2, extra_count=1)
-    them.monsters[0] = card(0, face_up=False)        # 里侧：只画卡背
-    them.monsters[3] = card(34645790, attack=False)
-    them.monsters[4] = card(49036338)
-    them.spells[2] = card(96205925)
-    them.field_zone = card(18716735)
-    them.extra = card(50588353)                      # 对手额外怪兽区
+    def put(who: str, card_id: int, slot: int, *, place: str = "auto", face_up: bool = True,
+            attack: bool = True) -> None:
+        """把一张卡放好：`place="auto"` 时按卡种决定进怪兽行还是魔陷行（场地魔法进场地格）。"""
+
+        view = sides[who]
+        detail = details_of(card_id) if details_of else None
+        kind = _kind_of(str(getattr(detail, "type_text", "")))
+        is_field_spell = kind == "spell" and "场地" in str(getattr(detail, "type_text", ""))
+        where = place
+        if place == "auto":
+            where = "field" if is_field_spell else ("monster" if kind == "monster" else "spell")
+        assert where != "monster" or kind == "monster", f"{card_id} 不是怪兽，别放进怪兽区"
+        assert where != "spell" or kind in ("spell", "trap"), f"{card_id} 不是魔陷，别放进魔陷行"
+        assert where != "field" or is_field_spell, f"{card_id} 不是场地魔法，别放进场地格"
+        if where == "monster":
+            view.monsters[slot] = card(card_id, face_up=face_up, attack=attack)
+        elif where == "spell":
+            view.spells[slot] = card(card_id, face_up=face_up, attack=attack)
+        elif where == "field":
+            view.field_zone = card(card_id, face_up=face_up, attack=attack)
+        else:
+            view.extra = card(card_id, face_up=face_up, attack=attack)
+
+    # 我方（下半场）：怪兽行 + 魔陷行 + 场地；额外怪兽区在中间那一格
+    put("me", 76072561, 0)                      # 闪刀姬=零露（连接）
+    put("me", 63288573, 1, attack=False)         # 闪刀姬-燎里（守备）
+    put("me", 9753964, 2)                        # 琰魔龙 红莲魔·渊（同调）
+    put("me", 34433770, 1)                       # 闪刀亚式-双纽闪门（魔法）→ 魔陷行
+    put("me", 10045474, 3)                       # 无限泡影（陷阱）→ 魔陷行
+    put("me", 33700664, 0)                       # 异解△领域-瓦尔涡罗斯（场地魔法）→ 场地格
+    put("me", 84815190, 0, place="extra")        # 鲜花女男爵 → 我方额外怪兽区
+
+    # 对手（上半场）
+    put("them", 49036338, 0)                     # PSY骨架驱动者
+    put("them", 34645790, 3, attack=False)        # 绯之异解△奈落迦（守备）
+    put("them", 0, 4)                            # 里侧：只画卡背（卡号 0 = 只有里侧信息）
+    put("them", 98806751, 1)                     # 执爱之化卢普（怪兽）
+    put("them", 96205925, 2)                     # 异解△福音（永续魔法）→ 魔陷行
+    put("them", 14442329, 0)                     # 点唱机酒吧（场地魔法）→ 场地格
+    put("them", 50588353, 0, place="extra")      # 水晶机巧-继承玻纤 → 对手额外怪兽区
+
     return FieldView(
         title="游戏王·当前局面",
         subtitle="群「游戏王测试群」",
         turn=7,
         phase="主要阶段 2",
-        top=them,
-        bottom=us,
+        top=sides["them"],
+        bottom=sides["me"],
         footer="里侧的卡只画卡背（不公开卡面）｜卡面＝标准卡框自绘 + 本机立绘 + 中文卡名/卡文",
     )
 

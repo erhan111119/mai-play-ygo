@@ -45,13 +45,13 @@ BOARD_HEIGHT = 720
 #: 主怪兽区/魔陷区的格数
 MAIN_ZONES = 5
 
-#: 格位与卡面的尺寸（卡面比例按真卡 59:86；格子 106×123 = 卡面 72×105 + 下面那行大号攻守）
-ZONE_WIDTH = 106
-ZONE_HEIGHT = 123
-CARD_WIDTH = 72
-CARD_HEIGHT = 105
+#: 格位与卡面的尺寸（卡面比例按真卡 59:86；格子 96×110 = 卡面 64×93 + 下面那行大号攻守）
+ZONE_WIDTH = 96
+ZONE_HEIGHT = 110
+CARD_WIDTH = 64
+CARD_HEIGHT = 93
 #: 魔陷行/场地区的格位高度（那些卡不显示大号攻守，矮一截，整张图才排得下）
-SPELL_ZONE_HEIGHT = 105
+SPELL_ZONE_HEIGHT = 93
 
 #: 区域号（与 `duel/protocol.py` 的 CardLocation 一致）
 MONSTER_ZONE = 4
@@ -285,13 +285,16 @@ def _stars_html(card: CardView) -> str:
     return f'<div class="stars{" rank" if card.rank else ""}">{marks}</div>'
 
 
-def _card_html(card: Optional[CardView], *, flat: bool = False) -> str:
+def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "") -> str:
     """一格：空位 / 卡背 / **标准卡框的卡面**（名字条 + 星 + 立绘 + 类型行 + 卡文 + 攻守）。
 
     `flat=True` 用在魔陷行/场地区：那些格位不显示下面那行大号攻守，所以矮一截，整张图才排得下。
+    `owner`（`opp` / `me`）只给**中央额外怪兽区**用——那两格在上下半场中间，要标清是谁的。
     """
 
     plate = "plate flat" if flat else "plate"
+    if owner:
+        plate += f" own-{owner}"
     if card is None:
         return f'<div class="{plate}"><div class="hole"></div></div>'
     if not card.face_up:
@@ -370,10 +373,10 @@ def _row_html(cards: List[Optional[CardView]], *, flat: bool = False) -> str:
 
 
 def _arena_html(view: FieldView) -> str:
-    """场地主体：对手魔陷行/怪兽行 → **共享额外怪兽区** → 我方怪兽行/魔陷行。
+    """场地主体：**上半＝对手**（魔陷行/怪兽行）→ **分界缝** → **下半＝我方**（怪兽行/魔陷行）。
 
-    额外怪兽区放在**两排怪兽行之间**（规则上它是双方共用的两格，MD 局内也是这么摆的）；
-    谁把怪放在那里，卡就朝谁（上面的朝下画、下面的朝上画）。
+    额外怪兽区（两格）放在分界缝的上下两侧——规则上它是双方共用的，所以那两格**按归属上色**
+    （对手的用红紫、我方的用蓝），免得看着像"谁的怪都一样"。
     """
 
     top = view.top
@@ -393,20 +396,25 @@ def _arena_html(view: FieldView) -> str:
         )
         return f'<div class="row{" toprow" if mirrored else ""}">{cells}{zone_html}</div>'
 
-    emz = (
-        '<div class="row emz">'
-        + _card_html(top.extra if top else None)
-        + _card_html(bottom.extra if bottom else None)
-        + "</div>"
-    )
+    who = lambda side: _escape(side.label) if side is not None else ""
     return (
         '<div class="arena">'
+        '<div class="half opp">'
+        f'<div class="sidelabel">对手 · {who(top)}</div>'
         + side_row(top, spells=True, mirrored=True)
         + side_row(top, spells=False, mirrored=True)
-        + emz
+        + "</div>"
+        # 中间那一行＝双方的额外怪兽区（规则上双方共用，MD 局内也是并排摆在中缝上）
+        + '<div class="row emz">'
+        + _card_html(top.extra if top else None, owner="opp")
+        + _card_html(bottom.extra if bottom else None, owner="me")
+        + "</div>"
+        + '<div class="half me">'
         + side_row(bottom, spells=False, mirrored=False)
         + side_row(bottom, spells=True, mirrored=False)
+        + f'<div class="sidelabel">我方 · {who(bottom)}</div>'
         + "</div>"
+        "</div>"
     )
 
 
@@ -428,15 +436,15 @@ _CSS = """
       linear-gradient(180deg, #0d1738 0%, #0a1027 45%, #080c1c 100%);
   }}
   /* 场地："石板"底纹（斜向菱形格），加一层中心柔光 */
-  .wrap {{ display: flex; flex-direction: column; height: 100%; padding: 8px 14px 10px; gap: 6px; }}
+  .wrap {{ display: flex; flex-direction: column; height: 100%; padding: 6px 14px 8px; gap: 4px; }}
   header {{ display: flex; align-items: baseline; gap: 10px; }}
-  .title {{ font-size: 18px; font-weight: 700; letter-spacing: .5px;
+  .title {{ font-size: 17px; font-weight: 700; letter-spacing: .5px;
     text-shadow: 0 0 12px rgba(120,170,255,.45); }}
   .subtitle {{ font-size: 12px; opacity: .75; }}
   .tourn {{ margin-left: auto; font-size: 12px; opacity: .8; }}
 
   .stage {{ flex: 1; display: flex; align-items: center; gap: 10px; min-height: 0; }}
-  .board {{ flex: 1; height: 100%; border-radius: 18px; padding: 10px 12px; position: relative;
+  .board {{ flex: 1; height: 100%; border-radius: 16px; padding: 7px 10px; position: relative;
     background:
       repeating-linear-gradient(45deg, rgba(255,255,255,.022) 0 10px, rgba(0,0,0,0) 10px 20px),
       repeating-linear-gradient(-45deg, rgba(255,255,255,.018) 0 10px, rgba(0,0,0,0) 10px 20px),
@@ -445,23 +453,47 @@ _CSS = """
     border: 1px solid rgba(150,190,255,.18);
     box-shadow: inset 0 0 60px rgba(0,0,0,.55), 0 10px 30px rgba(0,0,0,.45); }}
   .arena {{ height: 100%; display: flex; flex-direction: column; align-items: center;
-    justify-content: center; gap: 6px; }}
+    justify-content: center; gap: 3px; }}
+  /* 上下半场各染一层色（对手红紫、我方蓝），中间再压一道分界缝：一眼看出谁是谁的 */
+  .half {{ width: 100%; border-radius: 12px; padding: 1px 6px; display: flex;
+    flex-direction: column; align-items: center; gap: 3px; position: relative; }}
+  .half.opp {{ background: linear-gradient(180deg, rgba(255,90,140,.11), rgba(255,90,140,0));
+    box-shadow: inset 0 0 0 1px rgba(255,120,160,.16); }}
+  .half.me {{ background: linear-gradient(0deg, rgba(90,160,255,.13), rgba(90,160,255,0));
+    box-shadow: inset 0 0 0 1px rgba(120,180,255,.18); }}
+  .half .sidelabel {{ position: absolute; left: 6px; top: 50%; transform: translateY(-50%);
+    writing-mode: vertical-rl; font-size: 10px; letter-spacing: 2px; opacity: .55; }}
+  .seam {{ width: 92%; height: 0; border-top: 1px solid rgba(255,255,255,.18);
+    box-shadow: 0 0 10px rgba(160,200,255,.28); }}
 
   .row {{ display: flex; align-items: flex-start; gap: 6px; }}
-  .row.emz {{ gap: 132px; }}                 /* 中央那两格额外怪兽区拉开，像 MD 的中缝 */
+  /* 中间那一行＝双方的额外怪兽区：拉开距离，行中间压一道分界缝（上下半场的分界就在这） */
+  .row.emz {{ gap: 150px; position: relative; align-items: flex-start;
+    padding: 0 6px; }}
+  .row.emz::before {{ content: ""; position: absolute; left: 0; right: 0; top: 50%;
+    border-top: 1px solid rgba(255,255,255,.16); box-shadow: 0 0 10px rgba(160,200,255,.22);
+    pointer-events: none; }}
+  .row.emz .plate {{ background: rgba(8,12,26,.55); border-radius: 12px; }}
   .zone-tag {{ display: flex; flex-direction: column; align-items: center; gap: 2px;
     margin: 0 8px; }}
   .zlabel {{ font-size: 10px; opacity: .45; }}
   .plate {{ width: {zone_w}px; height: {zone_h}px; position: relative; display: flex;
     align-items: flex-start; justify-content: center; }}
   .plate.flat {{ height: {spell_h}px; }}      /* 魔陷行/场地区：矮一截（没有大号攻守那行） */
-  /* 空格位：凹槽（MD 那种场地刻线） */
+  /* 空格位：凹槽（MD 那种场地刻线，八角形） */
   .plate .hole {{ width: 100%; height: {card_h}px; border-radius: 10px;
     background: linear-gradient(180deg, rgba(150,190,255,.05), rgba(10,16,36,.35));
     border: 1px solid rgba(150,190,255,.16);
     box-shadow: inset 0 2px 10px rgba(0,0,0,.45); }}
   .plate .hole::after {{ content: ""; display: block; margin: 9px auto 0; width: 60%; height: 60%;
     border: 1px dashed rgba(150,190,255,.18); border-radius: 8px; }}
+  /* 额外怪兽区：按归属上色（对手红紫 / 我方蓝），那两格在中间，必须看得出是谁的 */
+  .plate.own-opp .hole {{ border-color: rgba(255,120,160,.45);
+    background: linear-gradient(180deg, rgba(255,90,140,.10), rgba(10,16,36,.35)); }}
+  .plate.own-me .hole {{ border-color: rgba(120,180,255,.45);
+    background: linear-gradient(180deg, rgba(90,160,255,.12), rgba(10,16,36,.35)); }}
+  .plate.own-opp .card {{ box-shadow: 0 4px 10px rgba(0,0,0,.55), 0 0 0 1px rgba(255,120,160,.45); }}
+  .plate.own-me .card {{ box-shadow: 0 4px 10px rgba(0,0,0,.55), 0 0 0 1px rgba(120,180,255,.45); }}
 
   /* ── 卡面：自绘的标准卡框 ───────────────────────────────── */
   .card {{ position: relative; width: {card_w}px; height: {card_h}px; border-radius: 5px;
@@ -476,13 +508,13 @@ _CSS = """
     text-align: right; text-shadow: 0 0 3px rgba(0,0,0,.9); padding-right: 3px; }}
   .card .stars.rank {{ color: #17171a; text-shadow: 0 0 1px #ffd76a, 0 0 4px #ffd76a; }}
   .card .stars.link {{ font-size: 8px; color: #cfe9ff; }}
-  .card .artbox {{ height: 42px; margin: 0 1px; overflow: hidden; border: 1px solid rgba(0,0,0,.6);
+  .card .artbox {{ height: 38px; margin: 0 1px; overflow: hidden; border: 1px solid rgba(0,0,0,.6);
     background: linear-gradient(160deg, #2b2417, #0c0a06); }}
   .card .art {{ width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }}
   .card .tline {{ margin-top: 2px; font-size: 7px; line-height: 10px; height: 10px; overflow: hidden;
     color: #ffe9bd; text-align: left; padding: 0 3px; background: rgba(0,0,0,.3);
     white-space: nowrap; }}
-  .card .text {{ margin: 2px 1px; height: 20px; overflow: hidden; font-size: 6.4px; line-height: 8px;
+  .card .text {{ margin: 2px 1px; height: 18px; overflow: hidden; font-size: 6.2px; line-height: 7.6px;
     padding: 1px 3px; text-align: left;
     background: rgba(246,240,224,.94); color: #1d1608; border-radius: 1px; }}
   .card .stat {{ position: absolute; right: 4px; bottom: 3px; font-size: 7.5px; font-weight: 700;
@@ -585,8 +617,7 @@ def build_html(view: FieldView) -> str:
     <div class="board">{_arena_html(view)}</div>
     {badge}
     {_side_panel_html(view.top, tag="top")}
-  </div>
-  {footer}
+  </div>  {footer}
 </div></body></html>"""
 
 
