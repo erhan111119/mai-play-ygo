@@ -187,6 +187,34 @@ def test_stack_counts_are_rendered() -> None:
         assert f'<div class="pnum">{count}</div>' in html, count
 
 
+def test_full_card_image_wins_over_drawn_frame() -> None:
+    """有**整卡卡图**（缓存里那张 `<卡号>.jpg`）时直接铺它，不再自绘名字条/卡文。
+
+    整卡图来自 `duel/card_images.py` 的缓存（本机缺的卡由它从萌卡那套 CDN 补齐）——
+    用户口径："有的会没有卡图，都加上，不许没有卡图"。
+    """
+
+    import tempfile
+
+    from duel.field_image import to_card_view
+    from duel.fieldstate import ZoneCard
+
+    with tempfile.TemporaryDirectory() as directory:
+        cache = Path(directory)
+        (cache / "12345.jpg").write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 64)   # 一张假 JPEG
+        card = to_card_view(ZoneCard(12345, 0x1), None, Path("nope"), Path("nope"), cache)
+        assert card is not None and card.full.startswith("data:image/jpeg;base64,"), card
+        html = build_html(
+            FieldView(
+                title="t",
+                turn=1,
+                bottom=SideView(label="我方", lp=8000, monsters=[card]),
+            )
+        )
+        assert 'class="card fullcard"' in html and 'class="cardimg"' in html, "整卡图要铺满卡位"
+        assert 'class="cname"' not in html, "有整卡图就不该再叠自绘的名字条"
+
+
 def test_html_contains_lp_turn_and_phase() -> None:
     """整张图上要有双方 LP、回合与阶段（查房图自带这些信息，群里不用再看文字）。"""
 
@@ -215,6 +243,7 @@ def _run_all() -> int:
         test_zones_are_mapped_to_slots,
         test_card_face_shows_chinese_name_type_and_effect,
         test_stack_counts_are_rendered,
+        test_full_card_image_wins_over_drawn_frame,
         test_html_contains_lp_turn_and_phase,
     ]
     failed = 0

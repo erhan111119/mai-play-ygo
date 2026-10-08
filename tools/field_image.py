@@ -20,6 +20,7 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
+from duel.card_images import DEFAULT_CACHE_DIR, cache_dir_for, warm_many  # noqa: E402
 from duel.cards import CardDatabase  # noqa: E402  导入顺序受 sys.path 补丁影响
 from duel.field_image import (  # noqa: E402
     BOARD_HEIGHT,
@@ -33,6 +34,7 @@ from duel.field_image import (  # noqa: E402
     _STATS_RE,
     build_html,
     card_art_uri,
+    card_full_uri,
 )
 
 DEFAULT_CDB = _PLUGIN_ROOT / "clients" / "ygopro" / "cards.cdb"
@@ -47,12 +49,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render", action="store_true", help="顺手用本机 Edge 渲染成 PNG（预览用）")
     parser.add_argument("--art-dir", type=Path, default=DEFAULT_ART_DIR, help="卡图目录（Art）")
     parser.add_argument("--art-fallback", type=Path, default=DEFAULT_ART_FALLBACK, help="备用卡图目录")
+    parser.add_argument("--pic-dir", type=Path, default=DEFAULT_CACHE_DIR,
+                        help="整卡卡图缓存目录（缺图会从这里/在线补齐）")
+    parser.add_argument("--no-fetch", action="store_true", help="预览时不联网补整卡图")
     parser.add_argument("--cdb", type=Path, default=DEFAULT_CDB, help="cards.cdb（拿卡名/卡种/攻守）")
     return parser.parse_args()
 
 
 def demo_view(
-    details_of: Optional[Callable[[int], object]], art_dir: Path, art_fallback: Path
+    details_of: Optional[Callable[[int], object]],
+    art_dir: Path,
+    art_fallback: Path,
+    pic_dir: Optional[Path] = None,
 ) -> FieldView:
     """一张演示局面：尽量铺满（各种召唤种类的怪 + 里侧 + 空位 + 牌堆计数），检查排版与兜底。
 
@@ -79,6 +87,8 @@ def demo_view(
             atk=int(match.group(1)) if match and face_up else None,
             def_=int(match.group(2)) if match and face_up else None,
             art=card_art_uri(card_id, art_dir=art_dir, fallback_dir=art_fallback) if face_up else "",
+            # 整卡图（本地缓存 → 缺了就排后台下载）：预览里先同步补齐一次，图里就能看到真卡图
+            full=card_full_uri(card_id, pic_dir=pic_dir) if face_up else "",
         )
 
     sides = {
@@ -121,7 +131,7 @@ def demo_view(
     # 对手（上半场）
     put("them", 49036338, 0)                     # PSY骨架驱动者
     put("them", 34645790, 3, attack=False)        # 绯之异解△奈落迦（守备）
-    put("them", 0, 4)                            # 里侧：只画卡背（卡号 0 = 只有里侧信息）
+    put("them", 0, 4, face_up=False)             # 里侧：只画卡背（卡号 0 = 只有里侧信息）
     put("them", 98806751, 1)                     # 执爱之化卢普（怪兽）
     put("them", 96205925, 2)                     # 异解△福音（永续魔法）→ 魔陷行
     put("them", 14442329, 0)                     # 点唱机酒吧（场地魔法）→ 场地格
@@ -157,7 +167,15 @@ def main() -> int:
 
     details_of: Optional[Callable[[int], object]] = lookup_card if database is not None else None
 
-    html = build_html(demo_view(details_of, args.art_dir, args.art_fallback))
+    # 演示局面里的卡先补一次整卡图（同步、走 netguard）：图里就能看到"真·卡图"的效果
+    pic_dir = cache_dir_for(args.pic_dir)
+    demo_ids = [76072561, 63288573, 9753964, 34433770, 10045474, 33700664, 84815190,
+                49036338, 34645790, 98806751, 96205925, 14442329, 50588353]
+    if not args.no_fetch:
+        fetched = warm_many(demo_ids, pic_dir)
+        print(f"整卡图补齐：新下 {len(fetched)} 张（缓存目录 {pic_dir}）")
+
+    html = build_html(demo_view(details_of, args.art_dir, args.art_fallback, pic_dir))
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(html, encoding="utf-8")
     print(f"HTML 已写出：{args.out}（{len(html)} 字符）")

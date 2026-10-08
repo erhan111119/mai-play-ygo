@@ -27,6 +27,8 @@
 
 from __future__ import annotations
 
+from .card_images import request_async as _request_card_pic
+
 import base64
 import hashlib
 import io
@@ -109,7 +111,8 @@ class CardView:
     rank: bool = False             # 超量：星星画成"黑底金星"的阶级星
     type_line: str = ""            # 卡面第二行（"怪兽 超量 效果" 这种，来自 cards.cdb 的类型位）
     effect: str = ""               # 中文卡文（卡面下半段那框小字）
-    art: str = ""                  # 卡图的 data URI；空 = 没有卡图，画卡名框
+    art: str = ""                  # 立绘的 data URI（自绘卡框用）；空 = 没立绘
+    full: str = ""                 # **整卡卡图**的 data URI（`duel/card_images.py` 的缓存/在线补齐）；有就用它
 
     @property
     def stats_text(self) -> str:
@@ -285,8 +288,37 @@ def _stars_html(card: CardView) -> str:
     return f'<div class="stars{" rank" if card.rank else ""}">{marks}</div>'
 
 
+def card_full_uri(card_id: int, *, pic_dir: Optional[Path] = None) -> str:
+    """**整卡卡图**的 data URI（本机缓存里那张 `<卡号>.jpg`）；没有就返回空串。
+
+    图和立绘走同一套缩放（`_shrink_art`）：整卡图按卡面宽度缩到显示尺寸，一张十几 KB。
+    缓存里没有时**顺手排进后台补齐**（`duel/card_images.py` 的单线程池，不联网阻塞出图）——
+    下一次 `/查房` 就有整卡图了；这一次先用自绘卡框（立绘 + 中文卡名/卡文）。
+    """
+
+    if pic_dir is None or card_id <= 0:
+        return ""
+    for suffix in (".jpg", ".png"):
+        path = Path(pic_dir) / f"{card_id}{suffix}"
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return ""
+        if not raw:
+            return ""
+        mime = "image/jpeg" if suffix == ".jpg" else "image/png"
+        payload, out_mime = _shrink_art(raw, mime=mime, max_width=ART_MAX_WIDTH)
+        if not payload:
+            return ""
+        return f"data:{out_mime};base64,{base64.b64encode(payload).decode('ascii')}"
+    _request_card_pic(card_id, Path(pic_dir))    # 缺图：排进后台补齐，下一次出图就有整卡图
+    return ""
+
+
 def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "") -> str:
-    """一格：空位 / 卡背 / **标准卡框的卡面**（名字条 + 星 + 立绘 + 类型行 + 卡文 + 攻守）。
+    """一格：空位 / 卡背 / **卡面**（整卡图优先 → 自绘标准卡框 → 卡名框）。
 
     `flat=True` 用在魔陷行/场地区：那些格位不显示下面那行大号攻守，所以矮一截，整张图才排得下。
     `owner`（`opp` / `me`）只给**中央额外怪兽区**用——那两格在上下半场中间，要标清是谁的。
@@ -300,6 +332,17 @@ def _card_html(card: Optional[CardView], *, flat: bool = False, owner: str = "")
     if not card.face_up:
         # 里侧：只画卡背（硬约束，别改成画卡面）
         return f'<div class="{plate}"><div class="card back"><span>卡背</span></div></div>'
+    numbers = (
+        f'<div class="fnum">{_escape(card.field_text)}</div>'
+        if card.kind == "monster" and card.field_text
+        else ""
+    )
+    if card.full:
+        # 整张卡图（本机缓存 / 在线补齐的萌卡中文卡图）：直接铺满卡位，不再叠自绘的名字条与卡文
+        return (
+            f'<div class="{plate}"><div class="card fullcard">'
+            f'<img class="cardimg" src="{card.full}" alt=""></div>{numbers}</div>'
+        )
     frame, line = _frame_of(card)
     # ⚠ 卡面用真 `<img>` 而不是 CSS 背景图：宿主渲染时等的是页面的 load 事件，
     # 背景图**不保证**在截屏前已经解码画好（实测发到群里的棋盘常有空卡面），
@@ -511,6 +554,9 @@ _CSS = """
   .card .artbox {{ height: 38px; margin: 0 1px; overflow: hidden; border: 1px solid rgba(0,0,0,.6);
     background: linear-gradient(160deg, #2b2417, #0c0a06); }}
   .card .art {{ width: 100%; height: 100%; object-fit: cover; object-position: 50% 18%; }}
+  /* 整卡卡图：直接铺满卡位（卡图本身就是标准卡面，别再叠自绘的名字条与卡文） */
+  .card.fullcard {{ padding: 0; background: #0b0e18; }}
+  .card.fullcard .cardimg {{ width: 100%; height: 100%; object-fit: fill; display: block; }}
   .card .tline {{ margin-top: 2px; font-size: 7px; line-height: 10px; height: 10px; overflow: hidden;
     color: #ffe9bd; text-align: left; padding: 0 3px; background: rgba(0,0,0,.3);
     white-space: nowrap; }}
@@ -637,11 +683,13 @@ def view_from_state(
     art_fallback_dir: Path = DEFAULT_ART_FALLBACK,
     details_of: Optional[Callable[[int], object]] = None,
     current_seat: Optional[int] = None,
+    pic_dir: Optional[Path] = None,
 ) -> FieldView:
     """把记录器的 `FieldState` 翻译成一张图的输入。
 
-    `details_of(card_id)` 返回带 `name` / `type_text` / `stats` 的对象（通常是
+    `details_of(card_id)` 返回带 `name` / `type_text` / `stats` / `effect` 的对象（通常是
     `CardDatabase.card_details` 的逐张版本）；不传就只显示卡号。`current_seat` 是**现在轮到谁**。
+    `pic_dir` 是**整卡卡图的缓存目录**（`duel/card_images.py`）——有它就优先用整卡图渲染。
     """
 
     zones_of = field_state.zones_of          # type: ignore[attr-defined]
@@ -661,20 +709,20 @@ def view_from_state(
         )
         for index in range(MAIN_ZONES):
             view.monsters[index] = to_card_view(
-                cards.get((MONSTER_ZONE, index)), details_of, art_dir, art_fallback_dir
+                cards.get((MONSTER_ZONE, index)), details_of, art_dir, art_fallback_dir, pic_dir
             )
             view.spells[index] = to_card_view(
-                cards.get((SPELL_ZONE, index)), details_of, art_dir, art_fallback_dir
+                cards.get((SPELL_ZONE, index)), details_of, art_dir, art_fallback_dir, pic_dir
             )
         for sequence in (5, 6):          # 额外怪兽区（本座位那一格）
             card = to_card_view(
-                cards.get((MONSTER_ZONE, sequence)), details_of, art_dir, art_fallback_dir
+                cards.get((MONSTER_ZONE, sequence)), details_of, art_dir, art_fallback_dir, pic_dir
             )
             if card is not None:
                 view.extra = card
                 break
         view.field_zone = to_card_view(
-            cards.get((FIELD_ZONE, 0)), details_of, art_dir, art_fallback_dir
+            cards.get((FIELD_ZONE, 0)), details_of, art_dir, art_fallback_dir, pic_dir
         )
         return view
 
@@ -693,8 +741,9 @@ def to_card_view(
     details_of: Optional[Callable[[int], object]] = None,
     art_dir: Path = DEFAULT_ART_DIR,
     art_fallback_dir: Path = DEFAULT_ART_FALLBACK,
+    pic_dir: Optional[Path] = None,
 ) -> Optional[CardView]:
-    """`ZoneCard` → `CardView`（里侧的卡不读卡图：反正要画卡背）。"""
+    """`ZoneCard` → `CardView`（里侧的卡不读任何卡图：反正要画卡背）。"""
 
     if card is None:
         return None
@@ -735,4 +784,6 @@ def to_card_view(
         type_line=type_line,
         effect=effect if face_up else "",
         art=card_art_uri(card_id, art_dir=art_dir, fallback_dir=art_fallback_dir) if face_up else "",
+        # 整卡图优先（本机缓存里那份，通常是萌卡的中文卡面）；里侧一律不读
+        full=card_full_uri(card_id, pic_dir=pic_dir) if face_up else "",
     )
