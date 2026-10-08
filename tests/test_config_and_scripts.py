@@ -216,6 +216,54 @@ def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> 
             server.stop_now()
 
 
+def test_rooms_endpoint_still_draws_the_table_before_the_duel_starts() -> None:
+    """房刚开好、人还没进来时也要给出两边的牌桌（这一条是用户报"监控用不了"的正因）。
+
+    当时的行为：记录器里还没有局面（`field_state` 为空），`_sides_from_state` 直接返回空列表，
+    面板上只剩一个标题、牌桌整块空白——看着像坏了，其实只是"还没开始"。
+    现在照样给两边的名字与**初始 LP**，牌区留空让人看出"空场"。
+    """
+
+    webui = _load("webui")
+    import http.client
+
+    class Recorder:
+        self_seat = 0
+        turn_count = 0
+        phase = ""
+        field_state = None          # 还没收到 MSG_START，什么都没有
+        players: Dict[int, Any] = {}
+
+    class Session:
+        started = False
+        finished = False
+
+        def recorder(self) -> Any:
+            return Recorder()
+
+    secret = "w" * 32
+    with tempfile.TemporaryDirectory() as directory:
+        plugin = StubPlugin(Path(directory))
+        plugin.config.duel.start_lp = 6000      # 用非默认值，确认真的读的是配置
+        plugin._rooms = {
+            "qq:group:9": types.SimpleNamespace(group_id="9", deck_name="刻魔异响鸣", session=Session())
+        }
+        server, port = _start_panel(webui, plugin, secret)
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            connection.request("GET", "/api/rooms", headers={"X-API-Key": secret})
+            payload = json.loads(connection.getresponse().read().decode("utf-8"))
+            connection.close()
+            room = payload["rooms"][0]
+            assert room["started"] is False, room
+            assert len(room["sides"]) == 2, room["sides"]
+            assert [side["lp"] for side in room["sides"]] == [6000, 6000], room["sides"]
+            assert all(zone is None for side in room["sides"] for zone in side["monsters"]), room["sides"]
+            assert [side["is_self"] for side in room["sides"]] == [True, False], room["sides"]
+        finally:
+            server.stop_now()
+
+
 # ---------------------------------------------------------------------------
 # 写脚本
 # ---------------------------------------------------------------------------
@@ -347,6 +395,36 @@ def test_script_generator_feeds_build_errors_back_and_cleans_up_failures() -> No
         assert failed.is_file(), "最后一次尝试要留一份给人看"
 
 
+def test_script_generator_says_exe_is_locked_instead_of_dumping_msbuild() -> None:
+    r"""exe 被占用（有人在打）时的编译失败要给一句人话，而不是一堆 MSBuild 警告。
+
+    实测（2026-10-08）：有人正在跟机器人打的时候跑「写脚本」，`dotnet build` 在
+    "复制 obj\Release\WindBot.exe 到 bin\Release\WindBot.exe" 这一步失败（MSB3026）——
+    那一局正跑着这个 exe。原始输出看不懂的人只会以为"生成功能坏了"。
+    """
+
+    scriptgen = _load("train.scriptgen")
+    output = "\n".join(
+        [
+            "  无可执行操作。指定的项目均不包含要还原的包。",
+            r"C:\Program Files\dotnet\sdk\9.0.304\Microsoft.Common.CurrentVersion.targets(4916,5): "
+            r"warning MSB3026: 无法将“obj\Release\WindBot.exe”复制到“bin\Release\WindBot.exe”",
+        ]
+    )
+    try:
+        scriptgen.DeckScriptGenerator._raise_if_exe_locked(output)
+    except scriptgen.ScriptGenerationError as exc:
+        assert "等这局打完" in str(exc), exc
+        assert "MSB3026" in str(exc), exc
+    else:
+        raise AssertionError("exe 被占用时应该抛 ScriptGenerationError")
+
+    # 别的编译错误（真的写错了代码）不该被翻译成"有人在打"
+    scriptgen.DeckScriptGenerator._raise_if_exe_locked(
+        "Decks/Gen1Executor.cs(9,26): error CS0117: 没有这个成员"
+    )
+
+
 def test_script_generator_reports_missing_tree_instead_of_pretending() -> None:
     """没配源码树就说清楚缺什么（不做"假装写好了"的兜底）。"""
 
@@ -460,8 +538,10 @@ def main() -> int:
     tests = [
         test_deck_operations_go_through_the_plugin_and_need_confirmation,
         test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards,
+        test_rooms_endpoint_still_draws_the_table_before_the_duel_starts,
         test_script_generator_writes_compiles_and_reports_attempts,
         test_script_generator_feeds_build_errors_back_and_cleans_up_failures,
+        test_script_generator_says_exe_is_locked_instead_of_dumping_msbuild,
         test_script_generator_reports_missing_tree_instead_of_pretending,
         test_script_generator_handles_truncated_and_renamed_output,
         test_runner_offers_the_new_kinds_only_when_the_tree_is_configured,

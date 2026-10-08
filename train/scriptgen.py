@@ -526,4 +526,26 @@ class DeckScriptGenerator:
             await process.wait()
             raise ScriptGenerationError(f"编译超时（{self._build_timeout:.0f} 秒）") from exc
         output = stdout.decode("utf-8", errors="replace")
+        if process.returncode != 0:
+            self._raise_if_exe_locked(output)
         return process.returncode == 0, output
+
+    @staticmethod
+    def _raise_if_exe_locked(output: str) -> None:
+        """把"exe 被占用"这种编译失败翻译成一句人话。
+
+        实测（2026-10-08）：有人正在跟机器人打的时候跑「写脚本」，`dotnet build` 会在
+        "把 obj\\Release\\WindBot.exe 复制到 bin\\Release\\WindBot.exe" 这一步失败
+        （MSB3026 / 另一个程序正在使用此文件）——因为那一局正跑着这个 exe。
+        原始输出是一堆 MSBuild 警告，看不懂的人只会以为"生成坏了"；这里直接说清楚
+        "等这局打完再写"，并且**不当成重试理由**（重试也还是锁着，白烧三轮）。
+        """
+
+        markers = ("MSB3026", "MSB3027", "MSB3021", "being used by another process", "另一个程序正在使用")
+        if not any(mark in output for mark in markers):
+            return
+        raise ScriptGenerationError(
+            "编译没法完成：WindBot.exe 正被占用（很可能有人正在跟机器人打这一局）。"
+            "这不是生成的问题——等这局打完再写脚本。原始输出里可以看到 "
+            + next(mark for mark in markers if mark in output)
+        )

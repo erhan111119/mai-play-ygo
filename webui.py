@@ -96,7 +96,12 @@ _ART_CACHE_SECONDS = 86400
 #: 「头牌」缓存：``(ydk 路径, mtime) → 卡号``。列卡组时要给每副牌配一张缩略图，
 #: 96 副牌每次都重读 .ydk 太浪费（虽然小，但没必要）——按 mtime 失效就够。
 _HEAD_CARD_CACHE: Dict[Tuple[str, float], int] = {}
+#: 卡的「头牌」缓存上限。
 _HEAD_CARD_CACHE_MAX = 512
+
+#: 是否把**每一条**面板访问日志都写进插件日志（默认只写非 200 的）。
+#: 对局监控页每 2 秒拉一次接口，全记下来会把日志灌满；排查时设 `webui_verbose=1`。
+_VERBOSE_ACCESS_LOG = os.environ.get("webui_verbose") == "1"
 
 #: 挑「有图的头牌」时最多往下试多少张。给 30 是因为额外卡组通常 15 张、
 #: 主卡组里常见的卡也就那么几种；再多就是浪费 disk stat。
@@ -337,12 +342,20 @@ class _PanelHandler(BaseHTTPRequestHandler):
 
     server_version = "MaiPlayYgoWebUI/1.0"
 
-    # 关掉 BaseHTTPRequestHandler 默认往 stderr 打每条访问日志的行为，
-    # 统一走插件的 logger（否则控制台会被刷屏）。
+    # 默认只记"值得看"的请求（非 200）。对局监控页每 2 秒拉一次 /api/rooms，
+    # 全部记下来会把宿主日志灌满、也把那点有用的信息淹掉；要排查时把
+    # `webui_verbose` 环境变量设成 1 就能看到每一条。
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
-        if panel.logger is not None:
+        if panel.logger is None:
+            return
+        status = args[1] if len(args) > 1 else ""
+        if _VERBOSE_ACCESS_LOG or str(status) != "200":
             panel.logger.debug("WebUI: " + fmt, *args)
+
+    def log_request(self, code: Any = "-", size: Any = "-") -> None:  # noqa: D102
+        # 交给 `log_message` 统一判断：标准库这一层会把成功请求也写出来
+        self.log_message('"%s" %s %s', self.requestline, str(code), str(size))
 
     # ---- 鉴权 ----
 
@@ -735,19 +748,28 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 recorder = session.recorder()
                 entry["turn"] = int(getattr(recorder, "turn_count", 0) or 0)
                 entry["phase"] = str(getattr(recorder, "phase", "") or "")
-                names = {
-                    int(seat): str(getattr(stats, "name", "") or "")
-                    for seat, stats in dict(getattr(recorder, "players", {}) or {}).items()
-                }
+                names: Dict[int, str] = {}
+                lp_hint: Dict[int, int] = {}
+                for seat, stats in dict(getattr(recorder, "players", {}) or {}).items():
+                    names[int(seat)] = str(getattr(stats, "name", "") or "")
+                    final = getattr(stats, "lp_final", None)
+                    if final:
+                        lp_hint[int(seat)] = int(final)
                 entry["sides"] = _sides_from_state(
                     getattr(recorder, "field_state", None),
                     names=names,
                     self_seat=int(getattr(recorder, "self_seat", 0) or 0),
+                    lp_hint=lp_hint,
+                    start_lp=int(getattr(plugin.config.duel, "start_lp", 8000) or 8000),
                 )
             except Exception as exc:  # noqa: BLE001  单个房间读失败不该让整页没数据
                 entry["error"] = f"{type(exc).__name__}: {exc}"
             rooms.append(entry)
-        return {"ok": True, "rooms": rooms, "note": "里侧的卡不公开卡号（与出图同一口径）"}
+        return {
+            "ok": True,
+            "rooms": rooms,
+            "note": "只列本插件开的房间；里侧的卡不公开卡号（与出图同一口径）",
+        }
 
     def _api_decks(self) -> Dict[str, Any]:
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
@@ -911,17 +933,25 @@ def _card_names(card_db: Any, card_ids: List[int]) -> Dict[int, str]:
     return names
 
 
-def _sides_from_state(state: Any, *, names: Dict[int, str], self_seat: int) -> List[Dict[str, Any]]:
+def _sides_from_state(
+    state: Any,
+    *,
+    names: Dict[int, str],
+    self_seat: int,
+    lp_hint: Optional[Dict[int, int]] = None,
+    start_lp: int = 0,
+) -> List[Dict[str, Any]]:
     """把 `FieldState` 摊成面板画牌桌要的形状：两边各自的路区与魔陷区 + 墓地/除外/额外计数。
 
     * 里侧的卡**只报"有卡"不报卡号**（与出图同一口径：面板不该比对手本人知道得更多）。
     * 顺序固定用 1~5 号位；空位给 ``None``，前端才画得出"空场"的样子。
+    * **还没有局面时也要给两边**（房刚开好、人还没进来时）：以前这种情况直接返回空列表，
+      面板上只剩一个标题、看着像坏了——现在照样给两边的名字与初始 LP，牌区空着。
     """
 
-    if state is None:
-        return []
-    zones = dict(getattr(state, "zones", {}) or {})
-    players = dict(getattr(state, "players", {}) or {})
+    zones = dict(getattr(state, "zones", {}) or {}) if state is not None else {}
+    players = dict(getattr(state, "players", {}) or {}) if state is not None else {}
+    hints = dict(lp_hint or {})
     sides: List[Dict[str, Any]] = []
     for seat in (self_seat, 1 - self_seat):
         player = players.get(seat)
@@ -936,12 +966,16 @@ def _sides_from_state(state: Any, *, names: Dict[int, str], self_seat: int) -> L
                 if card is not None:
                     break
             spells.append(_zone_card(card))
+        lp = getattr(player, "lp", None)
+        if lp is None or not int(lp):
+            # 还没收到任何 LP 报文（等人进房时就是这样）：先显示初始 LP，别显示 0
+            lp = hints.get(seat, start_lp)
         sides.append(
             {
                 "seat": seat,
                 "is_self": seat == self_seat,
                 "name": names.get(seat, ""),
-                "lp": int(getattr(player, "lp", 0) or 0),
+                "lp": int(lp or 0),
                 "graveyard": int(getattr(player, "grave", 0) or 0),
                 "banished": int(getattr(player, "banished", 0) or 0),
                 "extra": int(getattr(player, "extra", 0) or 0),
@@ -1056,6 +1090,23 @@ class WebUIServer:
                 candidates.append(Path(directory) / f"{int(card_id)}{suffix}")
         return candidates
 
+    def _wait_port_free(self, seconds: float = 6.0, step: float = 0.5) -> bool:
+        """等端口空出来（最多几秒）。
+
+        **为什么必须重试**：插件每次重载都会先关旧面板再起新的，而旧那个的监听线程不一定
+        已经退干净——一次探测就放弃的话，面板会在这一次重载里彻底起不来（用户看到的
+        "面板又打不开了"，日志里是"已经被别的程序占着"）。实测日志里这种时序占了大多数，
+        所以给它几秒钟；真的是被别的程序长期占着时，等满这几秒后照样如实报错、绝不抢端口。
+        """
+
+        deadline = time.monotonic() + max(0.0, seconds)
+        while True:
+            if _port_available(self.host, self.port):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(step)
+
     def has_art(self, card_id: int) -> bool:
         """本地有没有这张卡的图（只 stat，不读字节）。"""
 
@@ -1084,12 +1135,12 @@ class WebUIServer:
     def start(self) -> bool:
         """启动面板；端口被占用等失败一律返回 False 并记日志，绝不抛给插件加载路径。"""
 
-        if self.port and not _port_available(self.host, self.port):
+        if self.port and not self._wait_port_free():
             # 这一步是为了"端口被占就明说"：直接 bind 在 Windows 上不一定报错（SO_REUSEADDR
             # 允许抢端口），抢过来之后两个程序都以为自己在这个端口上服务，排查起来极难。
             if self.logger is not None:
                 self.logger.warning(
-                    "WebUI 启动失败：%s:%s 已经被别的程序占着（改 webui.port 换一个）",
+                    "WebUI 启动失败：%s:%s 已经被别的程序占着（等了几秒也没等到它释放；改 webui.port 换一个）",
                     self.host,
                     self.port,
                 )
@@ -1691,8 +1742,12 @@ async function loadDuel(){
   if (!d.ok) { $("duel-body").innerHTML = `<div class="banner err">${ICON.warn}${esc(d.error)}</div>`; return; }
   const rooms = d.rooms || [];
   if (!rooms.length) {
-    $("duel-body").innerHTML = `<div class="empty">${ICON.play}<div>现在没有进行中的对局</div>
-      <div class="faint" style="font-size:12px">群里有人说想打牌（或 <span class="mono">/开房</span>）之后，这里会实时显示牌桌</div></div>`;
+    $("duel-body").innerHTML = `<div class="empty">${ICON.play}<div>现在没有本插件开的房间</div>
+      <div class="faint" style="font-size:12px;max-width:520px;text-align:center;line-height:1.8">
+        这一页只显示**群里开给群友打的那种房间**（有人在里面跟机器人对局）。<br>
+        擂台、A/B 测试、体检跑起来的那些 ygopro / WindBot 进程不在这一页
+        （它们不走房间口令、也没有播报）——那些去看<a href="#" onclick="tab('training');return false;">训练页</a>的任务记录。<br>
+        群里有人说想打牌（或 <span class="mono">/开房</span>）之后，这里会实时显示牌桌。</div></div>`;
     return;
   }
   $("duel-body").innerHTML = rooms.map(roomBoard).join("");
