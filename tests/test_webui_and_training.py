@@ -30,6 +30,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
@@ -730,6 +731,111 @@ async def _unknown_deck_is_refused_before_a_record_exists() -> None:
         assert store.list_recent() == [], "起不来的任务不该在库里留下记录"
 
 
+async def _script_tokens_and_iteration_prompts_come_from_config() -> None:
+    """写脚本的输出额度取自配置；迭代的结论必须带上**脚本源码**与逐局战况。
+
+    两件都是"配了/写了但没生效"的高发区：额度原来写死在 `runner` 里（4096），
+    迭代结论原来只给擂台输出的尾巴（一个胜率），模型没法对着处理函数说该改哪一行。
+    """
+
+    store_module = _load("train.store")
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        store = store_module.TrainingStore(tmp / "training.db")
+        seen: List[int] = []
+        prompts: List[str] = []
+
+        async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+            del model
+            seen.append(max_tokens)
+            prompts.append(prompt)
+            return "结论：Card100Handler 的阈值太宽。"
+
+        runner = _make_runner(tmp, store, generate=fake_generate)
+        # 1) 默认额度
+        assert await runner._as_prompt_generate("hello") == "结论：Card100Handler 的阈值太宽。"
+        assert seen[-1] == 4096, seen
+        # 2) 配置推过来之后按配置走；给 0 退回默认（额度为 0 会让模型每次都返回空内容）
+        runner.set_script_max_tokens(7000)
+        await runner._as_prompt_generate("hello")
+        assert seen[-1] == 7000, seen
+        runner.set_script_max_tokens(0)
+        await runner._as_prompt_generate("hello")
+        assert seen[-1] == 4096, seen
+
+        # 3) 迭代结论的素材：脚本源码 + 逐局战况都要进提示词
+        arena_log = tmp / "arena.log"
+        arena_log.write_text(
+            "被测 exe：x\n[1/2] A 在 bot     ｜胜者=B      ｜回合=6｜   7s｜✔ A侧['AI_Gen9']\n"
+            "[2/2] A 在 opponent｜胜者=A      ｜回合=4｜   7s｜✔ A侧['AI_Gen9']\n"
+            "\n================ 汇总 ================\nGen9 胜率：50.0%\n",
+            encoding="utf-8",
+        )
+        script = types.SimpleNamespace(
+            style_name="Gen9",
+            code="class Gen9Executor\n{\n    private bool Card100Handler() { return true; }\n}",
+            warnings=[],
+        )
+        conclusion, error = await runner._iteration_conclusion(
+            params={"deck_name": "测试牌", "opponent_name": "对手牌"},
+            script=script,
+            baseline="Test",
+            log_path=arena_log,
+            history=[{"round": 1, "conclusion": "上一轮：把阈值收紧"}],
+        )
+        assert error == "" and conclusion, (conclusion, error)
+        prompt = prompts[-1]
+        for needle in ("Card100Handler", "[1/2] A 在 bot", "Gen9 胜率", "上一轮：把阈值收紧"):
+            assert needle in prompt, f"迭代结论的提示词里缺少 {needle}"
+
+        # 读不到的日志要如实说，而不是拼出一份假战况
+        assert "读不到" in runner._arena_evidence(tmp / "不存在的.log")
+
+
+async def _write_script_record_says_how_much_it_wrote() -> None:
+    """「编写脚本」的记录里要写清"写了多少"：行数、处理函数个数、缺了哪些卡。
+
+    用户看面板就是看这几个数（150 行的脚本和 600 行的脚本，一眼能分出来）。
+    """
+
+    store_module = _load("train.store")
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        store = store_module.TrainingStore(tmp / "training.db")
+        runner = _make_runner(tmp, store)
+        run = store.create(
+            "write_script", "编写脚本：测试牌", {"deck_id": 1, "deck_name": "测试牌"}, tmp / "a.log"
+        )
+
+        async def fake_combo(params: Dict[str, Any]) -> str:
+            del params
+            return "推演讲义"
+
+        async def fake_generate_script(params: Dict[str, Any], **kwargs: Any) -> Any:
+            del params, kwargs
+            code = "class Gen1Executor\n{\n" + "\n".join(
+                f"    private bool Card{index}Handler() {{ return false; }}" for index in range(3)
+            ) + "\n}"
+            return types.SimpleNamespace(
+                style_name="Gen1",
+                file_path=tmp / "Gen1Executor.cs",
+                code=code,
+                attempts=1,
+                warnings=["这些卡没写出处理函数，只登记了通用行为：某卡（9）"],
+            )
+
+        runner._derive_combo_for = fake_combo  # type: ignore[method-assign]
+        runner._generate_script = fake_generate_script  # type: ignore[method-assign]
+        await runner._run_write_script(
+            run, {"deck_id": 1, "deck_name": "测试牌", "deck_file": str(tmp / "牌.ydk")}
+        )
+        saved = store.get(run.run_id)
+        assert saved is not None and saved.status == store_module.STATUS_DONE, saved and saved.error
+        assert saved.summary["handlers"] == 3, saved.summary
+        assert saved.summary["lines"] >= 5, saved.summary
+        assert saved.summary["warnings"] == ["这些卡没写出处理函数，只登记了通用行为：某卡（9）"]
+
+
 async def _arena_refused_while_room_is_active() -> None:
     """房间里有人在打时不许起擂台（会再拉一套内核与两个 WindBot，把真人那局打坏）。"""
 
@@ -1070,6 +1176,8 @@ def main() -> int:
         test_timeout_failure_says_what_to_change,
         test_combo_keeps_the_main_lines_when_the_notes_round_fails,
         _combo_derivation_archives_the_guide,
+        _script_tokens_and_iteration_prompts_come_from_config,
+        _write_script_record_says_how_much_it_wrote,
         _unknown_deck_is_refused_before_a_record_exists,
         _arena_refused_while_room_is_active,
         _arena_needs_two_different_styles,

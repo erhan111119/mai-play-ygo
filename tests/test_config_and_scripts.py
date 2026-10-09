@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 import asyncio
 import importlib
 import json
+import re
 import sys
 import tempfile
 import time
@@ -211,6 +212,71 @@ def test_deck_settings_endpoint_writes_random_pool_and_ai_scope() -> None:
             server.stop_now()
 
 
+def test_training_deck_choices_expose_the_script_that_actually_plays() -> None:
+    """训练表单的卡组下拉要拿到**真正上场的那份脚本**（`script`）。
+
+    这条是 bug 的回归测试：接口原来只给 `generated_script` / `picked_style`，
+    而前端读的是 `script`，于是每副牌都显示成"还没脚本"——连已经写好 Gen106 的赖皮
+    在面板上也是这样（用户在真机上看到的就是这个）。
+    """
+
+    webui = _load("webui")
+    import http.client
+
+    secret = "f" * 32
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        data_dir = root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        deckpool = _load("duel.deckpool")
+        pool = deckpool.DeckPool(data_dir)
+        try:
+            with_script = pool.add(
+                group_id="111",
+                display_name="有脚本的牌",
+                contributor_id="u",
+                contributor_name="群友",
+                ydk_text="#main\n100\n!side\n",
+                deck_code="",
+                source_format="ydk",
+                main_count=1,
+                extra_count=0,
+                side_count=0,
+            )
+            pool.set_generated_script(with_script.deck_id, "Gen111")
+            pool.add(
+                group_id="111",
+                display_name="只有风格的牌",
+                contributor_id="u",
+                contributor_name="群友",
+                ydk_text="#main\n101\n!side\n",
+                deck_code="",
+                source_format="ydk",
+                main_count=1,
+                extra_count=0,
+                side_count=0,
+                windbot_deck="RaiseMoon",
+            )
+        finally:
+            pool.close()
+
+        plugin = StubPlugin(data_dir)
+        server, port = _start_panel(webui, plugin, secret)
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            connection.request("GET", "/api/training", headers={"X-API-Key": secret})
+            body = json.loads(connection.getresponse().read().decode("utf-8"))
+            connection.close()
+            choices = {item["name"]: item for item in body["decks"]}
+            assert choices["有脚本的牌"]["script"] == "Gen111", choices["有脚本的牌"]
+            # 没有生成脚本时退到实测挑的风格 / 自带风格，总之要有个名字
+            assert choices["只有风格的牌"]["script"] == "RaiseMoon", choices["只有风格的牌"]
+        finally:
+            server.stop_now()
+            # 面板读卡组库是在自己的线程里跑的，等它收尾再删临时目录（Windows 会报文件占用）
+            time.sleep(0.4)
+
+
 def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> None:
     """对局监控接口：**整张牌桌**都要给（额外怪兽区 / 场地 / 灵摆 / 三堆计数），里侧不泄卡号。
 
@@ -399,6 +465,27 @@ def fake_script(style: str, cls: str) -> str:
     return FAKE_CODE.replace("__CLS__", cls).replace("__STYLE__", style)
 
 
+def handler_reply(prompt: str) -> str:
+    """按提示词点名要的那几个函数，交一份占位处理函数。
+
+    现在的流程是"骨架由代码拼、模型只写处理函数"，所以假模型也得照这个契约回话：
+    从提示词里读出要哪些 `Card<卡号>Handler`（**只认这个形状**——速查表里还有
+    `SomeCardHandler` 那种示例名，不按卡号筛会把示例也当成要求）。
+    """
+
+    names = sorted(set(re.findall(r"private bool (Card\d+Handler)\(\)", prompt)), key=len)
+    body: List[str] = []
+    for name in names:
+        body += [
+            f"        private bool {name}()",
+            "        {",
+            "            return false;",
+            "        }",
+            "",
+        ]
+    return "```csharp\n" + "\n".join(body).rstrip() + "\n```"
+
+
 def _make_tree(root: Path) -> tuple:
     """造一份最小的"WindBot 源码树 + 运行目录"。"""
 
@@ -489,52 +576,11 @@ def test_deck_workspace_endpoint_lists_script_and_combo_archives() -> None:
 
 
 def test_script_generator_writes_compiles_and_reports_attempts() -> None:
-    """生成 → 编译成功：文件写进源码树、卡表写进 Decks/、轮数如实记下来。"""
+    """生成 → 编译成功：骨架 + 分批写出来的处理函数都进源码树，卡表也写一份。
 
-    scriptgen = _load("train.scriptgen")
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        source, windbot = _make_tree(root)
-        prompts: List[str] = []
-
-        async def generate(prompt: str) -> str:
-            prompts.append(prompt)
-            return fake_script("Gen42", "Gen42Executor")
-
-        generator = scriptgen.DeckScriptGenerator(
-            generate, source_dir=source, windbot_dir=windbot, style_name="Gen42", max_attempts=3
-        )
-
-        async def fake_build() -> tuple:
-            return True, "Build succeeded"
-
-        generator._build = fake_build  # type: ignore[method-assign]
-        cards = [
-            scriptgen.CardInfo(card_id=100, name="测试怪兽", zone="主卡组", effect="抽 1 张。"),
-            scriptgen.CardInfo(card_id=500, name="测试额外", zone="额外卡组"),
-        ]
-        request = scriptgen.DeckScriptRequest(
-            deck_id=42, deck_name="测试牌", cards=cards, combo_guide="先通召 100，再做 500。",
-            extra_prompt="先手优先做阻抗", feedback="上一轮太爱盖牌",
-        )
-        result = asyncio.run(generator.generate(request))
-
-        assert result.style_name == "Gen42" and result.attempts == 1, result
-        assert result.file_path.is_file(), result.file_path
-        assert "class Gen42Executor" in result.file_path.read_text(encoding="utf-8")
-        assert (windbot / "Decks" / "AI_Gen42.ydk").is_file(), "卡表也要写一份（脚本自身要自洽）"
-        # 提示词里该有的东西：卡文、combo、作者要求、上一轮反馈、约定的名字
-        prompt = prompts[0]
-        for needle in ("测试怪兽", "抽 1 张", "先通召 100", "先手优先做阻抗", "上一轮太爱盖牌", "Gen42Executor"):
-            assert needle in prompt, f"提示词里缺少 {needle}"
-
-
-def test_script_generator_feeds_build_errors_back_and_cleans_up_failures() -> None:
-    """编译失败要把编译器输出回喂重写；几轮都不成时**不能把坏文件留在源码树里**。
-
-    留着的后果很具体：csproj 会把 `Game/AI/Decks` 下所有 .cs 都编进去，
-    这份失败的尝试就成了同一个类的第二份定义，之后每轮编译都报 CS0101/CS0579
-    （实测把三轮重试全毒死过）。
+    这套流程的重点是"**第一次就写足量**"：`CardId` 常量表、登记表、通用兜底由代码拼（不花模型
+    额度、不可能写错），处理函数分批问模型——每批 `HANDLERS_PER_CALL` 张、一次调用一批。
+    脚本长度因此是"批数 × 每批长度"，而不是"一次回答能写多长"（宿主的单次模型调用只有 30 秒）。
     """
 
     scriptgen = _load("train.scriptgen")
@@ -545,20 +591,119 @@ def test_script_generator_feeds_build_errors_back_and_cleans_up_failures() -> No
 
         async def generate(prompt: str) -> str:
             prompts.append(prompt)
-            return fake_script("Gen7", "Gen7Executor")
+            return handler_reply(prompt)
+
+        generator = scriptgen.DeckScriptGenerator(
+            generate, source_dir=source, windbot_dir=windbot, style_name="Gen42", max_attempts=3
+        )
+
+        async def fake_build() -> tuple:
+            return True, "Build succeeded"
+
+        generator._build = fake_build  # type: ignore[method-assign]
+        # 9 张有效果的卡 + 1 张白板：白板没有可判断的东西，不写处理函数
+        cards = [
+            scriptgen.CardInfo(card_id=100 + index, name=f"测试怪兽{index}", zone="主卡组", effect="抽 1 张。")
+            for index in range(9)
+        ]
+        cards.append(scriptgen.CardInfo(card_id=500, name="测试白板", zone="主卡组", type_text="怪兽 通常"))
+        request = scriptgen.DeckScriptRequest(
+            deck_id=42,
+            deck_name="测试牌",
+            cards=cards,
+            combo_guide="先通召 100，再做 500。",
+            extra_prompt="先手优先做阻抗",
+            feedback="上一轮太爱盖牌",
+        )
+        result = asyncio.run(generator.generate(request))
+
+        assert result.attempts == 1, result
+        assert len(prompts) == 2, f"9 张卡该分成 2 批（每批 8 张），实际问了 {len(prompts)} 次"
+        code = result.file_path.read_text(encoding="utf-8")
+        assert "class Gen42Executor" in code
+        assert scriptgen.DeckScriptGenerator.count_handlers(code) == 9, "9 张有效果的卡都要有处理函数"
+        for card_id in [100 + index for index in range(9)]:
+            assert f"AddExecutor(ExecutorType.Activate, CardId.Card{card_id}, Card{card_id}Handler);" in code
+        # 白板只登记"能被拍出来"，不登记发动
+        assert "AddExecutor(ExecutorType.SummonOrSet, CardId.Card500);" in code
+        assert "AddExecutor(ExecutorType.Activate, CardId.Card500" not in code
+        assert "AddExecutor(ExecutorType.Repos, DefaultMonsterRepos);" in code
+        assert (windbot / "Decks" / "AI_Gen42.ydk").is_file(), "卡表也要写一份（脚本自身要自洽）"
+        # 提示词里该有的东西：本批卡文、要写的函数名、combo、作者要求、上一轮反馈
+        prompt = prompts[0]
+        for needle in ("抽 1 张", "Card100Handler", "先通召 100", "先手优先做阻抗", "上一轮太爱盖牌"):
+            assert needle in prompt, f"提示词里缺少 {needle}"
+
+
+def test_script_generator_registers_what_it_got_and_warns_about_the_rest() -> None:
+    """某一批最终没写成时：**不登记它的发动**（没判断就"能发就发"更糟），并在结果里说清少了哪些卡。"""
+
+    scriptgen = _load("train.scriptgen")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source, windbot = _make_tree(root)
+
+        async def generate(prompt: str) -> str:
+            # 只写第一张卡的处理函数，其余一律不写（模拟"这一批怎么问都写不出来"）
+            return handler_reply(prompt).split("        private bool Card")[0] + (
+                "        private bool Card100Handler()\n        {\n            return true;\n        }\n```"
+            )
+
+        generator = scriptgen.DeckScriptGenerator(
+            generate, source_dir=source, windbot_dir=windbot, style_name="Gen43", max_attempts=1
+        )
+
+        async def ok_build() -> tuple:
+            return True, "Build succeeded"
+
+        generator._build = ok_build  # type: ignore[method-assign]
+        cards = [
+            scriptgen.CardInfo(card_id=100, name="第一张", zone="主卡组", effect="抽 1 张。"),
+            scriptgen.CardInfo(card_id=101, name="第二张", zone="主卡组", effect="破坏一张。"),
+        ]
+        result = asyncio.run(
+            generator.generate(scriptgen.DeckScriptRequest(deck_id=43, deck_name="x", cards=cards))
+        )
+        code = result.file_path.read_text(encoding="utf-8")
+        assert "Card100Handler);" in code, code
+        assert "Card101Handler" not in code, "没写成的卡不能引用一个不存在的函数名"
+        assert "AddExecutor(ExecutorType.Activate, CardId.Card101" not in code, "没判断就不登记发动"
+        assert any("第二张" in note for note in result.warnings), result.warnings
+        assert scriptgen.DeckScriptGenerator.count_handlers(code) == 1, code
+
+
+def test_script_generator_retries_only_the_broken_batch_and_cleans_up_failures() -> None:
+    """编译报错落在哪一批就只重问那一批；几轮都不成时**不能把坏文件留在源码树里**。
+
+    留着的后果很具体：csproj 会把 `Game/AI/Decks` 下所有 .cs 都编进去，
+    这份失败的尝试就成了同一个类的第二份定义，之后每轮编译都报 CS0101/CS0579
+    （实测把三轮重试全毒死过）。
+    """
+
+    scriptgen = _load("train.scriptgen")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source, windbot = _make_tree(root)
+        target = source / "Game" / "AI" / "Decks" / "Gen7Executor.cs"
+        prompts: List[str] = []
+
+        async def generate(prompt: str) -> str:
+            prompts.append(prompt)
+            return handler_reply(prompt)
 
         generator = scriptgen.DeckScriptGenerator(
             generate, source_dir=source, windbot_dir=windbot, style_name="Gen7", max_attempts=2
         )
-        builds = {"n": 0}
 
         async def failing_build() -> tuple:
-            builds["n"] += 1
-            return False, "Decks/Gen7Executor.cs(9,26): error CS0117: 没有这个成员"
+            # 报错行取自真实文件、指向处理函数那一行——这样才测得到"按行号定位到哪一批"
+            rows = target.read_text(encoding="utf-8").splitlines()
+            line = next(index for index, text in enumerate(rows, start=1) if "Card7Handler()" in text)
+            return False, f"Decks/Gen7Executor.cs({line},26): error CS0117: 没有这个成员"
 
         generator._build = failing_build  # type: ignore[method-assign]
         request = scriptgen.DeckScriptRequest(
-            deck_id=7, deck_name="测试牌", cards=[scriptgen.CardInfo(card_id=1, name="卡")]
+            deck_id=7, deck_name="测试牌", cards=[scriptgen.CardInfo(card_id=7, name="卡", effect="抽 1 张。")]
         )
         try:
             asyncio.run(generator.generate(request))
@@ -567,10 +712,9 @@ def test_script_generator_feeds_build_errors_back_and_cleans_up_failures() -> No
         else:
             raise AssertionError("编译一直失败时应该抛 ScriptGenerationError")
 
-        assert builds["n"] == 2, builds
-        assert len(prompts) == 2, prompts
+        assert len(prompts) == 2, f"1 批 × 2 轮＝2 次调用，实际 {len(prompts)} 次"
         assert "CS0117" in prompts[1], "编译器输出要回喂给模型，它才知道改哪儿"
-        assert not (source / "Game" / "AI" / "Decks" / "Gen7Executor.cs").exists(), (
+        assert not target.exists(), (
             "失败的脚本必须从源码树里清掉，否则它会毒死之后每一轮编译"
         )
         failed = windbot / "FailedScripts" / "Gen7Executor.failed.cs"
@@ -633,12 +777,58 @@ def test_script_generator_reports_missing_tree_instead_of_pretending() -> None:
             raise AssertionError("没有源码树时不该「成功」")
 
 
-def test_script_generator_handles_truncated_and_renamed_output() -> None:
-    """两类"看着像成功"的坏回答都要拦住：写一半的、自己另起名字的。
+def test_script_generator_restores_the_previous_script_when_it_fails() -> None:
+    """改脚本失败时**要把上一版原样放回去**：池子里记的还是这个名字，源码树里没有它，
+    对局按 `Deck=<名字>` 找不到，WindBot 会静默换一个随机执行器顶上。
 
-    * 截断：代码取出来也编译不过，先要求它写短，省一轮无效编译；
-    * 改名：能编译、能注册，但对局时按约定名找不到脚本，WindBot 会随机挑一个顶上——
-      "用了错的脚本还看不出来"，所以必须在生成阶段就挡掉。
+    同时要把报错那几行的代码原文回喂给模型——只给"第 N 行类型不匹配"，它会照着原样重写一遍
+    （真机上实测连着两轮报同一个错）。
+    """
+
+    scriptgen = _load("train.scriptgen")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source, windbot = _make_tree(root)
+        target = source / "Game" / "AI" / "Decks" / "Gen5Executor.cs"
+        target.write_text("// 上一版：能用的脚本\n", encoding="utf-8")
+        prompts: List[str] = []
+
+        async def generate(prompt: str) -> str:
+            prompts.append(prompt)
+            return handler_reply(prompt)
+
+        generator = scriptgen.DeckScriptGenerator(
+            generate, source_dir=source, windbot_dir=windbot, style_name="Gen5", max_attempts=2
+        )
+
+        async def failing_build() -> tuple:
+            rows = target.read_text(encoding="utf-8").splitlines()
+            line = next(index for index, text in enumerate(rows, start=1) if "Card5Handler()" in text)
+            return False, f"Decks/Gen5Executor.cs({line},39): error CS0029: 无法将类型 int 转换为 ClientCard"
+
+        generator._build = failing_build  # type: ignore[method-assign]
+        request = scriptgen.DeckScriptRequest(
+            deck_id=5, deck_name="测试牌", cards=[scriptgen.CardInfo(card_id=5, name="卡", effect="抽 1 张。")]
+        )
+        try:
+            asyncio.run(generator.generate(request))
+        except scriptgen.ScriptGenerationError as exc:
+            assert "上一版脚本原样放回" in str(exc), exc
+        else:
+            raise AssertionError("一直编译不过时应该抛 ScriptGenerationError")
+
+        assert target.read_text(encoding="utf-8") == "// 上一版：能用的脚本\n", "上一版必须回到原位"
+        assert "Card5Handler" in prompts[1], "回喂里要有报错处的代码原文"
+        assert "←" in prompts[1], "报错行要标出来，模型才知道改哪句"
+
+
+def test_script_generator_handles_truncated_and_renamed_output() -> None:
+    """两类"看着像成功"的坏回答都要拦住：写一半的、函数名自己另起的。
+
+    * 截断：这一批没写完 → 回喂"写完整"重问（分批之后每批本来就不长，
+      所以要求的是**写完这一批**，不再是"砍掉几张卡写短一点"）；
+    * 改名：函数名与登记表对不上就等于这张卡没写 → 点名要回来；
+    两次都不成时，下一轮还会再补这一批（而不是整份任务就此失败）。
     """
 
     scriptgen = _load("train.scriptgen")
@@ -646,15 +836,16 @@ def test_script_generator_handles_truncated_and_renamed_output() -> None:
         root = Path(directory)
         source, windbot = _make_tree(root)
         replies = [
-            "```csharp\nclass Gen9Executor : DefaultExecutor {\n  // 写一半就被截断了",
-            fake_script("OtherName", "OtherNameExecutor"),
-            fake_script("Gen9", "Gen9Executor"),
+            "```csharp\n        private bool Card9Handler()\n        {\n            // 写一半就被截断了",
+            "```csharp\n        private bool Foo()\n        {\n            return false;\n        }\n```",
         ]
         prompts: List[str] = []
 
         async def generate(prompt: str) -> str:
             prompts.append(prompt)
-            return replies.pop(0)
+            if replies:
+                return replies.pop(0)
+            return handler_reply(prompt)
 
         generator = scriptgen.DeckScriptGenerator(
             generate, source_dir=source, windbot_dir=windbot, style_name="Gen9", max_attempts=4
@@ -667,13 +858,14 @@ def test_script_generator_handles_truncated_and_renamed_output() -> None:
         result = asyncio.run(
             generator.generate(
                 scriptgen.DeckScriptRequest(
-                    deck_id=9, deck_name="x", cards=[scriptgen.CardInfo(card_id=1, name="卡")]
+                    deck_id=9, deck_name="x", cards=[scriptgen.CardInfo(card_id=9, name="卡", effect="抽 1 张。")]
                 )
             )
         )
-        assert result.attempts == 3, result.attempts
-        assert "写短" in prompts[1] or "截断" in prompts[1], prompts[1][-300:]
-        assert "Gen9Executor" in prompts[2] and "名字" in prompts[2], prompts[2][-300:]
+        assert result.attempts == 2, f"第一轮这一批没写成，第二轮补上：{result.attempts}"
+        assert "截断" in prompts[1], prompts[1][-400:]
+        assert "Card9Handler" in prompts[2] and "没有写出来" in prompts[2], prompts[2][-400:]
+        assert scriptgen.DeckScriptGenerator.count_handlers(result.code) == 1, result.code
 
 
 def test_runner_offers_only_the_four_panel_kinds() -> None:
@@ -728,14 +920,17 @@ def main() -> int:
     tests = [
         test_deck_operations_go_through_the_plugin_and_need_confirmation,
         test_deck_settings_endpoint_writes_random_pool_and_ai_scope,
+        test_training_deck_choices_expose_the_script_that_actually_plays,
         test_deck_workspace_endpoint_lists_script_and_combo_archives,
         test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards,
         test_rooms_endpoint_still_draws_the_table_before_the_duel_starts,
         test_script_generator_writes_compiles_and_reports_attempts,
-        test_script_generator_feeds_build_errors_back_and_cleans_up_failures,
+        test_script_generator_registers_what_it_got_and_warns_about_the_rest,
+        test_script_generator_retries_only_the_broken_batch_and_cleans_up_failures,
         test_script_generator_says_exe_is_locked_instead_of_dumping_msbuild,
         test_script_generator_reports_missing_tree_instead_of_pretending,
         test_script_generator_handles_truncated_and_renamed_output,
+        test_script_generator_restores_the_previous_script_when_it_fails,
         test_runner_offers_only_the_four_panel_kinds,
     ]
     failures: List[str] = []

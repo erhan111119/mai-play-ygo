@@ -163,10 +163,12 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件")
-    config_version: str = Field(default="1.2.0", description="配置版本")
+    config_version: str = Field(default="1.3.0", description="配置版本")
     # 版本号提升是有意的：1.2.0 起新增 `[llm]`（三个用途的模型与超时）、`[training]`（训练功能）、
     # `[webui]`（插件自带面板）三节，并把 `duel.brain_model` / `duel.brain_timeout_ms`
     # 移成 `llm.decision_model` / `llm.decision_timeout_ms`（老键会被静默忽略）。
+    # 1.3.0 起 `[llm]` 多一个 `training_script_max_tokens`（写脚本每批的输出上限），
+    # 老配置没有这个键时按默认值 4096 走。
 
 
 class PathsConfig(PluginConfigBase):
@@ -389,6 +391,16 @@ class LlmConfig(PluginConfigBase):
             "实测原文是 `[E_TIMEOUT] 请求 cap.call 超时 (30000ms)`），写比它大没有意义。"
             "插件把上限设在 25 秒，是为了让失败由插件先发现，并在记录里写清"
             "「是模型太慢」以及该换哪只模型；训练任务是后台任务，失败一条不影响对局"
+        ),
+    )
+    training_script_max_tokens: int = Field(
+        default=4096,
+        description=(
+            "【写脚本】每次让模型写多少 token（默认 4096）。脚本是**分批**写的："
+            "每批 8 张卡的处理函数、一次模型调用写一批，所以这个数决定的是"
+            "「一批能写多细」，不是整份脚本的长度上限（脚本总长＝批数 × 每批）。"
+            "想让它写得更细可以调大，但**别超 8000**：宿主对插件的单次调用有 30 秒硬超时，"
+            "写不完就整批白写（宁可多分几批）。这个额度用满时输出约 200~300 行 C#"
         ),
     )
 
@@ -1018,6 +1030,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         if current is not None and self.config.training.enabled:
             if current.workspace == workspace and current.max_duels == max_duels:
                 current.set_training_model(self.config.llm.training_model)
+                # 写脚本的额度也是"改了就生效"的一项：它不改变任务的身份，没必要重建执行器
+                current.set_script_max_tokens(self.config.llm.training_script_max_tokens)
                 if self._logger is not None:
                     self._logger.debug("训练功能的配置没动到执行器，保留正在跑的任务")
                 return
@@ -1048,10 +1062,12 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             record_script=self._record_generated_script,
         )
         self._train_runner.set_training_model(self.config.llm.training_model)
+        self._train_runner.set_script_max_tokens(self.config.llm.training_script_max_tokens)
         self._logger.info(
-            "训练功能已就绪：工作目录 %s｜训练模型 %s｜单次擂台上限 %s 局",
+            "训练功能已就绪：工作目录 %s｜训练模型 %s｜写脚本额度 %s token/批｜单次擂台上限 %s 局",
             workspace,
             self.config.llm.training_model.strip() or "（宿主给插件配的那只）",
+            self.config.llm.training_script_max_tokens,
             self.config.training.max_duels_per_run,
         )
 

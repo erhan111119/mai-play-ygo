@@ -11,7 +11,7 @@
 [plugin]
 # 插件：插件基础配置。
 enabled = false  # 是否启用插件（复制成 config.toml 后改成 true）
-config_version = "1.2.0"  # 配置版本
+config_version = "1.3.0"  # 配置版本（1.3.0 起 [llm] 多一个 training_script_max_tokens）
 
 [paths]
 # 运行环境：两个虚拟客户端与数据文件的位置（默认都在插件自带的 clients/ 里）
@@ -59,6 +59,7 @@ decision_timeout_ms = 2500  # 【AI 决策】WindBot 等答复的上限（毫秒
 decision_style = "aggressive"  # 决策档位：conservative / normal / aggressive（也认 保守/平常/激进）；只改提示词，不用重编译 exe
 training_model = ""  # 【训练功能】读卡文推 combo、复盘、写结论用哪只。⚠ 要填**不思考**的（如 deepseek-chat）：宿主对插件的单次模型调用有 30 秒硬超时（cap.call），会思考的模型（本机的 `ds`/`deepseekV4.1flash`）光"想"就超时；留空＝宿主给插件配的那只
 training_timeout_ms = 25000  # 【训练功能】单次等模型的上限（毫秒）。**给不大**：宿主那侧 30 秒就断（cap.call），给 120000 也无效；给 25 秒是为了让失败由插件先发现，并在记录里说清"是模型太慢、该换哪只"
+training_script_max_tokens = 4096  # 【写脚本】一次让模型写多少 token（默认 4096）。脚本是分批写的（每批 8 张卡的处理函数、一次调用一批），所以这个数决定"一批能写多细"，不是整份脚本的长度上限（总长＝批数 × 每批）。想更细可以调大，但**别超 8000**：宿主对插件单次调用有 30 秒硬超时，写不完整批白写
 
 [wiki]
 # 百科检索：查卡 / 发卡图
@@ -66,8 +67,9 @@ endpoint = "https://ygocdb.com/api/v0/"  # 查卡接口地址（ygocdb 兼容；
 timeout = 15  # 在线接口超时时间（秒）：查卡与取卡图都用它
 
 [training]
-# 训练功能（插件里的「研究台」）：推演 combo / 复盘录像 / 预校验脚本 / 跑擂台 A/B。
+# 训练功能（插件里的「研究台」）：面板上就四件事——卡组互打 / 编写脚本 / 卡组迭代 / 复盘优化。
 # **用哪只模型在 [llm] 里**（`training_model`），这一节只放开关与放东西的地方。
+# 互打与迭代选的是"另一副卡组"（一个卡组只有一个脚本，两边各用自己那份）。
 # 训练任务都在插件自带的面板里发起与查看（不在群里用命令）——面板配置见下面的 [webui]。
 enabled = true  # 是否启用训练功能（关掉后面板只展示历史记录，不受理新任务；对局侧不受影响）
 workspace = ""  # 训练工作目录：擂台数据库、训练日志、推演结果都放这儿；留空＝插件数据目录下的 train/

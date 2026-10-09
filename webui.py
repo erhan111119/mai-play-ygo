@@ -734,19 +734,27 @@ class _PanelHandler(BaseHTTPRequestHandler):
         }
 
     def _deck_choices(self) -> List[Dict[str, Any]]:
-        """给训练表单用的卡组选项（编号、群、名字、现有脚本名）。"""
+        """给训练表单用的卡组选项（编号、群、名字、现有脚本名）。
+
+        `script` 是**真正上场的那份**（生成脚本优先，其次实测挑的，最后是自带风格名）：
+        前端两个下拉都读这个键——早先只给了 `generated_script` / `picked_style`，
+        于是前端读不到、每副牌都显示成"还没脚本"（连有 Gen106 的赖皮也一样）。
+        """
 
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
         choices: List[Dict[str, Any]] = []
         for row in _read_deck_rows(panel.deck_db_path):
+            generated = str(row.get("generated_script") or "")
+            picked = str(row.get("picked_style") or "")
             choices.append(
                 {
                     "deck_id": row.get("deck_id") or "",
                     "group_id": row.get("group_id") or "",
                     "name": row.get("display_name") or "",
-                    "generated_script": str(row.get("generated_script") or ""),
-                    "picked_style": str(row.get("picked_style") or ""),
+                    "generated_script": generated,
+                    "picked_style": picked,
                     "windbot_deck": str(row.get("windbot_deck") or ""),
+                    "script": generated or picked or str(row.get("windbot_deck") or ""),
                     "is_builtin": str(row.get("group_id") or "") == "__builtin__",
                 }
             )
@@ -2245,8 +2253,8 @@ function roomBoard(room){
    这些任务内部的步骤，不再让用户先想"我该跑哪一个"。 */
 const KIND_HINT = {
   arena: "两副牌各自用自己那份脚本对打，逐局交替座位——看谁的牌组+脚本更硬。",
-  write_script: "读卡文给这副牌写一份 C# 出牌脚本并编译（会自动先推一遍 combo；会改动 WindBot 源码树）。",
-  iterate: "推演 → 写脚本 → 跟另一副牌打 → 按结果再改一轮。**会真打牌，慢**。",
+  write_script: "读卡文给这副牌写一份 C# 出牌脚本并编译：**每张卡一个处理函数**，分批写（一批 8 张，一次调用一批），所以第一次就会写足量。已有脚本时是在它基础上改。会改动 WindBot 源码树。",
+  iterate: "推演 → 写脚本 → 跟另一副牌打 → 让模型对着**脚本源码 + 逐局战况**说下一版改哪几个函数 → 再改一轮。**会真打牌，慢**。",
   review: "读这副牌最近打过的对局记录，指出具体该改哪里（只看不改，不动任何文件）。",
 };
 const KIND_LABEL = {

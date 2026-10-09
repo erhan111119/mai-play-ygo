@@ -154,7 +154,8 @@ def test_config_model_builds_and_matches_toml() -> None:
     # 2026-10-07 起 1.10.0：`taunt_enabled` / `invite_enabled` 默认关闭（用户要求"开房发完地址就不再讲话"）。
     # 2026-10-08 起 1.2.0：新增 [llm]（三个用途的模型与超时）/ [training]（训练功能）/ [webui]（插件面板），
     # 并把 duel.brain_model + duel.brain_timeout_ms 移成 llm.decision_model + llm.decision_timeout_ms。
-    assert defaults.plugin.config_version == "1.2.0"
+    # 2026-10-09 起 1.3.0：`[llm]` 多一个 training_script_max_tokens（写脚本每批的输出上限）。
+    assert defaults.plugin.config_version == "1.3.0"
 
     with (_PLUGIN_ROOT / "config.toml.example").open("rb") as handle:
         toml_data = tomllib.load(handle)

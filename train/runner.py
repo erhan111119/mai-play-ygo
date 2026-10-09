@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 import asyncio
 import logging
@@ -74,6 +74,17 @@ PANEL_TAIL_LINES = 80
 
 #: 需要模型写结论的种类（写脚本 / 自动迭代的模型调用本身就是任务，不在此列）。
 KINDS_WITH_CONCLUSION = frozenset({KIND_ARENA})
+
+#: 写脚本时**每次模型调用**的输出上限（token）。可以在配置里改（`llm.training_script_max_tokens`）：
+#: 脚本是分批写的（每批 `scriptgen.HANDLERS_PER_CALL` 张卡），所以这个数只决定"一批能写多细"。
+#: 给太大没用——宿主对插件的单次调用有 30 秒硬超时，写不完一样是白写。
+DEFAULT_SCRIPT_MAX_TOKENS = 4096
+
+#: 自动迭代的"下一轮改什么"结论给多少额度。比普通结论长：它要列出能落到代码上的修改清单。
+_ITERATE_CONCLUSION_TOKENS = 2000
+
+#: 迭代结论里放多少字符的脚本源码（整份可能上千行，够模型对上处理函数就行）。
+_ITERATE_CODE_CHARS = 12000
 
 
 class TrainingError(RuntimeError):
@@ -140,6 +151,8 @@ class TrainingRunner:
         self._stopping = False
         #: 训练用哪只模型（空串＝宿主给插件配的那只）；由插件在起 runner 与配置热更新时推过来。
         self._training_model = ""
+        #: 写脚本时每次模型调用的输出上限；同样由插件按配置推过来（见 `set_script_max_tokens`）。
+        self._script_max_tokens = DEFAULT_SCRIPT_MAX_TOKENS
 
     # ---- 状态 ----
 
@@ -571,9 +584,13 @@ class TrainingRunner:
         return Path(source_dir), Path(windbot_dir)
 
     async def _generate_script(
-        self, params: Dict[str, Any], *, feedback: str = "", combo_guide: str = ""
+        self, params: Dict[str, Any], *, feedback: str = "", combo_guide: str = "", previous_code: str = ""
     ) -> Any:
-        """跑一次「写脚本」：读卡表 + 卡文 → 模型写 C# → dotnet 编译（失败自动重写几轮）。"""
+        """跑一次「写脚本」：读卡表 + 卡文 → 模型写 C# → 编译（失败自动重写几轮）。
+
+        `previous_code` 是上一版的源码：迭代时把它传进来才是"改"而不是"从零重写"。
+        不传的话，生成器自己会去找这副牌已有的脚本当基座（"再写一次"＝改进）。
+        """
 
         source_dir, windbot_dir = self._require_windbot_tree()
         ydk_path = Path(str(params["deck_file"]))
@@ -598,13 +615,18 @@ class TrainingRunner:
             combo_guide=combo_guide,
             extra_prompt=str(params.get("extra_prompt") or ""),
             feedback=feedback,
+            previous_code=previous_code,
         )
         return await generator.generate(request)
 
     async def _as_prompt_generate(self, prompt: str) -> str:
-        """把 `(prompt, model, max_tokens)` 形状的模型回调适配成生成器要的单参数形状。"""
+        """把 `(prompt, model, max_tokens)` 形状的模型回调适配成生成器要的单参数形状。
 
-        return await self._generate(prompt, str(self._model_name()), 4096)
+        额度取配置里的 `llm.training_script_max_tokens`：脚本是分批写的，这个数只影响
+        "一批能写多细"，不是整份脚本的长度上限。
+        """
+
+        return await self._generate(prompt, str(self._model_name()), int(self._script_max_tokens))
 
     async def _run_write_script(self, run: TrainingRun, params: Dict[str, Any]) -> None:
         """写脚本：**先推一遍 combo**，再让模型照它写 C# → 编译 → 把脚本名写回卡组池。
@@ -619,12 +641,18 @@ class TrainingRunner:
         if self._record_script is not None:
             # 不写回池子的话，刚写好的脚本不会被对局用上——那就白写了
             self._record_script(int(params.get("deck_id") or 0), script.style_name)
-        exe = Path(script.file_path).parents[2] / "bin" / "Release" / "WindBot.exe"
+        # 编译产物在**源码树根**下的 bin/Release/：脚本文件躺在 <根>/Game/AI/Decks/ 里，
+        # 所以得往上数四级才是根（数少一级就永远拿不到 mtime，面板上"exe 什么时候编的"一直是 0）
+        exe = Path(script.file_path).parents[3] / "bin" / "Release" / "WindBot.exe"
         summary = {
             "deck_name": params["deck_name"],
             "style_name": script.style_name,
             "file_path": str(script.file_path),
             "attempts": script.attempts,
+            # 这一次写了多少：面板上要能一眼看出"是不是又只写了十来行"
+            "lines": len(str(script.code).splitlines()),
+            "handlers": DeckScriptGenerator.count_handlers(script.code),
+            "warnings": list(script.warnings),
             "exe": str(exe),
             "exe_mtime": exe.stat().st_mtime if exe.is_file() else 0,
             "combo_used": bool(guide),
@@ -632,9 +660,11 @@ class TrainingRunner:
         self.store.finish(run.run_id, STATUS_DONE, summary=summary)
         if self.logger is not None:
             self.logger.info(
-                "已为「%s」写好出牌脚本 %s（第 %s 轮编译通过）：%s",
+                "已为「%s」写好出牌脚本 %s：%s 行、%s 个处理函数（第 %s 轮编译通过）：%s",
                 params["deck_name"],
                 script.style_name,
+                summary["lines"],
+                summary["handlers"],
                 script.attempts,
                 script.file_path,
             )
@@ -699,6 +729,8 @@ class TrainingRunner:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         history: List[Dict[str, Any]] = []
         feedback = ""
+        last_code = ""
+        """上一轮写出来的脚本源码：下一轮在它基础上改（迭代要越改越好，不能每轮从零重写）。"""
 
         def note(text: str) -> None:
             """往训练日志里追加一行（面板看进度就是读这个文件）。"""
@@ -736,11 +768,21 @@ class TrainingRunner:
             round_info["guide_path"] = str(guide_path)
             note(f"第 {index} 轮：combo 完成（{round_info['combo_lines']} 条主线），开始写脚本…")
 
-            script = await self._generate_script(params, feedback=feedback, combo_guide=guide_text)
+            script = await self._generate_script(
+                params, feedback=feedback, combo_guide=guide_text, previous_code=last_code
+            )
+            last_code = str(script.code)
             round_info["style_name"] = script.style_name
             round_info["script_file"] = str(script.file_path)
             round_info["script_attempts"] = script.attempts
-            note(f"第 {index} 轮：脚本 {script.style_name} 编译通过（第 {script.attempts} 轮），开擂台…")
+            round_info["script_lines"] = len(last_code.splitlines())
+            round_info["script_handlers"] = DeckScriptGenerator.count_handlers(last_code)
+            round_info["script_warnings"] = list(script.warnings)
+            note(
+                f"第 {index} 轮：脚本 {script.style_name} 编译通过"
+                f"（{round_info['script_lines']} 行、{round_info['script_handlers']} 个处理函数，"
+                f"第 {script.attempts} 轮），开擂台…"
+            )
 
             argv = [
                 str(self.tools_dir / "style_ab.py"),
@@ -771,17 +813,19 @@ class TrainingRunner:
             )
             round_info["arena_exit_code"] = exit_code
             round_info["arena_log"] = str(arena_log)
-            note(f"第 {index} 轮：擂台结束（退出码 {exit_code}），让模型写结论…")
-            conclusion = await self._conclude(
-                kind=KIND_ARENA,
-                params={**params, "style_a": script.style_name, "style_b": baseline},
-                output_tail=output_tail,
+            note(f"第 {index} 轮：擂台结束（退出码 {exit_code}），让模型读战况 + 脚本写下一版改什么…")
+            conclusion, conclusion_error = await self._iteration_conclusion(
+                params=params,
+                script=script,
+                baseline=baseline,
+                log_path=arena_log,
+                history=history,
             )
             if conclusion is None:
                 # 结论写不出来不算迭代失败：擂台日志本身就在，下一轮就没有修改方向而已
-                round_info["conclusion_error"] = self._last_conclusion_error
+                round_info["conclusion_error"] = conclusion_error
                 feedback = ""
-                note(f"第 {index} 轮：结论没生成（{self._last_conclusion_error}），下一轮不再带修改要求")
+                note(f"第 {index} 轮：结论没生成（{conclusion_error}），下一轮不再带修改要求")
             else:
                 round_info["conclusion"] = conclusion
                 feedback = conclusion
@@ -960,6 +1004,80 @@ class TrainingRunner:
             return None
 
 
+    async def _iteration_conclusion(
+        self,
+        *,
+        params: Dict[str, Any],
+        script: Any,
+        baseline: str,
+        log_path: Path,
+        history: Sequence[Dict[str, Any]],
+    ) -> Tuple[Optional[str], str]:
+        """写"下一轮要改什么"：给模型看**这一版脚本的源码** + 这一轮的逐局战况。
+
+        和单次擂台的结论不一样：那个只要说清"能不能信、下一步做什么"，迭代要的是**能落到
+        代码上的修改清单**。所以提示词里必须带源码——只说"胜率 40%"没法指导改哪个处理函数，
+        而"XX 的阈值太宽 / 该用 SelectCard 挑目标"才是真的改得动的东西。
+
+        Returns:
+            ``(结论, 失败原因)``；结论写不出来时前者为 None（原因给用户看）。
+        """
+
+        material = self._arena_evidence(log_path)
+        earlier = "\n".join(
+            f"- 第 {item['round']} 轮的修改要求：{str(item.get('conclusion') or '（没生成）')[:200]}"
+            for item in history
+        )
+        prompt = _ITERATE_PROMPT.format(
+            deck=params["deck_name"],
+            opponent=params.get("opponent_name") or "对手",
+            baseline=baseline,
+            style=script.style_name,
+            lines=len(str(script.code).splitlines()),
+            handlers=DeckScriptGenerator.count_handlers(script.code),
+            warnings="；".join(script.warnings) or "（无）",
+            earlier=earlier or "（这是第一轮）",
+            code=("```csharp\n" + str(script.code)[:_ITERATE_CODE_CHARS] + "\n```"),
+            material=material,
+        )
+        try:
+            raw = await self._generate(prompt, str(self._model_name()), _ITERATE_CONCLUSION_TOKENS)
+        except Exception as exc:  # noqa: BLE001  模型那层的问题要如实说
+            return None, f"调用模型失败：{exc}"
+        text = str(raw or "").strip()
+        if not text:
+            return None, "模型返回了空内容（额度被思考吃光，或那只模型不能用）"
+        if self.logger is not None:
+            self.logger.info("迭代结论已生成：%s", text.replace("\n", " ")[:120])
+        return text, ""
+
+    @staticmethod
+    def _arena_evidence(log_path: Path, max_duels: int = 40) -> str:
+        """从擂台日志里取"逐局战况 + 汇总"两段。
+
+        只给汇总（一个胜率）是不够的：指出问题要靠"第 3 局 6 回合就输了""这一局 20 秒就结束"
+        这类具体现象。逐局行是 `style_ab.py` 自己打的，所以这里按行首的 `[` 挑。
+        """
+
+        try:
+            rows = Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return "（读不到擂台日志）"
+        duels = [row for row in rows if row.startswith("[")]
+        split = next((index for index, row in enumerate(rows) if "汇总" in row), None)
+        summary = rows[split:] if split is not None else []
+        parts: List[str] = []
+        if duels:
+            parts.append(
+                f"逐局（共 {len(duels)} 局，这里列前 {min(len(duels), max_duels)} 局）：\n"
+                + "\n".join(duels[:max_duels])
+            )
+        if summary:
+            parts.append("汇总：\n" + "\n".join(summary))
+        if not parts:
+            parts.append("（擂台日志里没有逐局记录；尾巴：\n" + "\n".join(rows[-12:]) + "）")
+        return "\n\n".join(parts)
+
     def _cleanup_process(self) -> None:
         """进程对象在取消路径上的收尾（不 await，只保证不再被引用）。"""
 
@@ -979,6 +1097,15 @@ class TrainingRunner:
         """配置热更新后由插件把新模型名推给 runner。"""
 
         self._training_model = str(model or "")
+
+    def set_script_max_tokens(self, value: Any) -> None:
+        """配置热更新后由插件把"写脚本每次调用的输出上限"推给 runner。
+
+        上限<=0（或没配）时用默认值：写脚本必须有个额度，给 0 会让模型每次都返回空内容。
+        """
+
+        tokens = int(value or 0)
+        self._script_max_tokens = tokens if tokens > 0 else DEFAULT_SCRIPT_MAX_TOKENS
 
     def _cards_cdb(self) -> str:
         """卡库路径（拿不到就给空串，脚本自己会报"卡库不存在"）。"""
@@ -1062,6 +1189,36 @@ class TrainingRunner:
 
 #: 复盘优化的提示词。**要求它说"改哪一行/哪条规则"**，不接受"多练习"这种废话；
 #: 也不许它编卡（素材里出现了哪些卡就是哪些卡）。
+_ITERATE_PROMPT = """你在主持「游戏王出牌脚本」的自动迭代：读完这一版脚本与它刚打完的这一轮擂台，
+写出**下一版脚本要改什么**。你的输出会原样交给写脚本的模型当修改要求，所以要对着代码说话。
+
+这副牌：{deck}（对手：{opponent}，对照脚本：{baseline}）
+这一版脚本：{style}（{lines} 行、{handlers} 个处理函数）
+写脚本时已知的问题：{warnings}
+
+之前的修改要求：
+{earlier}
+
+这一版脚本源码：
+{code}
+
+这一轮擂台的实际战况：
+{material}
+
+要求：
+1. **对着上面的处理函数说话**：写清"哪个函数（`Card<卡号>Handler`）现在的判断是什么、该改成什么"
+   ——例如"Card12345678Handler 只要对手场上有 1 只怪就发，改成对手有 2 只以上且自己场面落后时再发"。
+   只说"要加强先手展开"这种话没有用，写脚本的模型照着它改不动。
+2. **每条都要给依据**：引用战况里的具体现象（第几局、几回合、脚本没加载的告警、耗时异常）。
+   战况里看不出来的事就不要写。
+3. **样本不够就直说**：本机实测同一套牌重测会出现完全相反的胜率，所以局数少于 80 局时
+   **不许**说"这版更强/更弱"，只能说"机制有没有跑坏"以及从逐局现象里看到的具体问题。
+4. 如果战况里有"脚本没加载 / 执行器没注册 / 进程崩了 / 超时"这类痕迹，**第一条就写它**，
+   并且这轮不要拿胜率说事。
+5. 最后给一句"下一版重点改哪两三个函数"，不超过 40 字。
+6. 中文小标题 + 短句，不要长篇大论；不要编造卡号与卡文。
+"""
+
 _REVIEW_PROMPT = """你在帮一副游戏王卡组做复盘。下面是它最近打过的对局记录（记录器在对局里
 实时看到的：回合、双方动作数、召唤/特召/发动/盖放/攻击、伤害、双方用过的卡）。
 
