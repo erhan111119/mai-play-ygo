@@ -421,6 +421,61 @@ def test_kill_tree_uses_taskkill_with_tree_flag() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_research_asks_the_online_model_and_keeps_its_material() -> None:
+    """联网查资料：用**配置里那只联网模型**发出去，卡表进提示词，回复原文带回来。
+
+    这条守住的是"写脚本能联网"这件事的两端：**发给谁**（model 参数要原样传下去，别被
+    training_model 顶掉）和**问了什么**（卡表必须一起给，不然搜回来的资料与这副牌无关）。
+    """
+
+    analysis = _load("train.analysis")
+    seen: Dict[str, str] = {}
+
+    async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+        seen["model"] = model
+        seen["prompt"] = prompt
+        seen["max_tokens"] = str(max_tokens)
+        return "- 先手做 500 站场\n- 100 留到后手"
+
+    result = asyncio.run(
+        analysis.research_archetype(
+            fake_generate,
+            deck_name="异解",
+            digest="# 卡组：异解\n- 100 测试怪兽｜效果：抽 1 张。",
+            model="联网搜索",
+            extra_prompt="重点看先手",
+            logger=None,
+        )
+    )
+    assert seen["model"] == "联网搜索", "必须发给配置里那只联网模型"
+    assert "异解" in seen["prompt"] and "测试怪兽" in seen["prompt"], "卡表要一起给"
+    assert "重点看先手" in seen["prompt"], "作者的要求要带上"
+    assert int(seen["max_tokens"]) > 0
+    assert result.text.startswith("- 先手做 500"), result.text
+    assert result.model == "联网搜索"
+
+
+def test_empty_research_reply_is_an_error() -> None:
+    """联网模型回空串必须报错：调用方靠它区分"没配/查失败"与"查到了"，不能自己编资料。"""
+
+    analysis = _load("train.analysis")
+
+    async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+        del prompt, model, max_tokens
+        return ""
+
+    try:
+        asyncio.run(
+            analysis.research_archetype(
+                fake_generate, deck_name="x", digest="d", model="联网搜索", logger=None
+            )
+        )
+    except analysis.AnalysisError as exc:
+        assert "空内容" in str(exc), exc
+    else:
+        raise AssertionError("空回复应该抛 AnalysisError")
+
+
 def test_deck_digest_and_combo_check_catch_cards_outside_the_deck() -> None:
     """模型提到的卡必须真在卡表里：不在的从结构化字段里剔掉，并留下 warning。"""
 
@@ -711,6 +766,56 @@ async def _combo_derivation_archives_the_guide() -> None:
         assert len(archived) == 1, archived
         assert "先攻压制" in archived[0].read_text(encoding="utf-8")
         assert not runner.busy
+
+
+async def _research_goes_to_the_search_model_and_never_blocks_the_run() -> None:
+    """联网查资料这条链的三件事：没配就**不问**、配了就**用那只模型**问并落盘、问失败**只记账不炸**。
+
+    第三点是刻意的：搜索 provider 欠费/超时不该把整次写脚本拖没（资料只是参考），
+    但也不许悄悄咽掉——失败原因要留在 `_research_error` 里给面板看。
+    """
+
+    store_module = _load("train.store")
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        store = store_module.TrainingStore(tmp / "training.db")
+        deck_path = tmp / "测试牌.ydk"
+        _write_deck(deck_path, [101, 102])
+        params = {"deck_id": 0, "deck_name": "测试牌", "deck_file": str(deck_path)}
+
+        # 1) 没配联网模型：一次模型调用都不该发生（`_never_called` 会炸）
+        lazy = _make_runner(tmp, store)
+        assert await lazy._derive_research_for(params) == ""
+        assert lazy.research_dir.is_dir(), "研究目录要在起 runner 时就建好"
+
+        # 2) 配了：用**那只**模型问，资料落盘
+        seen: List[str] = []
+
+        async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+            del max_tokens
+            seen.append(model)
+            assert "增殖的G" in prompt, prompt[:120]
+            return "- 先把 101 拍上去\n- 102 留着应对"
+
+        runner = _make_runner(tmp, store, generate=fake_generate)
+        runner.set_search_model("联网搜索")
+        text = await runner._derive_research_for(params)
+        assert seen == ["联网搜索"], seen
+        assert "102 留着应对" in text
+        assert runner._research_error == ""
+        archived = list(runner.research_dir.glob("*-0-*.txt"))
+        assert len(archived) == 1, archived
+        assert "102 留着应对" in archived[0].read_text(encoding="utf-8")
+
+        # 3) 联网那一侧挂了：返回空串（不炸）但把原因记下来
+        async def failing_generate(prompt: str, model: str, max_tokens: int) -> str:
+            del prompt, model, max_tokens
+            raise RuntimeError("[E_TIMEOUT] 请求 cap.call 超时 (30000ms)")
+
+        broken = _make_runner(tmp, store, generate=failing_generate)
+        broken.set_search_model("联网搜索")
+        assert await broken._derive_research_for(params) == ""
+        assert "30 秒" in broken._research_error, broken._research_error
 
 
 async def _unknown_deck_is_refused_before_a_record_exists() -> None:
@@ -1402,6 +1507,7 @@ def main() -> int:
         test_timeout_failure_says_what_to_change,
         test_combo_keeps_the_main_lines_when_the_notes_round_fails,
         _combo_derivation_archives_the_guide,
+        _research_goes_to_the_search_model_and_never_blocks_the_run,
         _script_tokens_and_iteration_prompts_come_from_config,
         _write_script_record_says_how_much_it_wrote,
         _unknown_deck_is_refused_before_a_record_exists,

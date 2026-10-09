@@ -419,6 +419,87 @@ def _with_hint(message: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 联网资料查证
+# ---------------------------------------------------------------------------
+
+#: 联网查资料**每次**答复的额度。这类带检索的模型会把检索到的原文一起带回来，给少了只剩半句。
+#: 写脚本是一次性调用（不是对局内逐次决策），几十秒的等待可以接受。
+RESEARCH_MAX_TOKENS = 1800
+
+
+@dataclass
+class ResearchResult:
+    """联网资料查证的结果。"""
+
+    text: str = ""
+    model: str = ""
+
+
+_RESEARCH_SYSTEM = """你在为「游戏王」的一副卡组做资料搜集，读者是准备给它写自动出牌脚本的人。
+请**联网检索**这副牌在现实中的主流打法，然后整理成给脚本作者看的资料。
+
+要求：
+1. 只写与卡表里**实际有的卡**有关的战术。资料里出现的卡如果不在卡表里，就不要写进结论；
+   宁愿少写，也不要为了凑数把别的构筑的卡混进来。
+2. 重点回答这四件事：
+   * 典型展开路线：起手有哪几张 → 做到什么终场（按"先手"和"后手"分开写）；
+   * 卡的用法时机：哪些是启动点、哪些要留着应对、同一个效果的多个用法里哪个优先；
+   * 常见失误：打得不好的人通常错在哪一步、错在哪张卡上；
+   * 这套牌怕什么（手坑/除去/特定压制），以及怎么躲。
+3. 不确定的地方**直接写"不确定"**，查不到就写"没查到"——不要用记忆里的旧信息把空补上。
+4. 最后单独一段列出来源（站点名或标题即可；一条都没拿到就别写这段）。
+5. 输出纯文本条目（每条 `- ` 开头），不要 JSON、不要表格、不要代码块。"""
+
+
+async def research_archetype(
+    generate: Callable[..., Any],
+    *,
+    deck_name: str,
+    digest: str,
+    model: str,
+    extra_prompt: str = "",
+    logger: Optional[logging.Logger] = None,
+) -> ResearchResult:
+    """让**联网模型**查一遍这副牌在现实里怎么打，返回给写脚本用的资料文本。
+
+    与 :func:`derive_combo` 的分工：combo 推演是"按卡文自己推出来的"，这一份是"网上的人怎么打"。
+    两份都会喂给写脚本的模型，而**卡文永远优先**：网上资料可能过时、可能是别的构筑的说法
+    （本机实测：同一个问题问两只联网模型，卡表明细就对不上），所以调用方在提示词里必须把它
+    标成"仅供参考、与卡文冲突时以卡文为准"。
+
+    Args:
+        generate: 发请求的协程，签名 ``generate(prompt, model, max_tokens) -> str``。
+        deck_name / digest: 卡组名与 :func:`build_deck_digest` 的产物。
+        model: 联网模型名（空串＝没配，调用方应该干脆不要调这个函数）。
+        extra_prompt: 作者额外要求（特别想弄清楚什么就写在这）。
+        logger: 日志器。
+
+    Raises:
+        AnalysisError: 调用失败或回复为空（**不吞**：要不要继续由调用方决定——
+            写脚本时"少一份参考"和"整个任务失败"是两种不同的处理）。
+    """
+
+    extra = str(extra_prompt or "").strip()
+    extra_block = f"\n\n作者特别想弄清楚的问题：\n{extra[:1000]}" if extra else ""
+    prompt = (
+        f"{_RESEARCH_SYSTEM}\n\n{digest}{extra_block}\n\n"
+        f"请检索「{deck_name}」这套牌的打法，整理成上面要求的资料。"
+    )
+    try:
+        raw = await generate(prompt, model, RESEARCH_MAX_TOKENS)
+    except Exception as exc:  # noqa: BLE001  统一成 AnalysisError，让调用方把它记成一次失败
+        raise AnalysisError(_with_hint(f"联网查资料失败：{exc}")) from exc
+    text = str(raw or "").strip()
+    if not text:
+        raise AnalysisError(
+            _with_hint("联网模型返回了空内容（额度被思考吃光，或这只模型其实不支持对话接口）")
+        )
+    if logger is not None:
+        logger.info("联网资料已取回：%s 字（模型 %s）", len(text), model or "宿主默认")
+    return ResearchResult(text=text, model=model)
+
+
+# ---------------------------------------------------------------------------
 # 给跑完的输出写结论
 # ---------------------------------------------------------------------------
 

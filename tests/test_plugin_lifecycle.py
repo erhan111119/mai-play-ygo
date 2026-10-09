@@ -673,7 +673,8 @@ async def test_on_unload_releases_data_dir() -> None:
         # 2026-10-08 加的两样东西也在这个目录里，逐个删干净才算"句柄都放开了"：
         # 训练记录库（`train/training.db`，同样是一次连接都不能留着）与自动生成的面板密钥。
         (data_dir / "train" / "training.db").unlink()
-        for sub in ("logs", "combos", "decks"):
+        # `research` 是 2026-10-09 加的：写脚本前联网查到的资料存在这儿（没联网时是空目录）
+        for sub in ("logs", "combos", "decks", "research"):
             (data_dir / "train" / sub).rmdir()
         (data_dir / "train").rmdir()
         (data_dir / "webui_key.txt").unlink()
@@ -2076,6 +2077,9 @@ def test_llm_section_owns_the_models_and_the_decision_layer_reads_it() -> None:
     # 上限默认 4000：决策层推荐的 2 秒档模型需要它；快模型不受影响（这只是上限）
     assert config.llm.decision_timeout_ms == 4000, config.llm.decision_timeout_ms
     assert hasattr(config.llm, "training_model") and hasattr(config.llm, "training_timeout_ms")
+    # 联网那一路出厂**关着**（空串＝不联网）：它要另一只带检索的模型，不是每台机器都有，
+    # 所以只能由用户显式填（填的是宿主 model_config.toml 里的模型名）
+    assert config.llm.search_model == "", config.llm.search_model
     # 决策层的两项已经搬走：模型里不该再有旧键（否则就有两份真相）
     assert "brain_model" not in module.DuelConfig.model_fields
     assert "brain_timeout_ms" not in module.DuelConfig.model_fields
@@ -2257,12 +2261,14 @@ async def test_config_save_keeps_a_running_training_task() -> None:
             stopped: List[str] = []
             runner.stop_now = lambda: stopped.append("stop")  # type: ignore[method-assign]
 
-            # 1) 只改模型：不重建、不打断
+            # 1) 只改模型：不重建、不打断（联网那只也一样走这条路推过去）
             instance.config.llm.training_model = "另一只"
+            instance.config.llm.search_model = "联网搜索"
             await instance.on_config_update("self", {}, "1.2.0")
             assert not stopped, "改模型不该把在跑的任务掐掉"
             assert instance.training_runner() is runner, "不该重建执行器"
             assert runner._model_name() == "另一只", "模型名要推过去"
+            assert runner._search_model == "联网搜索", "联网模型名也要热更新推过去"
 
             # 2) 改工作目录：必须重建（换了目录还往旧目录写结果才是灾难）
             instance.config.training.workspace = str(root / "another")

@@ -158,7 +158,8 @@ def test_config_model_builds_and_matches_toml() -> None:
     # 1.5.0 起 `llm.decision_timeout_ms` 默认 4000（决策层推荐用 2 秒档的关思考模型）。
     # 同日起 1.4.0：`llm.decision_model` 默认改成空串（跟宿主的 utils 任务走）——
     # 出厂默认写一个厂商模型名，在别的机器上一上来就会"未找到名为 xxx 的模型"。
-    assert defaults.plugin.config_version == "1.5.0"
+    # 1.6.0 起 `[llm]` 多一个 search_model（写脚本前联网查资料用；默认留空＝不联网）。
+    assert defaults.plugin.config_version == "1.6.0"
 
     with (_PLUGIN_ROOT / "config.toml.example").open("rb") as handle:
         toml_data = tomllib.load(handle)

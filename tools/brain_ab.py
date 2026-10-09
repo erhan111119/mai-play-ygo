@@ -374,7 +374,8 @@ async def run(args: argparse.Namespace) -> int:
     db = CardDatabase(paths / "ygopro" / "cards.cdb")
     tmp_root = Path(tempfile.mkdtemp(prefix="brain_ab_deck_"))
     if args.deck_file:
-        deck_path = Path(args.deck_file)
+        # 同上：`DeckFile=` 按 WindBot 的工作目录解析，相对路径会让 Deck 加载不出来
+        deck_path = Path(args.deck_file).resolve()
     else:
         deck_path = _write_deck(tmp_root / "mirror.ydk", veiler=args.veiler, imperm=args.imperm)
     print(f"被测 exe：{windbot_exe}")

@@ -687,6 +687,7 @@ def test_script_generator_writes_compiles_and_reports_attempts() -> None:
             combo_guide="先通召 100，再做 500。",
             extra_prompt="先手优先做阻抗",
             feedback="上一轮太爱盖牌",
+            research_notes="网上说：先手优先做 500，100 要留到后手。",
         )
         result = asyncio.run(generator.generate(request))
 
@@ -706,6 +707,10 @@ def test_script_generator_writes_compiles_and_reports_attempts() -> None:
         prompt = prompts[0]
         for needle in ("抽 1 张", "Card100Handler", "先通召 100", "先手优先做阻抗", "上一轮太爱盖牌"):
             assert needle in prompt, f"提示词里缺少 {needle}"
+        # 联网资料要进提示词，而且**必须带上"卡文优先"的口径**：网上的说法可能是别的构筑、
+        # 也可能过时，模型不能拿它覆盖卡文
+        assert "网上说：先手优先做 500" in prompt, "联网资料没进提示词"
+        assert "网上查到的打法资料" in prompt and "卡文与上面的卡表是唯一依据" in prompt
         # 两个真机上栽过的 API 名要写在速查表里（模型最容易自己编名字的两处）：
         # 墓区是 CardLocation.Grave（不是 Graveyard）、"这次问的是哪种动作"是 Type（不是 ExecutorType）
         for needle in ("CardLocation.Grave", "CardLocation.Graveyard", "Type == ExecutorType"):

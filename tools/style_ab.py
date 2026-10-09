@@ -309,13 +309,18 @@ async def _run_one(
 
 
 async def run(args: argparse.Namespace) -> int:
-    deck_file = Path(args.deck_file)
+    # ⚠ 卡表路径**必须解析成绝对路径**再交给 WindBot：`DeckFile=` 是按 **WindBot 的工作目录**
+    # （`clients/windbot`）解析的，而命令行里写的通常是"相对 MaiBot 根目录"的路径。
+    # 传相对路径的后果不是"报错说找不到卡表"，而是 Deck 根本没加载 → 两个 bot 一收到 JoinGame
+    # 就 `System.NullReferenceException`（GameBehavior.OnJoinGame 里读 `Deck.Cards`），
+    # 每一局空转到 max-duel-seconds 才收摊——2026-10-09 就是这样白跑了 7 局 × 2 分钟。
+    deck_file = Path(args.deck_file).resolve()
     if not deck_file.is_file():
         print(f"卡表不在：{deck_file}")
         return 2
     # 第二副牌（可选）：给了就是"两副牌互打"（各自用自己的脚本），
     # 不给就是老口径"同一副牌换脚本"，两边行为完全兼容
-    deck_file_b = Path(args.deck_file_b) if args.deck_file_b else deck_file
+    deck_file_b = Path(args.deck_file_b).resolve() if args.deck_file_b else deck_file
     if not deck_file_b.is_file():
         print(f"B 侧卡表不在：{deck_file_b}")
         return 2

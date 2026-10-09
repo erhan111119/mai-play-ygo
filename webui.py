@@ -718,6 +718,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 "enabled": bool(plugin.config.training.enabled),
                 "workspace": str(panel.training_workspace()),
                 "model": str(plugin.config.llm.training_model or "").strip() or "（宿主给插件配的那只）",
+                "search_model": str(plugin.config.llm.search_model or "").strip() or "（关：写脚本不联网）",
                 "max_duels_per_run": int(plugin.config.training.max_duels_per_run),
                 "counts": _safe_counts(panel),
             },
@@ -749,6 +750,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
             "enabled": bool(plugin.config.training.enabled),
             "workspace": str(panel.training_workspace()),
             "model": str(plugin.config.llm.training_model or "").strip() or "（宿主给插件配的那只）",
+            "search_model": str(plugin.config.llm.search_model or "").strip() or "（关：写脚本不联网）",
             "max_duels_per_run": int(plugin.config.training.max_duels_per_run),
             "bridge_ready": runner is not None,
             "kinds": kinds,
@@ -2048,6 +2050,7 @@ async function loadOverview(){
       <dt>状态</dt><dd>${d.training.enabled ? '<span class="chip ok">已启用</span>' : '<span class="chip dim">已关闭</span>'}</dd>
       <dt>记录</dt><dd style="display:flex;gap:6px;flex-wrap:wrap">${trainRows}</dd>
       <dt>训练模型</dt><dd><span class="chip brand">${esc(d.training.model)}</span></dd>
+      <dt>联网资料</dt><dd><span class="chip ${d.training.search_model.startsWith("（关") ? "dim" : "brand"}">${esc(d.training.search_model)}</span></dd>
       <dt>单次擂台</dt><dd>最多 ${esc(d.training.max_duels_per_run)} 局</dd>
       <dt>工作目录</dt><dd class="mono faint">${esc(d.training.workspace)}</dd>
     </dl>`;
@@ -2375,6 +2378,12 @@ function runExchange(run){
   const replyHtml = reply.length > 400
     ? `<details class="long"><summary>展开详情（${esc(reply.length)} 字）</summary><div class="txt">${reply}</div></details>`
     : `<div class="txt">${reply}</div>`;
+  // 写脚本时"联网那一路"到底有没有成：没配就不显示，配了但失败必须写出来
+  const researchNote = summary.research_model
+    ? `<div class="faint" style="font-size:12px">联网资料：${esc(summary.research_model)}${
+        summary.research_chars ? ` 取到 ${esc(summary.research_chars)} 字` : " 没取到"
+      }${summary.research_error ? `（${esc(summary.research_error)}）` : ""}</div>`
+    : "";
   return `<div class="msg">
       <div class="bubble me">${ask}${params.extra_prompt ? longText(params.extra_prompt) : ""}
         <div class="at">${esc(run.started_at || "")}${run.duration_seconds==null?"":"　"+esc(run.duration_seconds)+"s"}</div></div>
@@ -2382,7 +2391,7 @@ function runExchange(run){
         <div class="rh">${KIND_MARK(run.status)}<b>${esc(run.title)}</b>${statusChip(run.status)}
           <span style="flex:1"></span>
           <a href="#" onclick="showRun('${esc(run.run_id)}');return false;">详情</a></div>
-        ${replyHtml}</div>
+        ${replyHtml}${researchNote}</div>
     </div>`;
 }
 function activeExchange(run){

@@ -164,7 +164,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件")
-    config_version: str = Field(default="1.5.0", description="配置版本")
+    config_version: str = Field(default="1.6.0", description="配置版本")
     # 版本号提升是有意的：1.2.0 起新增 `[llm]`（三个用途的模型与超时）、`[training]`（训练功能）、
     # `[webui]`（插件自带面板）三节，并把 `duel.brain_model` / `duel.brain_timeout_ms`
     # 移成 `llm.decision_model` / `llm.decision_timeout_ms`（老键会被静默忽略）。
@@ -174,6 +174,7 @@ class PluginSectionConfig(PluginConfigBase):
     # `deepseek-flash`）单次约 2 秒，2500（Python 侧 2100）会让它卡在边缘；快模型不受影响（那只是个上限）。
     # 1.4.0 起 `llm.decision_model` 的默认值从 `deepseek-chat` 改成空串（跟宿主的 utils 任务走）：
     # 把一个厂商模型名当出厂默认，在别的机器上那个名字不存在，决策层一上来就必然失败。
+    # 1.6.0 起 `[llm]` 再多一个 `search_model`（写脚本前联网查资料用，留空＝不联网）。
 
 
 class PathsConfig(PluginConfigBase):
@@ -393,6 +394,17 @@ class LlmConfig(PluginConfigBase):
             "【训练功能】用哪只模型。训练要它读卡文推 combo、复盘录像、写结论——"
             "**建议用一只聪明点的**（和上面「决策」那只相反，那只要求快而不要求聪明）。"
             "留空＝跟宿主的 utils 任务走"
+        ),
+    )
+    search_model: str = Field(
+        default="",
+        description=(
+            "【写脚本·联网资料】用哪只**能联网检索**的模型（宿主 `config/model_config.toml` 里的"
+            "**模型名称**，不是模型标识符）。写脚本/迭代时先用它查一遍「这套牌现实里怎么打」，"
+            "把资料喂给 `training_model` 那只写手（资料存在 `train/research/`，卡文仍是唯一依据）。"
+            "本机可填 `联网搜索`（DMX 的 qwen3-max-search，实测单次 7~12 秒）；"
+            "⚠ DeepSeek 官方 API **没有**联网版（deepseek-chat / deepseek-flash 都是纯生成），"
+            "所以这里必须另挂一只带检索的模型。留空＝不联网，脚本照旧只按卡文与 combo 推演写"
         ),
     )
     training_timeout_ms: int = Field(
@@ -1049,8 +1061,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         if current is not None and self.config.training.enabled:
             if current.workspace == workspace and current.max_duels == max_duels:
                 current.set_training_model(self.config.llm.training_model)
-                # 写脚本的额度也是"改了就生效"的一项：它不改变任务的身份，没必要重建执行器
+                # 写脚本的额度与联网那一路也是"改了就生效"的一项：它们不改变任务的身份，
+                # 没必要重建执行器
                 current.set_script_max_tokens(self.config.llm.training_script_max_tokens)
+                current.set_search_model(self.config.llm.search_model)
                 if self._logger is not None:
                     self._logger.debug("训练功能的配置没动到执行器，保留正在跑的任务")
                 return
@@ -1082,11 +1096,13 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         )
         self._train_runner.set_training_model(self.config.llm.training_model)
         self._train_runner.set_script_max_tokens(self.config.llm.training_script_max_tokens)
+        self._train_runner.set_search_model(self.config.llm.search_model)
         self._logger.info(
-            "训练功能已就绪：工作目录 %s｜训练模型 %s｜写脚本额度 %s token/批｜单次擂台上限 %s 局",
+            "训练功能已就绪：工作目录 %s｜训练模型 %s｜写脚本额度 %s token/批｜联网资料 %s｜单次擂台上限 %s 局",
             workspace,
             self.config.llm.training_model.strip() or "（跟宿主 utils 任务）",
             self.config.llm.training_script_max_tokens,
+            self.config.llm.search_model.strip() or "（关：写脚本不联网）",
             self.config.training.max_duels_per_run,
         )
 

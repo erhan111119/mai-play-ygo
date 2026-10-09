@@ -2,6 +2,34 @@
 
 > 本文件从「麦麦玩游戏王」1.0.0 起版（合并前的「游戏王对局管家」历史已不随仓库保留）。
 
+## 1.1.5
+
+### 写脚本能联网查资料了（用户口径：给写脚本加一只联网模型）
+
+- **先说清楚一件事**：DeepSeek 官方 API **没有联网版**——`deepseek-chat` / `deepseek-flash` /
+  `deepseek-reasoner` 都是纯生成，"联网搜索"只存在于 DeepSeek App 里。所以"加装一只联网的
+  deepseek-flash"这条路本身不通；能做的是**另挂一只带检索的模型当资料员**：宿主
+  `model_config.toml` 新登记 `name = "联网搜索"`（DMX1 的 `qwen3-max-search`，实测单次 7~12 秒、
+  零思考 token）。⚠ DMX 目录里的 `Tencent-Search` / `jina-deepsearch-v1` / `perplexity-*`
+  **不是 chat 模型**（对 `/chat/completions` 直接 404），别拿它们填 `model_identifier`。
+- 新增配置项 `llm.search_model`（配置版本 → **1.6.0**，默认留空＝不联网）。写脚本 / 卡组迭代会
+  先用这只模型查一遍"这套牌现实里怎么打、哪些卡要留着、常见失误"，资料存进 `train/research/`
+  再喂给写手模型（`training_model`）。提示词里写明**卡文与卡表是唯一依据**、网上资料只作参考
+  ——两台联网模型对同一个问题的卡表明细已经对不上过一次，不能让它覆盖卡文。
+- 联网那一路**失败不拖垮写脚本**：搜索 provider 超时/欠费时照旧按卡文与 combo 推演写，
+  但失败原因会写进任务记录与面板（「联网资料：X 没取到（原因）」），不静默咽掉。
+- 面板：总览的训练卡片多一行「联网资料」（配了显示模型名，没配显示"（关：写脚本不联网）"）；
+  写脚本任务的回复下面标出这一次取到多少字。
+
+### 修复
+
+- `tools/style_ab.py` / `tools/brain_ab.py` 的 `--deck-file` 现在**解析成绝对路径**再交给 WindBot。
+  原来传相对路径不会报错：`DeckFile=` 是按 WindBot 的工作目录（`clients/windbot`）解析的，
+  卡表加载不出来 → 两个 bot 一收到 JoinGame 就 `System.NullReferenceException`
+  （`GameBehavior.OnJoinGame` 里读 `Deck.Cards`），每一局都空转满 `--max-duel-seconds` 才收摊
+  ——今天就这样白跑了 7 局 × 2 分钟，胜负全是 draw、回合 0。现在按 MaiBot 根目录写
+  `plugins/mai-play-ygo/clients/...` 也能正常跑（改完实测正常收官）。
+
 ## 1.1.4
 
 ### 决策层与训练功能改用关思考的 `deepseek-flash`（用户口径：不用 deepseek-chat 了）

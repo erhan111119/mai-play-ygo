@@ -32,6 +32,7 @@ from .analysis import (
     build_deck_digest,
     deck_card_ids,
     derive_combo,
+    research_archetype,
     summarise_run,
     tail_lines,
 )
@@ -144,8 +145,9 @@ class TrainingRunner:
 
         self.log_dir = self.workspace / "logs"
         self.combo_dir = self.workspace / "combos"
+        self.research_dir = self.workspace / "research"
         self.export_dir = self.workspace / "decks"
-        for directory in (self.workspace, self.log_dir, self.combo_dir, self.export_dir):
+        for directory in (self.workspace, self.log_dir, self.combo_dir, self.research_dir, self.export_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
         self._task: Optional["asyncio.Task[None]"] = None
@@ -154,8 +156,14 @@ class TrainingRunner:
         self._stopping = False
         #: 训练用哪只模型（空串＝宿主给插件配的那只）；由插件在起 runner 与配置热更新时推过来。
         self._training_model = ""
+        #: 联网查资料用的模型（空串＝不联网）。它跟写作模型是**两只**：写作要快而稳，
+        #: 联网那只只负责"去网上把打法捞回来"，一次写脚本只调一次。
+        self._search_model = ""
         #: 写脚本时每次模型调用的输出上限；同样由插件按配置推过来（见 `set_script_max_tokens`）。
         self._script_max_tokens = DEFAULT_SCRIPT_MAX_TOKENS
+        #: 最近一次联网查资料失败的原因（空串＝没失败过）。它只用于在面板/日志上**如实说明**
+        #: "这一轮没联网"，不是错误状态机——下次调用会覆盖它。
+        self._research_error = ""
 
     # ---- 状态 ----
 
@@ -600,11 +608,15 @@ class TrainingRunner:
         combo_guide: str = "",
         previous_code: str = "",
         attempts: int = DEFAULT_SCRIPT_ATTEMPTS,
+        research_notes: str = "",
     ) -> Any:
         """跑一次「写脚本」：读卡表 + 卡文 → 模型写 C# → 编译（失败自动重写几轮）。
 
         `previous_code` 是上一版的源码：迭代时把它传进来才是"改"而不是"从零重写"。
         不传的话，生成器自己会去找这副牌已有的脚本当基座（"再写一次"＝改进）。
+
+        `research_notes` 是联网查到的资料（`llm.search_model` 出的那一份，见
+        :meth:`_derive_research_for`）：写进提示词当参考，卡文仍是唯一依据。
         """
 
         source_dir, windbot_dir = self._require_windbot_tree()
@@ -631,6 +643,7 @@ class TrainingRunner:
             deck_name=str(params["deck_name"]),
             cards=cards,
             combo_guide=combo_guide,
+            research_notes=research_notes,
             extra_prompt=str(params.get("extra_prompt") or ""),
             feedback=feedback,
             previous_code=previous_code,
@@ -647,16 +660,20 @@ class TrainingRunner:
         return await self._generate(prompt, str(self._model_name()), int(self._script_max_tokens))
 
     async def _run_write_script(self, run: TrainingRun, params: Dict[str, Any]) -> None:
-        """写脚本：**先推一遍 combo**，再让模型照它写 C# → 编译 → 把脚本名写回卡组池。
+        """写脚本：**先推一遍 combo、联网查一遍资料**，再让模型照它们写 C# → 编译 → 写回卡组池。
 
         推演放在这一步里面（而不是让用户先跑一次"推演 combo"）：用户口径是"一件事一句话"，
         而推演只是写脚本的中间材料——它自己会存档，想看得去 `train/combos/`，
-        不必先在面板上跑一次。
+        不必先在面板上跑一次。联网资料同理，存在 `train/research/`。
         """
 
         guide = await self._derive_combo_for(params)
+        research = await self._derive_research_for(params)
         script = await self._generate_script(
-            params, combo_guide=guide, attempts=int(params.get("rounds") or DEFAULT_SCRIPT_ATTEMPTS)
+            params,
+            combo_guide=guide,
+            attempts=int(params.get("rounds") or DEFAULT_SCRIPT_ATTEMPTS),
+            research_notes=research,
         )
         if self._record_script is not None:
             # 不写回池子的话，刚写好的脚本不会被对局用上——那就白写了
@@ -676,16 +693,27 @@ class TrainingRunner:
             "exe": str(exe),
             "exe_mtime": exe.stat().st_mtime if exe.is_file() else 0,
             "combo_used": bool(guide),
+            # 联网那一路的结果要**如实**记下来：没配就是没配、失败就说失败，
+            # 不然面板上看不出"这一版脚本到底查没查过资料"
+            "research_model": str(getattr(self, "_search_model", "") or ""),
+            "research_chars": len(research),
+            "research_error": str(getattr(self, "_research_error", "") or ""),
         }
         self.store.finish(run.run_id, STATUS_DONE, summary=summary)
         if self.logger is not None:
+            research_note = (
+                f"联网资料 {summary['research_chars']} 字"
+                if summary["research_chars"]
+                else (f"联网资料没取到（{summary['research_error']}）" if summary["research_error"] else "没联网")
+            )
             self.logger.info(
-                "已为「%s」写好出牌脚本 %s：%s 行、%s 个处理函数（第 %s 轮编译通过）：%s",
+                "已为「%s」写好出牌脚本 %s：%s 行、%s 个处理函数（第 %s 轮编译通过，%s）：%s",
                 params["deck_name"],
                 script.style_name,
                 summary["lines"],
                 summary["handlers"],
                 script.attempts,
+                research_note,
                 script.file_path,
             )
 
@@ -708,6 +736,41 @@ class TrainingRunner:
         if self.logger is not None:
             self.logger.info("combo 推演已存档：%s", path)
         return result.text()
+
+    async def _derive_research_for(self, params: Dict[str, Any]) -> str:
+        """联网查一遍这副牌怎么打，存档并返回正文（没配联网模型就返回空串）。
+
+        **失败不抛**：联网资料是"锦上添花"——搜索 provider 挂了、欠费了都不该把整次写脚本拖没。
+        但也**不许悄悄失败**：失败原因会原样回到调用方记进 summary/日志，面板上看得见。
+        """
+
+        model = str(getattr(self, "_search_model", "") or "")
+        if not model:
+            if self.logger is not None:
+                self.logger.info("没配联网资料模型（llm.search_model），这一轮脚本只按卡文与 combo 推演写")
+            return ""
+        try:
+            result = await research_archetype(
+                self._generate,
+                deck_name=str(params["deck_name"]),
+                digest=self._deck_digest(params),
+                model=model,
+                extra_prompt=str(params.get("extra_prompt") or ""),
+                logger=self.logger,
+            )
+        except Exception as exc:  # noqa: BLE001  联网那一路的问题只记不抛，理由见上
+            self._research_error = f"{exc}"
+            if self.logger is not None:
+                self.logger.warning("联网查资料失败（这一轮不联网继续写）：%s", exc)
+            return ""
+        self._research_error = ""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        deck_id = int(params.get("deck_id") or 0)
+        path = self.research_dir / f"{stamp}-{deck_id}-{_safe_stem(str(params['deck_name']))}.txt"
+        path.write_text(result.text, encoding="utf-8")
+        if self.logger is not None:
+            self.logger.info("联网资料已存档：%s", path)
+        return result.text
 
     def _load_latest_combo(self, deck_id: int, deck_name: str) -> str:
         """取这副牌最近一份 combo 推演（没有就空串：脚本退化成"只按卡文写"）。"""
@@ -765,6 +828,17 @@ class TrainingRunner:
             f"开始迭代：{params['deck_name']}，{rounds} 轮 × {duels} 局/轮，"
             f"对手「{opponent_name}」（脚本 {baseline}）"
         )
+        # 联网资料**整次迭代只查一遍**：它描述的是"这套牌现实里怎么打"，跟"这一轮输在哪"
+        # 无关（后者由 feedback 承担），每轮重查只是白等一次搜索。
+        if str(getattr(self, "_search_model", "") or ""):
+            note("先联网查一遍这套牌的打法…")
+        else:
+            note("没配联网模型（llm.search_model），跳过联网查资料")
+        research = await self._derive_research_for(params)
+        if research:
+            note(f"联网资料 {len(research)} 字，已存档到 train/research/")
+        elif getattr(self, "_research_error", ""):
+            note(f"联网查资料失败，这次迭代不联网继续：{self._research_error}")
         for index in range(1, rounds + 1):
             if self._stopping:
                 break
@@ -789,7 +863,11 @@ class TrainingRunner:
             note(f"第 {index} 轮：combo 完成（{round_info['combo_lines']} 条主线），开始写脚本…")
 
             script = await self._generate_script(
-                params, feedback=feedback, combo_guide=guide_text, previous_code=last_code
+                params,
+                feedback=feedback,
+                combo_guide=guide_text,
+                previous_code=last_code,
+                research_notes=research,
             )
             last_code = str(script.code)
             round_info["style_name"] = script.style_name
@@ -1135,6 +1213,11 @@ class TrainingRunner:
         """配置热更新后由插件把新模型名推给 runner。"""
 
         self._training_model = str(model or "")
+
+    def set_search_model(self, model: str) -> None:
+        """配置热更新后由插件把"联网查资料用哪只模型"推给 runner（空串＝不联网）。"""
+
+        self._search_model = str(model or "")
 
     def set_script_max_tokens(self, value: Any) -> None:
         """配置热更新后由插件把"写脚本每次调用的输出上限"推给 runner。

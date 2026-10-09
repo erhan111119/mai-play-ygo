@@ -213,6 +213,13 @@ class DeckScriptRequest:
     combo_guide: str = ""
     """上游的 combo 推演（`train/combos/*.txt`）。有它，脚本里的展开顺序才不是模型瞎猜的。"""
 
+    research_notes: str = ""
+    """联网查到的资料（`train/research/*.txt`，靠 `llm.search_model` 那只联网模型取）。
+
+    它是**参考**不是依据：网上写的可能是别的构筑、也可能是旧的规制，所以提示词里把它标成
+    "与卡文冲突时以卡文为准"。留空＝没配联网模型，脚本只在卡文 + combo 推演上写。
+    """
+
     extra_prompt: str = ""
     """作者额外要求（面板上填的那一栏）：想强调什么打法、禁掉什么行为都写在这。"""
 
@@ -842,6 +849,16 @@ class DeckScriptGenerator:
                 "",
                 "这副牌的 combo 推演（**优先按这个顺序实现**，它是按卡文推出来的）：",
                 request.combo_guide.strip()[:4000],
+            ]
+        if request.research_notes.strip():
+            # 联网资料放在 combo 后面：它是"网上的人怎么打"，可能过时或属于别的构筑，
+            # 所以先写清楚它是参考、卡文优先，免得模型拿网上的说法覆盖卡文
+            lines += [
+                "",
+                "网上查到的打法资料（**参考用**，来源是公开网页，可能有错或过时）：",
+                "读它的目的是知道「这套牌现实里怎么打、哪些卡要留」，但**卡文与上面的卡表是唯一依据**——"
+                "资料里与卡文冲突的地方一律按卡文写；资料里提到的卡如果不在卡表里，忽略它。",
+                request.research_notes.strip()[:3500],
             ]
         if request.extra_prompt.strip():
             lines += ["", "作者的额外要求（必须遵守）：", request.extra_prompt.strip()[:2000]]
