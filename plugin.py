@@ -163,12 +163,14 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件")
-    config_version: str = Field(default="1.3.0", description="配置版本")
+    config_version: str = Field(default="1.4.0", description="配置版本")
     # 版本号提升是有意的：1.2.0 起新增 `[llm]`（三个用途的模型与超时）、`[training]`（训练功能）、
     # `[webui]`（插件自带面板）三节，并把 `duel.brain_model` / `duel.brain_timeout_ms`
     # 移成 `llm.decision_model` / `llm.decision_timeout_ms`（老键会被静默忽略）。
     # 1.3.0 起 `[llm]` 多一个 `training_script_max_tokens`（写脚本每批的输出上限），
     # 老配置没有这个键时按默认值 4096 走。
+    # 1.4.0 起 `llm.decision_model` 的默认值从 `deepseek-chat` 改成空串（跟宿主的 utils 任务走）：
+    # 把一个厂商模型名当出厂默认，在别的机器上那个名字不存在，决策层一上来就必然失败。
 
 
 class PathsConfig(PluginConfigBase):
@@ -311,15 +313,19 @@ class WikiConfig(PluginConfigBase):
 
 
 class LlmConfig(PluginConfigBase):
-    """模型配置：这一节**只写模型名**（填宿主 `model_config.toml` 里那只模型的名字）。
+    """模型配置：这一节**只写模型名**——填宿主 `config/model_config.toml` 里那个模型的 `name`
+    （`[[models]]` 里可以随意命名的那个字段），**不是 `model_identifier`**：
+    后者是发给供应商的标识符；两者常常不一样（`name` 是你自己起的名字，identifier 是发给供应商的那个串）。
+    写错会在调用时被宿主拒掉（`未找到名为 'xxx' 的模型`），插件把原因原样记进日志与训练记录。
 
     三个用途各管一件事，互不借用：
 
     * **总结**——打完一局把机读复述写成一段人话（`duel.summarize_with_ai` 打开时才用）；
     * **决策**——阻抗决策层在对手回合里问「这张无效卡该指哪只怪」；
-    * **训练**——训练功能里的 combo 推演、录像复盘、写结论。
+    * **训练**——训练功能里的 combo 推演、写脚本、复盘与写结论。
 
-    模型名一律留空＝用宿主给插件配的那只（`model_config.toml` 里的 `plugin` 任务）。
+    模型名一律留空＝跟宿主的默认插件任务走：宿主把插件的默认任务定为 `utils`，
+    也就是 `[model_task_config.utils]` 那一组模型（不是"专门给插件配的一只"）。
     超时时间由插件自己执行（宿主那侧没有超时参数），超时只影响这一次调用，不影响对局本身。
     """
 
@@ -330,7 +336,7 @@ class LlmConfig(PluginConfigBase):
     summary_model: str = Field(
         default="",
         description=(
-            "【对局总结】用哪只模型。留空＝用宿主给插件配的那只。"
+            "【对局总结】用哪只模型。留空＝跟宿主的 utils 任务走。"
             "这活儿是「把字段列表写成一段人话」，对智力要求低——胜负那一行由插件自己写在"
             "播报最前面，模型只负责润色，所以哪只都行"
         ),
@@ -344,9 +350,9 @@ class LlmConfig(PluginConfigBase):
         ),
     )
     decision_model: str = Field(
-        default="deepseek-chat",
+        default="",
         description=(
-            "【AI 决策】用哪只模型。**推荐小体量、不思考的那种**（默认 deepseek-chat）。"
+            "【AI 决策】用哪只模型。**推荐小体量、不思考的那种**（本机实测 `deepseek-chat` 关掉思考后 0.58~0.93 秒）。"
             "实测对手回合的等待预算一共只有 15 秒，一次会思考的答复要 13 秒；"
             "而 `deepseek-chat` 关掉思考后是 0.58~0.93 秒、零思考 token、答复就是干净的序号。"
             "⚠ 换模型要同时看两件事：模型名，以及 `model_config.toml` 里那条"
@@ -380,7 +386,7 @@ class LlmConfig(PluginConfigBase):
         description=(
             "【训练功能】用哪只模型。训练要它读卡文推 combo、复盘录像、写结论——"
             "**建议用一只聪明点的**（和上面「决策」那只相反，那只要求快而不要求聪明）。"
-            "留空＝用宿主给插件配的那只"
+            "留空＝跟宿主的 utils 任务走"
         ),
     )
     training_timeout_ms: int = Field(
@@ -1073,7 +1079,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         self._logger.info(
             "训练功能已就绪：工作目录 %s｜训练模型 %s｜写脚本额度 %s token/批｜单次擂台上限 %s 局",
             workspace,
-            self.config.llm.training_model.strip() or "（宿主给插件配的那只）",
+            self.config.llm.training_model.strip() or "（跟宿主 utils 任务）",
             self.config.llm.training_script_max_tokens,
             self.config.training.max_duels_per_run,
         )
@@ -2803,7 +2809,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 prefix,
                 "开" if wants_target else "关",
                 "开" if wants_gate else "关",
-                self.config.llm.decision_model.strip() or "（宿主给插件配的那只）",
+                self.config.llm.decision_model.strip() or "（跟宿主 utils 任务）",
                 bridge.style,
                 timeout,
             )

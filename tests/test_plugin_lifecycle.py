@@ -2065,7 +2065,9 @@ def test_llm_section_owns_the_models_and_the_decision_layer_reads_it() -> None:
     config = module.MaiPlayYgoConfig()
     # 三处用途各有自己的模型与超时
     assert hasattr(config.llm, "summary_model") and hasattr(config.llm, "summary_timeout_ms")
-    assert config.llm.decision_model == "deepseek-chat", config.llm.decision_model
+    # 决策模型的出厂默认是**空串**（跟宿主的 utils 任务走）：写一个厂商模型名当默认，
+    # 在别的机器上那个名字不存在，决策层一上来就必然失败（配置版本 1.4.0 改的）
+    assert config.llm.decision_model == "", config.llm.decision_model
     assert config.llm.decision_timeout_ms == 2500, config.llm.decision_timeout_ms
     assert hasattr(config.llm, "training_model") and hasattr(config.llm, "training_timeout_ms")
     # 决策层的两项已经搬走：模型里不该再有旧键（否则就有两份真相）
@@ -2086,7 +2088,7 @@ def test_llm_section_owns_the_models_and_the_decision_layer_reads_it() -> None:
             },
         )
         assert instance.config.duel.brain_enabled is True
-        assert instance.config.llm.decision_model == "deepseek-chat", "老键不该盖住新节的默认值"
+        assert instance.config.llm.decision_model == "", "老键不该盖住新节的默认值（默认留空＝跟 utils 走）"
 
 
 async def test_llm_section_reaches_summary_and_decision_calls() -> None:
