@@ -1833,7 +1833,7 @@ pre.log .lv-debug { color:#6f7d95; } pre.log .lv-info { color:#9fe8c8; }
 /* ---- 训练台：对话流 + 吸底输入区（"游戏王专用的小 dsh"）---- */
 .console { display:flex; flex-direction:column; gap:12px; }
 .stream { display:flex; flex-direction:column; gap:14px; padding:16px 18px; overflow:auto;
-  max-height:calc(100vh - 330px); min-height:220px; border-radius:var(--r-lg);
+  max-height:calc(100vh - 370px); min-height:200px; border-radius:var(--r-lg);
   border:1px solid var(--line); background:linear-gradient(180deg, var(--panel), var(--panel-2)); }
 .msg { display:flex; flex-direction:column; gap:8px; }
 .bubble { border-radius:14px; padding:10px 13px; font-size:13px; max-width:min(860px, 92%);
@@ -1863,13 +1863,18 @@ pre.log .lv-debug { color:#6f7d95; } pre.log .lv-info { color:#9fe8c8; }
 .bubble details.long > summary { cursor:pointer; color:var(--brand-2); font-size:12px; }
 .bubble details.long .txt { margin-top:6px; color:var(--muted); }
 .composer .crow2 { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
-.composer .crow2 > .field { flex:0 0 auto; min-width:170px; }
-.composer .crow2 select { min-width:190px; }
+.composer .crow2 > .field, .composer .extra-inline > .field { flex:0 0 auto; min-width:170px; }
+/* 下拉别被最长的卡组名撑宽：撑宽就换行，把「对手卡组」挤到第二行、落到视口外
+   （实测被撑到 427px → 四五个字段排不下；用户看到的就是「对手卡组没有显示」）。 */
+.composer .crow2 select, .composer .extra-inline select { min-width:190px; max-width:260px; }
 .composer .crow2 .btn { padding:9px 18px; }
 .composer .cinput { margin-top:10px; }
 .composer .cinput textarea { resize:vertical; }
-.composer .extra { margin-top:10px; }
-.composer .extra:empty { display:none; }
+/* 随种类出现的字段（对手卡组 / 局数 / 轮数…）：**并排在同一行**，跟在「要写的东西」后面。
+   ⚠ 原来它在 textarea 下面单独一行，真机上正好被挤到视口最底边（top=999px / 视口 1000px）——
+   用户看到的就是"对手卡组没有显示"（其实渲染了 97 项，只是看不见）。 */
+.composer .extra-inline { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+.composer .extra-inline:empty { display:none; }
 .composer .faint { margin-top:8px; line-height:1.7; }
 
 /* ---- 登录 ---- */
@@ -2422,7 +2427,8 @@ function renderExtraFields(active){
   if (kind === "review") {
     html += `<label class="field"><span>复盘最近几局</span><input id="c-latest" type="number" value="3" min="1" max="20"></label>`;
   }
-  box.innerHTML = html ? `<div class="crow2">${html}</div>` : "";
+  // 直接放进那一行（外层 .crow2 已经是 flex，这里再套一层会让宽度规则失效）
+  box.innerHTML = html;
 }
 async function loadDeckWorks(){
   const deckId = $("c-deck").value;
@@ -2703,13 +2709,13 @@ def _app_page() -> str:
             <div class="crow2">
               <label class="field"><span>卡组</span><select id="c-deck"></select></label>
               <label class="field"><span>要写的东西</span><select id="c-kind" onchange="onKindChange()"></select></label>
+              <div class="extra-inline" id="c-extra"></div>
               <button class="btn primary" id="btn-send" onclick="sendTask()">开始</button>
             </div>
             <div class="cinput">
               <textarea id="c-text" rows="2"
                 placeholder="想强调的打法、额外的要求（可以不填）。例如：先手优先做鲜花女男爵；别去踩对面的神宣"></textarea>
             </div>
-            <div class="extra" id="c-extra"></div>
             <div class="faint" id="c-hint" style="font-size:11.5px"></div>
           </div>
         </div>

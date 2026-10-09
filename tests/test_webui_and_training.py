@@ -1183,6 +1183,21 @@ def test_panel_has_no_external_asset_references() -> None:
     assert "<svg" in webui._app_page(), "图标应该是内联 svg"
 
 
+def test_training_composer_keeps_the_kind_fields_on_screen() -> None:
+    """随种类出现的字段（对手卡组 / 局数 / 轮数）要在**同一行**里，不能排在文本框之后。
+
+    回归测试：它原来排在 textarea 后面，真机上整块被挤出视口（量下来 top=999px、视口 1000px）——
+    用户看到的就是"对手卡组没有显示"（其实渲染了 97 项，只是看不见）。
+    另外下拉不能被最长的卡组名撑宽：一撑宽这一行就换行，"对手卡组"又掉到第二行去。
+    """
+
+    webui = _load("webui")
+    page = webui._app_page()
+    assert '<div class="extra-inline" id="c-extra"></div>' in page, "字段要放进「卡组 / 要写的东西」那一行"
+    assert page.index('id="c-extra"') < page.index('id="c-text"'), "字段必须在额外要求文本框之前"
+    assert "max-width:260px" in page, "下拉要限宽，否则被长卡组名撑宽后这一行会换行"
+
+
 def test_deck_card_opens_its_detail_from_the_whole_card() -> None:
     """卡组卡片**整张**都能点开详情，而卡上的两个控件（随机池 / AI 决策）不能顺带打开抽屉。
 
@@ -1211,6 +1226,7 @@ def main() -> int:
         test_deck_names_and_head_cards_come_from_the_card_db,
         test_panel_has_no_external_asset_references,
         test_deck_card_opens_its_detail_from_the_whole_card,
+        test_training_composer_keeps_the_kind_fields_on_screen,
         test_kill_tree_uses_taskkill_with_tree_flag,
         test_deck_digest_and_combo_check_catch_cards_outside_the_deck,
         test_combo_tolerates_non_json_reply_but_says_so,
