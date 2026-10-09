@@ -114,7 +114,7 @@ class FieldState:
     def __post_init__(self) -> None:
         """把初始生命值填进两个座位。"""
 
-        for seat, player in self.players.items():
+        for player in self.players.values():
             player.lp = self.start_lp
 
     def apply(self, event: DuelEvent) -> None:

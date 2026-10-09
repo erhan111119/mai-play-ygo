@@ -439,7 +439,7 @@ def test_numbering_is_the_number_users_see() -> None:
             by_name = {deck.display_name: number for number, deck in numbered}
             assert by_name["第一副"] == 1 and by_name["第二副"] == 2, by_name
             # 追加新卡组 → 已有编号不变（投稿只会排到末尾）
-            third = submit(pool, "333", "第三副")
+            submit(pool, "333", "第三副")
             after = {deck.display_name: number for number, deck in pool.numbered_decks()}
             assert after["第一副"] == 1 and after["第二副"] == 2 and after["第三副"] == 3, after
             # 删掉第一副 → 编号会**重新排**，而数据库编号不会：两者是两回事（用户踩的就是这个）

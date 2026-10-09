@@ -24,10 +24,9 @@ from __future__ import annotations
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
-import asyncio
 import json
 import logging
 import os
@@ -1191,13 +1190,28 @@ def _board_sides(
             except Exception:  # noqa: BLE001
                 detail_map = {}
 
-        def slot(location: int, sequence: int) -> Optional[Dict[str, Any]]:
+        def slot(
+            location: int,
+            sequence: int,
+            # ⚠ 闭包默认参数把这一轮的 seat_zones/details/detail_map **绑进来**：
+            # 它们是每轮循环重新赋值的，直接引用循环变量会被 B023 判为"绑定到会变的变量"
+            # （虽然这里当轮就调用、实际没出事，但写清楚更不容易被后人改坏）
+            seat_zones: Dict[Any, Any] = seat_zones,
+            details: Dict[int, str] = details,
+            detail_map: Dict[int, Any] = detail_map,
+        ) -> Optional[Dict[str, Any]]:
             """一格 → 面板要的信息（``None`` 表示空格）。"""
 
             card = seat_zones.get((location, sequence))
-            return _slot_json(card, names=details, details=detail_map)
+            # 怪兽区才给攻守：魔陷区/灵摆区/场地区的卡没有攻守可显示
+            return _slot_json(card, names=details, details=detail_map, monster_zone=True)
 
-        def spell_slot(sequence: int) -> Optional[Dict[str, Any]]:
+        def spell_slot(
+            sequence: int,
+            seat_zones: Dict[Any, Any] = seat_zones,
+            details: Dict[int, str] = details,
+            detail_map: Dict[int, Any] = detail_map,
+        ) -> Optional[Dict[str, Any]]:
             """魔陷区的一格。
 
             ⚠ **灵摆区就是魔陷区最左（0）与最右（4）这两格**（大师规则 4 之后不再单独占地）：
@@ -1208,7 +1222,7 @@ def _board_sides(
             card = seat_zones.get((SPELL_ZONES[0], sequence))
             if card is None and sequence in (0, 4):
                 card = seat_zones.get((SPELL_ZONES[1], 1 if sequence == 4 else 0))
-            return _slot_json(card, names=details, details=detail_map)
+            return _slot_json(card, names=details, details=detail_map, monster_zone=False)
 
         player = players.get(seat)
         stats = stats_of.get(seat)
@@ -1230,7 +1244,13 @@ def _board_sides(
                 # 魔陷区 5 格（**最左/最右就是灵摆区**）+ 场地区
                 "spells": [spell_slot(seq) for seq in range(5)],
                 "spell_pendulum": [seq in (0, 4) for seq in range(5)],
-                "field_zone": slot(SPELL_ZONES[0], 5),
+                # 场地区（内核把它报在魔陷区第 6 格）：不是怪兽，不给攻守
+                "field_zone": _slot_json(
+                    seat_zones.get((SPELL_ZONES[0], 5)),
+                    names=details,
+                    details=detail_map,
+                    monster_zone=False,
+                ),
                 "piles": {
                     "grave": int(getattr(player, "grave", 0) or 0),
                     "banished": int(getattr(player, "banished", 0) or 0),
@@ -1242,49 +1262,53 @@ def _board_sides(
     return sides
 
 
-def _slot_json(card: Any, *, names: Dict[int, str], details: Dict[int, Any]) -> Optional[Dict[str, Any]]:
+def _slot_json(
+    card: Any, *, names: Dict[int, str], details: Dict[int, Any], monster_zone: bool = False
+) -> Optional[Dict[str, Any]]:
     """场上一格 → 面板要的信息（``None`` 表示空格）。
 
     ⚠ 记录器里存的是 `ZoneCard`（带 ``card_id`` / ``position`` / 攻守），**不是卡号**：
     第一版按卡号写（`int(card)`）在对局中就炸了 `TypeError: int() argument must be ... not 'ZoneCard'`。
-    里侧的卡**不报卡号**（只报"有卡 + 里侧"），与出图同一口径。
 
-    攻守取"内核说过的那份"（`ZoneCard.attack/defense`，来自 `MSG_UPDATE_DATA`），内核没说过时
-    退回**卡面数值**（卡库里的），并在 `stats_live` 里说明是哪一种——装备/场地加成之后两者会不一样。
+    **里侧的卡**（含内核不报卡号的盖卡）只给"有卡 + 里侧 + 攻/守表示"，卡号卡名一律不出去
+    （与出图同一口径）。⚠ 这里的判断顺序很重要：`card_id` 为 0 **正是盖卡的常态**
+    （对手盖下去的牌内核不报卡号），早先写成"没卡号就返回 None"，于是**盖卡在面板上整片消失**。
+
+    `monster_zone=True` 才给攻守/星级：魔陷区、灵摆区（就是魔陷区最左/最右）、场地区的卡
+    **没有、也不该显示**攻守——用户报过"魔法陷阱卡和放在魔陷区的怪兽也显示攻击力"。
     """
 
     if card is None:
         return None
     card_id = int(getattr(card, "card_id", 0) or 0)
-    if not card_id:
-        return None
     face_up = bool(getattr(card, "face_up", True))
     attack_position = bool(getattr(card, "attack_position", False))
-    if not face_up:
-        # 里侧的卡：只给"有卡 + 攻/守表示"，卡号卡名一律不出去（与出图同一口径）
+    if not face_up or not card_id:
+        # 里侧/卡号未知：只给"有卡 + 攻/守表示"，卡号卡名一律不出去（与出图同一口径）
         return {"id": 0, "face_up": False, "attack": attack_position, "name": "", "kind": ""}
     detail = details.get(card_id)
     name = ""
     if detail is not None:
         name = str(getattr(detail, "name", "") or "")
-    live_atk = int(getattr(card, "attack", -1))
-    live_def = int(getattr(card, "defense", -1))
-    base_atk = getattr(detail, "atk", None) if detail is not None else None
-    base_def = getattr(detail, "defense", None) if detail is not None else None
-    atk = live_atk if live_atk >= 0 else base_atk
-    def_ = live_def if live_def >= 0 else base_def
-    return {
+    entry: Dict[str, Any] = {
         "id": card_id,
         "face_up": True,
         "attack": attack_position,
         "name": name or names.get(card_id, ""),
-        "atk": atk,
-        "def_": def_,
-        # 攻守是哪来的：内核当前值 / 卡面数值（面板上要能分辨，别把卡面当成现在的）
-        "stats_live": live_atk >= 0 or live_def >= 0,
-        "level": int(getattr(detail, "level", 0) or 0) if detail is not None else 0,
         "kind": _card_kind_translate(detail) if detail is not None else "",
     }
+    if not monster_zone:
+        return entry
+    live_atk = int(getattr(card, "attack", -1))
+    live_def = int(getattr(card, "defense", -1))
+    base_atk = getattr(detail, "atk", None) if detail is not None else None
+    base_def = getattr(detail, "defense", None) if detail is not None else None
+    entry["atk"] = live_atk if live_atk >= 0 else base_atk
+    entry["def_"] = live_def if live_def >= 0 else base_def
+    # 攻守是哪来的：内核当前值 / 卡面数值（面板上要能分辨，别把卡面当成现在的）
+    entry["stats_live"] = live_atk >= 0 or live_def >= 0
+    entry["level"] = int(getattr(detail, "level", 0) or 0) if detail is not None else 0
+    return entry
 
 
 def _card_kind_translate(detail: Any) -> str:
@@ -2369,11 +2393,15 @@ function runExchange(run){
     params.rounds ? `<span class="chip dim">${esc(params.rounds)} 轮</span>` : "",
     params.duels ? `<span class="chip dim">${esc(params.duels)} 局</span>` : "",
   ].filter(Boolean).join(" ");
-  const reply = summary.conclusion ? esc(String(summary.conclusion))
-    : summary.guide_path ? "推演已存档，点开看全文。"
+  // **明文结果**（`result_text`，插件那一侧算好的确定性数字）排在最前，模型的结论跟在后面：
+  // 用户口径"这些任务结束后要给我一个明文的结果"——数字不能只挂在模型那段话里（它可能失败）
+  const resultText = summary.result_text ? esc(String(summary.result_text)) : "";
+  const conclusion = summary.conclusion ? esc(String(summary.conclusion)) : "";
+  const fallback = summary.guide_path ? "推演已存档，点开看全文。"
     : summary.style_name ? `出牌脚本 ${esc(summary.style_name)} 已编译通过（第 ${esc(summary.attempts || "?")} 轮）。`
-    : summary.exit_code === 0 ? "跑完了，没有结论（点开看输出尾巴）。"
+    : summary.exit_code === 0 ? "跑完了（点开看输出尾巴）。"
     : (run.error ? esc(String(run.error)) : "（没有输出）");
+  const reply = [resultText, conclusion || (resultText ? "" : fallback)].filter(Boolean).join("\n\n");
   // 失败原因（编译器输出、日志尾巴）经常很长：对话流里折起来，详情抽屉里看全文
   const replyHtml = reply.length > 400
     ? `<details class="long"><summary>展开详情（${esc(reply.length)} 字）</summary><div class="txt">${reply}</div></details>`

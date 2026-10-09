@@ -3102,7 +3102,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             ("WindBot.exe", self.config.paths.windbot_executable, self.config.paths.resolved_windbot_executable()),
             ("WindBot 工作目录", self.config.paths.windbot_dir, self.config.paths.resolved_windbot_dir()),
         )
-        for label, raw, resolved in checks:
+        for label, _raw, resolved in checks:
             if resolved is None:
                 missing.append(f"{label}（未填写）")
             elif not resolved.exists():

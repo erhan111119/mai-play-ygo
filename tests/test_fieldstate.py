@@ -465,7 +465,7 @@ def test_taunt_picker_avoids_immediate_repeat() -> None:
     picks = [picker.pick() for _ in range(60)]
     assert all(line in TAUNT_LINES for line in picks)
     assert len(set(picks)) > 5, f"60 次只挑出 {len(set(picks))} 种，随机性太差"
-    for before, after in zip(picks, picks[1:]):
+    for before, after in zip(picks, picks[1:], strict=False):
         assert before != after, "连着重复同一句最出戏，必须避开"
 
     single = TauntPicker(["只有一句"], rng=random.Random(1))

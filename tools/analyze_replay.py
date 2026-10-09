@@ -310,7 +310,7 @@ def describe_deck_diff(
     if differs:
         lines.append(
             "张数不同的："
-            + "、".join(f"{card_label(db, c)} {l}→{r}" for c, l, r in differs[:top])
+            + "、".join(f"{card_label(db, c)} {left}→{right}" for c, left, right in differs[:top])
         )
     return lines
 

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import asyncio
 import http.client
@@ -1030,6 +1030,105 @@ async def _review_apply_writes_backup_and_rolls_back_when_build_fails() -> None:
             assert "没有编译" in saved3.summary["build_tail"], saved3.summary["build_tail"]
         finally:
             runner_module.build_windbot = original_build  # type: ignore[attr-defined]
+
+
+def test_duel_page_slots_hide_stats_outside_monster_zones_and_show_face_down() -> None:
+    """对局页的格子：**只有怪兽区**给攻守；**盖卡必须画出来**（用户报的两条）。
+
+    2026-10-09 用户报："魔法陷阱卡和放在灵摆区的怪兽以及放置在魔陷区的怪兽也有显示攻击力这些数值，
+    而且盖卡在这里不显示。"——前者是 `_slot_json` 对所有格位都发 atk/def_；后者是
+    `card_id` 为 0（对手盖卡内核不报卡号）被当成"空格"返回了 None。
+    """
+
+    webui = _load("webui")
+    from duel.fieldstate import ZoneCard  # noqa: PLC0415  测试内导入，避免影响别的用例
+
+    class Detail:
+        name = "测试怪兽"
+        atk = 1800
+        defense = 1300
+        level = 4
+        type_text = "怪兽 效果"
+
+    details = {999: Detail()}
+    names = {999: "测试怪兽"}
+
+    # ① 怪兽区：给攻守（内核当前值优先）
+    monster = webui._slot_json(
+        ZoneCard(999, 0x1, attack=2600, defense=1300), names=names, details=details, monster_zone=True
+    )
+    assert monster and monster["atk"] == 2600 and monster["def_"] == 1300 and monster["stats_live"], monster
+
+    # ② 魔陷区（含灵摆区 / 当装备用的怪兽）：不给攻守
+    equip = webui._slot_json(
+        ZoneCard(999, 0x1, attack=1200, defense=0), names=names, details=details, monster_zone=False
+    )
+    assert equip and "atk" not in equip and "def_" not in equip, equip
+    assert equip["name"] == "测试怪兽", "名字还是要给（贴纸/装备都要看得见）"
+
+    # ③ 盖卡：内核不报卡号（card_id=0）也必须返回一格"里侧"，不能当成空格
+    hidden = webui._slot_json(ZoneCard(0, 0x8), names=names, details=details, monster_zone=True)
+    assert hidden is not None, "盖卡不能消失"
+    assert hidden["face_up"] is False and hidden["id"] == 0 and hidden["name"] == "", hidden
+    assert hidden["attack"] is False, "0x8 = 里侧守备"
+
+    # ④ 空格才是 None
+    assert webui._slot_json(None, names=names, details=details, monster_zone=True) is None
+
+
+def test_training_tasks_end_with_a_plain_text_result() -> None:
+    """四类训练任务结束时都要落一段**明文结果**（用户口径："结束后给我一个明文的结果"）。
+
+    数字从工具输出/记录字段里抄（确定性），模型的结论另存 `conclusion`——模型失败时
+    用户也还能看到"打了多少局、谁赢多少"。
+    """
+
+    runner = _load("train.runner")
+    arena = """
+A = Gen103（日志名 AI_Gen103）｜B = Test（日志名 AI_Test）
+[1/40] A 在 bot ｜胜者=A
+
+================ 汇总 ================
+局数：40
+算进胜率：40
+平局：0
+没判出胜负：0
+Gen103 赢：10
+Test 赢：30
+Gen103 胜率：25.0%
+95%区间：14.2% ~ 40.2%
+两侧脚本核对不通过的局数：0
+"""
+    text = runner.arena_result_text(arena)
+    for needle in ("Gen103 10 胜 : Test 30 胜", "胜率 25.0%", "14.2% ~ 40.2%", "共 40 局", "核对通过"):
+        assert needle in text, f"{needle} 不在：{text}"
+    assert "没解析出统计" in runner.arena_result_text("（工具没输出）")
+
+    write = runner.write_script_result_text(
+        {"deck_name": "异解", "style_name": "Gen103", "lines": 1722, "handlers": 39,
+         "attempts": 3, "research_model": "联网搜索", "research_chars": 4818, "research_queries": ["a", "b"],
+         "warnings": ["这一版是在已有脚本基础上改的"]}
+    )
+    for needle in ("异解 → Gen103", "1722 行 / 39 个处理函数", "第 3 轮编译通过", "联网资料 4818 字（2 次检索）"):
+        assert needle in write, write
+
+    iterate = runner.iterate_result_text(
+        [
+            {"round": 1, "style_name": "Gen38", "script_lines": 100, "script_handlers": 5, "compared": False},
+            {"round": 2, "style_name": "Gen38", "script_lines": 120, "script_handlers": 6, "compared": True,
+             "arena_result": "擂台对打｜Gen38 8 胜 : Test 12 胜｜共 20 局"},
+        ],
+        "Test",
+    )
+    assert "自动迭代 2 轮（对手脚本 Test）" in iterate and "8 胜 : Test 12 胜" in iterate, iterate
+    assert "末轮脚本 Gen38（120 行 / 6 个处理函数）" in iterate, iterate
+
+    review = runner.review_result_text(
+        {"duels": 3, "script_chars": 81688, "digest_chars": 9898, "log_lines": 122,
+         "patches": ["a：b"], "applied": 1, "build_ok": True}
+    )
+    for needle in ("读了 3 局", "决策日志 122 行", "给出 1 个补丁", "已落地 1 个并编译通过"):
+        assert needle in review, review
 
 
 def test_deck_digest_and_combo_check_catch_cards_outside_the_deck() -> None:
@@ -2058,6 +2157,8 @@ def main() -> int:
         test_deck_card_opens_its_detail_from_the_whole_card,
         test_training_composer_keeps_the_kind_fields_on_screen,
         test_kill_tree_uses_taskkill_with_tree_flag,
+        test_duel_page_slots_hide_stats_outside_monster_zones_and_show_face_down,
+        test_training_tasks_end_with_a_plain_text_result,
         test_deck_digest_and_combo_check_catch_cards_outside_the_deck,
         test_combo_tolerates_non_json_reply_but_says_so,
         test_empty_model_reply_is_an_error_not_an_empty_guide,

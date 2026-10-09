@@ -166,7 +166,7 @@ async def main() -> int:
         print()
         if usable:
             print(f"可用（延迟 ≤3s 且有正文）：{'、'.join(usable)}")
-            print(f"→ 把它写进插件配置 [duel] 的 brain_model，再打开 brain_enabled")
+            print("→ 把它写进插件配置 [duel] 的 brain_model，再打开 brain_enabled")
         else:
             print("没有任何模型可用：阻抗决策层先保持关闭（brain_enabled 默认就是关）。")
             print("判读：ok=false 且「思考=N字」很大 → 思考型；1~2 秒就报错 → provider 侧问题。")

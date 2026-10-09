@@ -30,7 +30,6 @@ import logging
 import math
 import re
 import sys
-import tempfile
 import time
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent

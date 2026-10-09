@@ -21,6 +21,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tup
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -591,6 +592,9 @@ class TrainingRunner:
             "command": " ".join(command[1:]),
             "log_path": str(log_path),
         }
+        if run.kind == KIND_ARENA:
+            # 明文结果先落下来：模型那段结论可能失败，而"打了多少局、谁赢多少"必须在
+            summary["result_text"] = arena_result_text(output_tail)
         if run.kind in KINDS_WITH_CONCLUSION:
             conclusion = await self._conclude(
                 kind=run.kind, params=params, output_tail=output_tail
@@ -727,6 +731,8 @@ class TrainingRunner:
             "research_rounds": int(getattr(self, "_search_rounds", 0) or 0),
             "research_queries": list(getattr(self, "_research_queries", []) or []),
         }
+        # 明文结果（面板那一行直接显示它，不用点开详情）
+        summary["result_text"] = write_script_result_text(summary)
         self.store.finish(run.run_id, STATUS_DONE, summary=summary)
         if self.logger is not None:
             research_note = (
@@ -992,6 +998,8 @@ class TrainingRunner:
             )
             round_info["arena_exit_code"] = exit_code
             round_info["arena_log"] = str(arena_log)
+            # 留着给人看的一行战果（`iterate_result_text` 就是从这里抄数字的）
+            round_info["arena_result"] = arena_result_text(output_tail)
             note(f"第 {index} 轮：擂台结束（退出码 {exit_code}），让模型读战况 + 脚本写下一版改什么…")
             conclusion, conclusion_error = await self._iteration_conclusion(
                 params=params,
@@ -1024,6 +1032,7 @@ class TrainingRunner:
                 "rounds": len(history),
                 "history": history,
                 "log_path": str(log_path),
+                "result_text": iterate_result_text(history, baseline),
             },
         )
 
@@ -1199,30 +1208,29 @@ class TrainingRunner:
                 _patch_report(patch_set, applied, build_ok, build_tail),
             ],
         )
-        self.store.finish(
-            run.run_id,
-            STATUS_DONE,
-            summary={
-                "deck_name": params["deck_name"],
-                "style_name": params.get("style") or "",
-                "duels": len(records),
-                "conclusion": answer[:4000],
-                "review_path": str(path),
-                "log_path": str(run.log_path),
-                "script_source": source_label,
-                "script_chars": len(source_text),
-                "digest_chars": len(digest),
-                "log_lines": len(log_material.splitlines()),
-                "patches": [patch.describe() for patch in patch_set.patches],
-                "patch_problems": list(patch_set.problems),
-                "applied": applied.applied,
-                "apply_error": applied.error,
-                "backups": list(applied.backups),
-                "build_ok": build_ok,
-                "build_tail": build_tail[-1200:],
-                "apply_requested": apply_patch,
-            },
-        )
+        summary: Dict[str, Any] = {
+            "deck_name": params["deck_name"],
+            "style_name": params.get("style") or "",
+            "duels": len(records),
+            "conclusion": answer[:4000],
+            "review_path": str(path),
+            "log_path": str(run.log_path),
+            "script_source": source_label,
+            "script_chars": len(source_text),
+            "digest_chars": len(digest),
+            "log_lines": len(log_material.splitlines()),
+            "patches": [patch.describe() for patch in patch_set.patches],
+            "patch_problems": list(patch_set.problems),
+            "applied": applied.applied,
+            "apply_error": applied.error,
+            "backups": list(applied.backups),
+            "build_ok": build_ok,
+            "build_tail": build_tail[-1200:],
+            "apply_requested": apply_patch,
+        }
+        # 明文结果放在最后算：`review_result_text` 要读上面的补丁/落地/编译字段
+        summary["result_text"] = review_result_text(summary)
+        self.store.finish(run.run_id, STATUS_DONE, summary=summary)
         if self.logger is not None:
             self.logger.info(
                 "复盘优化已存档：%s（依据 %s 局；补丁 %s 个，落地 %s 个%s）",
@@ -1716,6 +1724,115 @@ PATCH>>>
 ================ D. 最近一局的决策日志（截断） ================
 {decision_log}
 """
+
+
+def _match_once(pattern: str, text: str) -> str:
+    """抓第一个匹配的组（抓不到给空串）——结果文本的解析就用这一条，别每处各写一遍。"""
+
+    found = re.search(pattern, text, re.M)
+    return found.group(1).strip() if found else ""
+
+
+def arena_result_text(output: str) -> str:
+    """把擂台（`tools/style_ab.py` 的输出）压成**一行明文结果**。
+
+    为什么要自己解析：这些任务的结论以前只有"模型写的一段话"（模型失败就没有），
+    用户要的是一眼能看的结果。数字直接从工具输出里抄，抄不到的部分如实留空，
+    不替它编（用户口径：结束后给我一个明文的结果）。
+    """
+
+    text = str(output or "")
+    wins = re.findall(r"^(.+?) 赢：(\d+)\s*$", text, re.M)
+    games = _match_once(r"^局数：(\d+)", text)
+    rate_line = re.search(r"^(.+?) 胜率：([\d.]+)%", text, re.M)
+    interval = _match_once(r"95%区间：([\d.]+%\s*~\s*[\d.]+%)", text)
+    mismatch = _match_once(r"两侧脚本核对不通过的局数：(\d+)", text)
+    truncated = _match_once(r"（到时间上限 [^）]*已跑 (\d+) 局）", text)
+
+    parts: List[str] = ["擂台对打"]
+    if len(wins) >= 2:
+        parts.append(f"{wins[0][0]} {wins[0][1]} 胜 : {wins[1][0]} {wins[1][1]} 胜")
+    if rate_line:
+        parts.append(f"{rate_line.group(1)} 胜率 {rate_line.group(2)}%")
+    if interval:
+        parts.append(f"95% 区间 {interval}")
+    if games:
+        parts.append(f"共 {games} 局")
+    elif truncated:
+        parts.append(f"提前收工，已跑 {truncated} 局")
+    if mismatch:
+        parts.append("两侧脚本核对通过" if mismatch == "0" else f"⚠ {mismatch} 局脚本核对没过（结论不可信）")
+    if len(parts) == 1:
+        # 一行都没解析出来：别假装有结果，把"看哪儿"说清楚
+        return "擂台对打：跑完了，但没解析出统计（点开看日志尾巴）"
+    return "｜".join(parts)
+
+
+def iterate_result_text(history: Sequence[Dict[str, Any]], baseline: str) -> str:
+    """自动迭代的明文结果：每一轮跟基线打的结果 + 末轮脚本。"""
+
+    if not history:
+        return "自动迭代：一轮都没跑完（看日志）"
+    rounds = [f"第 {int(item.get('round') or index + 1)} 轮" for index, item in enumerate(history)]
+    detail: List[str] = []
+    for index, item in enumerate(history):
+        label = rounds[index]
+        if not item.get("compared"):
+            detail.append(f"{label}：没有可比基线（只验证能加载）")
+            continue
+        line = str(item.get("arena_result") or arena_result_text(str(item.get("arena_output") or "")))
+        detail.append(f"{label}：{line.replace('擂台对打｜', '')}")
+    last = history[-1]
+    tail = f"末轮脚本 {last.get('style_name') or '?'}"
+    if last.get("script_lines"):
+        tail += f"（{last.get('script_lines')} 行 / {last.get('script_handlers')} 个处理函数）"
+    return f"自动迭代 {len(history)} 轮（对手脚本 {baseline}）：" + "；".join(detail) + f"｜{tail}"
+
+
+def write_script_result_text(summary: Dict[str, Any]) -> str:
+    """写脚本的明文结果。"""
+
+    parts = [
+        "写脚本",
+        f"{summary.get('deck_name') or '?'} → {summary.get('style_name') or '?'}",
+        f"{summary.get('lines', '?')} 行 / {summary.get('handlers', '?')} 个处理函数",
+        f"第 {summary.get('attempts', '?')} 轮编译通过",
+    ]
+    if summary.get("research_chars"):
+        queries = len(summary.get("research_queries") or [])
+        parts.append(f"联网资料 {summary['research_chars']} 字（{queries} 次检索）")
+    elif summary.get("research_model"):
+        parts.append("联网资料没取到")
+    warnings = list(summary.get("warnings") or [])
+    if warnings:
+        parts.append("⚠ " + "；".join(str(item)[:60] for item in warnings[:3]))
+    return "｜".join(parts)
+
+
+def review_result_text(summary: Dict[str, Any]) -> str:
+    """复盘的明文结果（读了什么 + 给了几个补丁 + 落地/编译结果）。"""
+
+    parts = [
+        "复盘优化",
+        f"读了 {summary.get('duels', '?')} 局",
+        f"脚本源码 {summary.get('script_chars', 0)} 字（摘要 {summary.get('digest_chars', 0)} 字）",
+        f"决策日志 {summary.get('log_lines', 0)} 行",
+    ]
+    patches = list(summary.get("patches") or [])
+    if patches:
+        parts.append(f"给出 {len(patches)} 个补丁")
+        if summary.get("applied"):
+            parts.append(f"已落地 {summary['applied']} 个并{'编译通过' if summary.get('build_ok') else '编译没通过'}")
+        elif summary.get("apply_error"):
+            parts.append(f"没有落地（{summary['apply_error'][:80]}）")
+        else:
+            parts.append("没有落地（没勾「落地并编译」）")
+    else:
+        parts.append("没有给补丁（只给了建议）")
+    problems = list(summary.get("patch_problems") or [])
+    if problems:
+        parts.append("⚠ 补丁格式问题：" + "；".join(str(item)[:60] for item in problems[:2]))
+    return "｜".join(parts)
 
 
 def _duel_brief(index: int, record: Any) -> str:

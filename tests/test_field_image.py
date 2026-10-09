@@ -136,7 +136,9 @@ def test_zones_are_mapped_to_slots() -> None:
     state.zones[(0, 4, 2)] = ZoneCard(76072561, 0x1)          # 我方：主怪兽区3
     state.zones[(0, 4, 6)] = ZoneCard(63288573, 0x1)          # 我方：额外怪兽区
     state.zones[(0, 8, 0)] = ZoneCard(9726840, 0x5)           # 我方：魔法陷阱区1
-    state.zones[(0, 256, 0)] = ZoneCard(33700664, 0x5)        # 我方：场地区
+    # ⚠ 场地区是**魔陷区的第 6 格**（内核报 `(SPELL_ZONE=8, 5)`），不是 `(FIELD_ZONE=256, 0)`：
+    # 原来按 256 查，于是查房图上场地魔法永远不显示（2026-10-09 用户报"场地魔法不会显示"）。
+    state.zones[(0, 8, 5)] = ZoneCard(33700664, 0x5)          # 我方：场地区
     state.zones[(1, 4, 0)] = ZoneCard(96205925, 0xA)          # 对手：里侧的怪
     details = _details(
         {
@@ -212,6 +214,78 @@ def test_stack_counts_are_rendered() -> None:
         assert label in html, label
     for count in ("7", "2", "1", "4"):
         assert f'<div class="pnum">{count}</div>' in html, count
+
+
+def test_monster_stats_come_from_the_kernel_and_never_on_spell_rows() -> None:
+    """查房图上的攻守：**内核当前值优先**，魔陷行/场地区不给攻守，场地魔法要画出来。
+
+    用户报的两条（2026-10-09）：
+    * "查房界面的怪兽攻击力数值不是实际数值而是原始数值" → 原实现只读卡库的 `stats` 串；
+    * "场地魔法不会显示" → 原实现查 `(FIELD_ZONE=256, 0)`，而内核报的是 `(SPELL_ZONE, 5)`。
+    顺带钉住"魔陷区里当装备用的怪兽"不显示攻守（与对局面板同一口径）。
+    """
+
+    import types
+
+    from duel.field_image import SPELL_ZONE
+    from duel.fieldstate import MONSTER_ZONE
+
+    class FakeDetail:
+        """卡库里那只怪兽：卡面攻 1800 / 守 1300（而内核说现在是 2600）。"""
+
+        name = "测试怪兽"
+        type_text = "怪兽 效果"
+        stats = "攻1800/守1300/星4/光/龙"
+        effect = ""
+        atk = 1800
+        defense = 1300
+        level = 4
+
+    class FakeState:
+        """够 `view_from_state` 用的最小状态。"""
+
+        def __init__(self, zones: dict) -> None:
+            self._zones = zones
+            player = types.SimpleNamespace(lp=8000, grave=0, banished=0, extra=0)
+            self.players = {0: player, 1: player}
+            self.turn_count = 3
+
+        def zones_of(self, seat: int) -> dict:
+            return self._zones if seat == 0 else {}
+
+        def seen_ids(self, seat: int) -> list:
+            return []
+
+    state = FakeState(
+        {
+            (MONSTER_ZONE, 0): ZoneCard(999, 0x1, attack=2600, defense=1300),
+            (MONSTER_ZONE, 1): ZoneCard(0, 0x8),                          # 里侧盖怪（内核不报卡号）
+            (SPELL_ZONE, 0): ZoneCard(777, 0x1, attack=1200, defense=0),  # 当装备用的怪兽
+            (SPELL_ZONE, 5): ZoneCard(674561, 0x1),                      # 场地魔法
+        }
+    )
+    view = view_from_state(
+        state,
+        seat=0,
+        opponent_seat=1,
+        our_label="我方",
+        their_label="对手",
+        details_of=lambda card_id: FakeDetail(),
+        current_seat=0,
+        pic_dir=Path("nope"),
+    )
+    monster = view.bottom.monsters[0]
+    assert monster is not None and monster.atk == 2600 and monster.def_ == 1300, monster
+    hidden = view.bottom.monsters[1]
+    assert hidden is not None and not hidden.face_up, hidden
+    equipped = view.bottom.spells[0]
+    assert equipped is not None and equipped.atk is None and equipped.def_ is None, equipped
+    assert view.bottom.field_zone is not None, "场地魔法要显示（内核把它报在魔陷区第 6 格）"
+    assert view.bottom.field_zone.atk is None, "场地区不该有攻守"
+    html = build_html(view)
+    assert "2600" in html, "怪兽要显示内核下发的当前攻击力"
+    assert "1800" not in html, "不能拿卡面数值当实际数值"
+    assert "1200" not in html, "魔陷行/装备怪兽不显示攻守"
 
 
 def test_full_card_image_wins_over_drawn_frame() -> None:

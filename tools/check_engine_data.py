@@ -195,7 +195,7 @@ def check_library_globals(script_dir: Path) -> Tuple[List[str], Dict[str, int]]:
         "Bit", "Math", "Table", "String", "Os", "Io", "Aux", "EFFECT", "TYPE", "LOCATION",
         "ATTRIBUTE", "RACE", "PHASE", "POS", "REASON", "TIMING", "SUMMON", "RESET", "EVENT",
         "CATEGORY", "OPCODE", "PLAYER", "LINK", "DUEL", "CHAININFO", "EFFECT_FLAG", "SET",
-        "HINT", "Link", "Card", "Table",
+        "HINT", "Link",
     }
     missing = sorted(
         name for name in used if name not in defined and name not in builtin

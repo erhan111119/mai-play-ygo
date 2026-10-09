@@ -28,7 +28,6 @@ import argparse
 import asyncio
 import logging
 import sys
-import tempfile
 import time
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent

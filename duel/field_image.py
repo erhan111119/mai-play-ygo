@@ -37,7 +37,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("mai-play-ygo.field_image")
 
@@ -478,7 +478,10 @@ def _arena_html(view: FieldView) -> str:
         )
         return f'<div class="row{" toprow" if mirrored else ""}">{cells}{zone_html}</div>'
 
-    who = lambda side: _escape(side.label) if side is not None else ""
+    def who(side: Optional[SideView]) -> str:
+        """这一侧的名字（没给定就空着，别写成 None）。"""
+
+        return _escape(side.label) if side is not None else ""
     return (
         '<div class="arena">'
         '<div class="half opp">'
@@ -780,21 +783,27 @@ def view_from_state(
             extra_count=int(getattr(player, "extra", 0) or 0),
         )
         for index in range(MAIN_ZONES):
+            # 怪兽区：给攻守（内核当前值优先，见 `to_card_view`）
             view.monsters[index] = to_card_view(
-                cards.get((MONSTER_ZONE, index)), details_of, art_dir, art_fallback_dir, pic_dir
+                cards.get((MONSTER_ZONE, index)), details_of, art_dir, art_fallback_dir, pic_dir,
+                monster_zone=True,
             )
+            # 魔陷行（含灵摆区最左/最右两格）：不给攻守
             view.spells[index] = to_card_view(
                 cards.get((SPELL_ZONE, index)), details_of, art_dir, art_fallback_dir, pic_dir
             )
         for sequence in (5, 6):          # 额外怪兽区（本座位那一格）
             card = to_card_view(
-                cards.get((MONSTER_ZONE, sequence)), details_of, art_dir, art_fallback_dir, pic_dir
+                cards.get((MONSTER_ZONE, sequence)), details_of, art_dir, art_fallback_dir, pic_dir,
+                monster_zone=True,
             )
             if card is not None:
                 view.extra = card
                 break
+        # ⚠ 场地区**不是** `(FIELD_ZONE, 0)`：内核把它报在魔陷区的第 6 格（`(SPELL_ZONE, 5)`）——
+        # 这正是"查房的图里场地魔法永远不显示"的原因（`fieldstate` 也只收 MONSTER_ZONE/SPELL_ZONES）。
         view.field_zone = to_card_view(
-            cards.get((FIELD_ZONE, 0)), details_of, art_dir, art_fallback_dir, pic_dir
+            cards.get((SPELL_ZONE, 5)), details_of, art_dir, art_fallback_dir, pic_dir
         )
         return view
 
@@ -817,15 +826,25 @@ def to_card_view(
     # ⚠ 别再改回 None：调用方（`plugin.py` 的 `/查房`）没传这个参数时，None 会让整张图
     # 全部退化成"名字 + 攻守"的兜底卡面（2026-10-09 线上就是这么表现的："卡图没有正确渲染"）。
     pic_dir: Optional[Path] = DEFAULT_CACHE_DIR,
+    monster_zone: bool = False,
 ) -> Optional[CardView]:
-    """`ZoneCard` → `CardView`（里侧的卡不读任何卡图：反正要画卡背）。"""
+    """`ZoneCard` → `CardView`（里侧的卡不读任何卡图：反正要画卡背）。
+
+    ⚠ 攻守的取值顺序（2026-10-09 用户报"查房图里攻击力是原始数值"）：
+    **内核下发过的当前值优先**（`ZoneCard.attack/defense`，来自 `MSG_UPDATE_CARD`），
+    内核没说过时才退回卡库的卡面数值。原来只读卡库那份，于是装备/场地加成、指示物、
+    减攻效果之后图上的数字全是错的。
+
+    `monster_zone=True` 才给攻守：魔陷区/灵摆区/场地区里的卡（含"当装备用的怪兽"）
+    **没有攻守可显示**——用户报过"魔陷区的卡也显示攻击力"。
+    """
 
     if card is None:
         return None
     card_id = int(getattr(card, "card_id", 0) or 0)
     face_up = bool(getattr(card, "face_up", True))
     name, kind, atk, def_, link = str(card_id), "monster", None, None, False
-    level, rank, type_line, effect = 0, False, "", ""
+    level, type_line, effect = 0, "", ""
     if details_of is not None:
         try:
             detail = details_of(card_id)
@@ -839,11 +858,21 @@ def to_card_view(
             type_line = type_text.replace(" ", "/")
             match = _STATS_RE.search(str(getattr(detail, "stats", "")))
             if match:
-                atk, def_ = int(match.group(1)), int(match.group(2))
-                level = int(match.group(3) or 0)
+                atk, def_, level = int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)
             # 卡文只给表侧的卡（里侧的不读，免得哪天顺手画出来）
             if face_up:
                 effect = str(getattr(detail, "effect", "") or "")
+    if face_up and monster_zone:
+        # 当前值优先（内核没下发的字段保持卡面值）；连接怪没有守备力，别把 0 写成守备
+        live_atk = int(getattr(card, "attack", -1) or -1)
+        live_def = int(getattr(card, "defense", -1) or -1)
+        if live_atk >= 0:
+            atk = live_atk
+        if live_def >= 0 and not link:
+            def_ = live_def
+    elif not monster_zone:
+        # 非怪兽区：攻守一律不显示（场地区/魔陷区/灵摆区都是"没有这些数值"的卡）
+        atk, def_ = None, None
     return CardView(
         card_id=card_id,
         name=name,
