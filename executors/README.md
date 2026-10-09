@@ -160,14 +160,15 @@ MaiBotBrain 相关的钩子在没传 `BrainFile=` 时是零开销的空转：只
 （`BrainOppBudgetMs`），最坏情况是白等几次。**答不上来就什么都不写**，WindBot 按脚本继续；
 连续 3 次没答复就熔断本局的问答。
 
-**模型实测（2026-10-08）——这一条决定它能不能用，也解释了为什么默认值是 `deepseek-chat`**：
+**模型实测（2026-10-08；2026-10-09 补 `deepseek-flash`）——这一条决定它能不能用**：
 "够不够快"与"模型聪不聪明"无关，只取决于**有没有关掉思考**。同一个 key、同一个 base_url，
 用插件自带提示词（405 prompt tokens / `max_tokens=256`）实测：
 
 | 配置 | 延迟 | 思考 | 答复 |
 |---|---|---|---|
-| `deepseek-chat` + **关思考**（默认值就是它） | **0.58~0.93 秒** | 0 token | 干净的序号（如 `2`） |
-| `deepseek-flash` + 关思考 | 1.08 秒 | 0 token | 干净的序号 |
+| `deepseek-flash` + **关思考**（2026-10-09 新登记的 `name = "deepseek-flash"` 那条，插件现在用它） | **2.0~2.2 秒** | 0 token | 干净的序号（如 `2`） |
+| └ 同一条在 2026-10-08 的探针里临时关思考量到 | 1.08 秒 | 0 token | 干净的序号（两种量法差在是否经宿主服务，取 2 秒那档更保守） |
+| `deepseek-chat` + **关思考**（0.5 秒档，插件 2026-10-09 前用它） | **0.58~0.93 秒** | 0 token | 干净的序号（如 `2`） |
 | `deepseek-v4-pro` + 关思考 | 1.08 秒 | 0 token | 干净的序号 |
 | `deepseek-flash`（本机原来那条 `deepseekV4.1flash` 的现状） | 2.21 秒 | **256 token（撞满额度）** | **空串** |
 | `ds`（插件默认的 `utils` 任务） | 17.1 秒 | 7039 字 | **空串** |
@@ -179,8 +180,11 @@ MaiBotBrain 相关的钩子在没传 `BrainFile=` 时是零开销的空转：只
 **判读要点（比"换哪只模型"更重要）**：本机大部分模型是**思考型**，思考会把 `max_tokens` 吃光，
 所以 `response` 是空串——**"把 max_tokens 调大"解决不了**（只是让它思考更久，实测 17 秒/7039 字）。
 真正的开关是模型条目里的 `extra_params = {thinking = {type = "disabled"}}`
-（本机 `deepseek-flash` 那条反而显式写着 `thinking = {type = "enabled"}, reasoning_effort = "max"`，
-那是给回复用的，别动它——决策层用新登记的 `deepseek-chat` 那一条）。
+（本机叫 `deepseekV4.1flash` 那条反而显式写着 `thinking = {type = "enabled"}, reasoning_effort = "max"`，
+那是给回复用的，别动它——决策层的模型名与它**同名不同条目**：插件填的是 `deepseek-flash`，
+即 2026-10-09 新登记的、`model_identifier` 也是 `deepseek-flash` 但 thinking 关掉的那条）。
+⚠ **等待上限要跟着模型走**：`deepseek-flash` 单次约 2 秒，所以 `llm.decision_timeout_ms` 配成 4000；
+2500（Python 侧 2100）只适合 0.6~0.9 秒档的模型，配 2 秒的模型会卡在边缘、频繁超时。
 
 所以两个开关的默认值是：**`BrainTargetChoice` 开**（目标选择，低风险、有信息优势）、
 **`BrainNegateGate` 关**（有 86% 否决前科，先跑镜像 A/B）。换 provider / 换模型之后用

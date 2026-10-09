@@ -2073,7 +2073,8 @@ def test_llm_section_owns_the_models_and_the_decision_layer_reads_it() -> None:
     # 决策模型的出厂默认是**空串**（跟宿主的 utils 任务走）：写一个厂商模型名当默认，
     # 在别的机器上那个名字不存在，决策层一上来就必然失败（配置版本 1.4.0 改的）
     assert config.llm.decision_model == "", config.llm.decision_model
-    assert config.llm.decision_timeout_ms == 2500, config.llm.decision_timeout_ms
+    # 上限默认 4000：决策层推荐的 2 秒档模型需要它；快模型不受影响（这只是上限）
+    assert config.llm.decision_timeout_ms == 4000, config.llm.decision_timeout_ms
     assert hasattr(config.llm, "training_model") and hasattr(config.llm, "training_timeout_ms")
     # 决策层的两项已经搬走：模型里不该再有旧键（否则就有两份真相）
     assert "brain_model" not in module.DuelConfig.model_fields

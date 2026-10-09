@@ -2,6 +2,25 @@
 
 > 本文件从「麦麦玩游戏王」1.0.0 起版（合并前的「游戏王对局管家」历史已不随仓库保留）。
 
+## 1.1.4
+
+### 决策层与训练功能改用关思考的 `deepseek-flash`（用户口径：不用 deepseek-chat 了）
+
+- **模型推荐换人**：本机在宿主 `model_config.toml` 里新登记了一条 `name = "deepseek-flash"`
+  （`model_identifier` 同为 `deepseek-flash`，`thinking = {type = "disabled"}`），
+  插件三处模型（`summary_model` / `decision_model` / `training_model`）都指向它。
+  实测（走宿主 LLM 服务、用插件自带决策提示词）：**2.0~2.2 秒、零思考 token、答复就是干净的序号**；
+  对照组是原来那条 `deepseekV4.1flash`（**开着**思考、同名标识符）——2.21 秒、思考 937 字、
+  并且**答复是空串**（额度被思考吃光），正好印证"关思考才是开关"。
+- **`llm.decision_timeout_ms` 默认 2500 → 4000**（配置版本 → 1.5.0）：原来那档是配 0.6~0.9 秒的
+  `deepseek-chat` 用的，而新模型单次约 2 秒，2500（Python 侧 2100）会让它**卡在边缘、频繁超时**。
+  这个值只是上限——快模型不受影响（答复到了就走）。
+- `tools/brain_channel_check.py` 多了 `--brain-timeout-ms`：它自己那局自测固定用紧张的 2500ms
+  （专门暴露"答复太慢"），现在可以按插件的实际口径再量一遍。
+  `tools/brain_ab.py` 的 `--real-model` 默认值也跟着改成 `deepseek-flash`。
+- 文档同步：`config.toml.example`、README 的模型表、插件里的字段说明、`executors/README.md §3.5`
+  的实测表都改成新模型的数字，并写明"等待上限要跟模型配"。
+
 ## 1.1.2
 
 ### 卡组详情把额外卡组与副卡组分开（用户报"额外卡组和副卡组应该分开的"）

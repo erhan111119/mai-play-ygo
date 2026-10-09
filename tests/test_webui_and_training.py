@@ -522,7 +522,7 @@ def test_timeout_failure_says_what_to_change() -> None:
 
     analysis = _load("train.analysis")
     hint = analysis.failure_hint("[E_TIMEOUT] 请求 cap.call 超时 (30000ms)")
-    assert "30 秒" in hint and "deepseek-chat" in hint, hint
+    assert "30 秒" in hint and "deepseek-flash" in hint, hint
     assert analysis.failure_hint("别的问题") == ""
 
     async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
@@ -536,7 +536,7 @@ def test_timeout_failure_says_what_to_change() -> None:
             )
         )
     except analysis.AnalysisError as exc:
-        assert "30 秒" in str(exc) and "deepseek-chat" in str(exc), exc
+        assert "30 秒" in str(exc) and "deepseek-flash" in str(exc), exc
     else:
         raise AssertionError("超时应该抛 AnalysisError")
 

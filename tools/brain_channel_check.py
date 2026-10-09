@@ -119,7 +119,7 @@ def _make_real_generate(model_name: str, timings: List[float]):
     """造一个**真的** generate：走宿主的 LLM 服务（与插件运行时同一条路）。
 
     为什么要留这个入口：假模型只能证明"通道通"，证不了"配上真模型之后一局要等多久"。
-    实测 `deepseek-chat` 在决策层提示词下 0.58~0.93 秒，这里量的是**含文件往返**的端到端延迟。
+    实测 `deepseek-flash`（关思考）在决策层提示词下约 2 秒，这里量的是**含文件往返**的端到端延迟。
     """
 
     async def generate(prompt: str) -> Optional[str]:
@@ -156,7 +156,10 @@ def _write_probe_deck(path: Path) -> Path:
     return path
 
 
-async def run(*, max_duration: float = 240.0, join_timeout: float = 60.0, real_model: str = "") -> int:
+async def run(
+    *, max_duration: float = 240.0, join_timeout: float = 60.0, real_model: str = "",
+    brain_timeout_ms: int = 2500,
+) -> int:
     """跑一局自测；返回进程退出码。
 
     Args:
@@ -164,6 +167,10 @@ async def run(*, max_duration: float = 240.0, join_timeout: float = 60.0, real_m
         join_timeout: 等"人类"对手进房的秒数。
         real_model: 给了就用**真的模型**（走宿主 LLM 服务）而不是秒答的假模型——
             这样量出来的是含文件往返的端到端延迟。
+        brain_timeout_ms: WindBot 等答复的上限。工具默认 2500ms（**紧张窗口**，专门用来
+            暴露"答复太慢"）；插件实际用的是 `llm.decision_timeout_ms`——本机把决策模型换成
+            `deepseek-flash`（关思考）之后单次实测约 2 秒，那一档已经放宽到 4000。
+            要按插件的口径量，用 `--brain-timeout-ms` 传成配置里的值。
     """
 
     logger = logging.getLogger("brain_channel")
@@ -293,15 +300,18 @@ async def run(*, max_duration: float = 240.0, join_timeout: float = 60.0, real_m
 def main() -> int:
     parser = argparse.ArgumentParser(description="阻抗决策层真机链路自测")
     parser.add_argument("--max-duration", type=float, default=120.0, help="一局最长秒数")
+    parser.add_argument("--brain-timeout-ms", type=int, default=2500,
+                        help="WindBot 等答复的上限（默认 2500＝紧张窗口；插件实际用 llm.decision_timeout_ms）")
     parser.add_argument("--join-timeout", type=float, default=45.0, help="等对手进房的秒数")
     parser.add_argument(
         "--real-model",
         default="",
-        help="用真模型而不是假模型（例如 deepseek-chat）；量端到端延迟时用它",
+        help="用真模型而不是假模型（例如 deepseek-flash）；量端到端延迟时用它",
     )
     args = parser.parse_args()
     return asyncio.run(
-        run(max_duration=args.max_duration, join_timeout=args.join_timeout, real_model=args.real_model)
+        run(max_duration=args.max_duration, join_timeout=args.join_timeout,
+            real_model=args.real_model, brain_timeout_ms=args.brain_timeout_ms)
     )
 
 

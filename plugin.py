@@ -164,12 +164,14 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件")
-    config_version: str = Field(default="1.4.0", description="配置版本")
+    config_version: str = Field(default="1.5.0", description="配置版本")
     # 版本号提升是有意的：1.2.0 起新增 `[llm]`（三个用途的模型与超时）、`[training]`（训练功能）、
     # `[webui]`（插件自带面板）三节，并把 `duel.brain_model` / `duel.brain_timeout_ms`
     # 移成 `llm.decision_model` / `llm.decision_timeout_ms`（老键会被静默忽略）。
     # 1.3.0 起 `[llm]` 多一个 `training_script_max_tokens`（写脚本每批的输出上限），
     # 老配置没有这个键时按默认值 4096 走。
+    # 1.5.0 起 `llm.decision_timeout_ms` 默认 2500 → 4000：决策层推荐用的模型（关思考的
+    # `deepseek-flash`）单次约 2 秒，2500（Python 侧 2100）会让它卡在边缘；快模型不受影响（那只是个上限）。
     # 1.4.0 起 `llm.decision_model` 的默认值从 `deepseek-chat` 改成空串（跟宿主的 utils 任务走）：
     # 把一个厂商模型名当出厂默认，在别的机器上那个名字不存在，决策层一上来就必然失败。
 
@@ -353,18 +355,21 @@ class LlmConfig(PluginConfigBase):
     decision_model: str = Field(
         default="",
         description=(
-            "【AI 决策】用哪只模型。**推荐小体量、不思考的那种**（本机实测 `deepseek-chat` 关掉思考后 0.58~0.93 秒）。"
+            "【AI 决策】用哪只模型。**必须是不思考的那种**（模型条目里 thinking = disabled）。"
             "实测对手回合的等待预算一共只有 15 秒，一次会思考的答复要 13 秒；"
-            "而 `deepseek-chat` 关掉思考后是 0.58~0.93 秒、零思考 token、答复就是干净的序号。"
+            "本机实测 `deepseek-flash`（thinking = disabled）单次约 2.0~2.2 秒、零思考 token、答复就是干净的序号——"
+            "所以这一档的等待上限也配成 4000ms（2500 只适合 0.6~0.9 秒的模型）。"
             "⚠ 换模型要同时看两件事：模型名，以及 `model_config.toml` 里那条"
             "`extra_params = {thinking = {type = \"disabled\"}}`——思考型模型会把额度全花在"
             "思考上、`response` 是空串（拉高额度解不了）。换完用 `tools/brain_model_probe.py` 量一遍"
         ),
     )
     decision_timeout_ms: int = Field(
-        default=2500,
+        default=4000,
         description=(
-            "【AI 决策】WindBot 等答复的上限（毫秒，默认 2500）。"
+            "【AI 决策】WindBot 等答复的上限（毫秒，默认 4000）。"
+            "⚠ 这个上限要跟所选模型配：2 秒档的模型（本机的 `deepseek-flash`）需要 4000；"
+            "2500 只适合 0.6~0.9 秒档的模型。"
             "Python 侧的等模型上限会自动取「这个值再减 400 毫秒」，好让超时由 Python 先发现并记账。"
             "实测模型答复 0.6~0.9 秒，所以 2500 是「够用且不会拖住对局」的余量；"
             "调大之前想清楚：对手回合的等待预算一共只有 15 秒"
@@ -635,7 +640,7 @@ class DuelConfig(PluginConfigBase):
             "【阻抗决策层】是否让模型决定「这一张无效卡该指向对面哪只怪」。**默认开**。"
             "风险最低的一半：它只在「脚本本来就要交这张无效卡」的前提下改目标，不会让脚本少交一张牌；"
             "模型在这里有真信息优势（脚本只认卡号，模型认识卡文）。"
-            "2026-10-08 实测：链路与模型都验过（`deepseek-chat` 关思考 0.58~0.93 秒、答复干净、"
+            "实测：链路与模型都验过（本机 `deepseek-flash` 关思考约 2 秒、答复干净、"
             "零思考 token），一局只问十次左右，等待挤得进对手回合的 15 秒预算。"
             "关掉＝完全按出牌脚本自己的判据选目标（改动前的老口径）"
         ),

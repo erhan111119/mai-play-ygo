@@ -478,7 +478,7 @@ def main() -> int:
         "--baseline", action="store_true",
         help="基线：两边都不开决策层。**先跑它**——基线不是 ~50% 就说明座位/先手带偏，胜率不能直接读",
     )
-    parser.add_argument("--real-model", default="deepseek-chat", help="决策层用的模型")
+    parser.add_argument("--real-model", default="deepseek-flash", help="决策层用的模型（要关思考的那种）")
     parser.add_argument("--max-duel-seconds", type=float, default=240.0, help="单局最长秒数")
     parser.add_argument("--join-timeout", type=float, default=30.0, help="等对手进房的秒数")
     parser.add_argument("--max-minutes", type=float, default=50.0, help="整批的时间上限")

@@ -155,9 +155,10 @@ def test_config_model_builds_and_matches_toml() -> None:
     # 2026-10-08 起 1.2.0：新增 [llm]（三个用途的模型与超时）/ [training]（训练功能）/ [webui]（插件面板），
     # 并把 duel.brain_model + duel.brain_timeout_ms 移成 llm.decision_model + llm.decision_timeout_ms。
     # 2026-10-09 起 1.3.0：`[llm]` 多一个 training_script_max_tokens（写脚本每批的输出上限）。
+    # 1.5.0 起 `llm.decision_timeout_ms` 默认 4000（决策层推荐用 2 秒档的关思考模型）。
     # 同日起 1.4.0：`llm.decision_model` 默认改成空串（跟宿主的 utils 任务走）——
     # 出厂默认写一个厂商模型名，在别的机器上一上来就会"未找到名为 xxx 的模型"。
-    assert defaults.plugin.config_version == "1.4.0"
+    assert defaults.plugin.config_version == "1.5.0"
 
     with (_PLUGIN_ROOT / "config.toml.example").open("rb") as handle:
         toml_data = tomllib.load(handle)

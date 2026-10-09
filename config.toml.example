@@ -11,7 +11,7 @@
 [plugin]
 # 插件：插件基础配置。
 enabled = false  # 是否启用插件（复制成 config.toml 后改成 true）
-config_version = "1.4.0"  # 配置版本（1.4.0 起 decision_model 默认留空＝跟 utils 任务走；1.3.0 起 [llm] 多一个 training_script_max_tokens）
+config_version = "1.5.0"  # 配置版本（1.5.0 起 decision_timeout_ms 默认 4000，配 2 秒档的决策模型；1.4.0 起 decision_model 默认留空＝跟 utils 任务走；1.3.0 起 [llm] 多一个 training_script_max_tokens）
 
 [paths]
 # 运行环境：两个虚拟客户端与数据文件的位置（默认都在插件自带的 clients/ 里）
@@ -58,10 +58,10 @@ taunt_lines = []  # 挑衅台词池（集合，一条一句）；留空用内置
 # 三个用途各管一件事，谁都不用别人的模型。
 summary_model = ""  # 【对局总结】把机读复述写成一段人话；这活儿对智力要求低，哪只都行（留空＝跟 utils 走）
 summary_timeout_ms = 60000  # 【对局总结】等模型的上限（毫秒）。总结额度是 16384 token，思考型模型会先想一大段，给短了会稳定超时（群里看起来就是"没有 AI 总结"）
-decision_model = ""  # 【AI 决策】阻抗决策层用哪只。**推荐小体量、不思考的那种**：对手回合的等待预算只有 15 秒，会思考的答复要 13 秒（留空＝跟 utils 走；本机实测 `deepseek-chat` 关掉思考后 0.58~0.93 秒、答复就是干净的序号）
-decision_timeout_ms = 2500  # 【AI 决策】WindBot 等答复的上限（毫秒）；Python 侧自动取这个值再减 400，好让超时由插件先发现并记账
+decision_model = ""  # 【AI 决策】阻抗决策层用哪只。**必须是不思考的那种**：对手回合的等待预算只有 15 秒，会思考的答复光"想"就超时。留空＝跟 utils 走；本机实测 `deepseek-flash`（模型条目里 thinking = disabled）单次约 2.0~2.2 秒、零思考 token、答复就是干净的序号
+decision_timeout_ms = 4000  # 【AI 决策】WindBot 等答复的上限（毫秒）；Python 侧自动取这个值再减 400，好让超时由插件先发现并记账。⚠ 要跟所选模型配：本机的 `deepseek-flash` 单次约 2 秒，2500 会让它卡在边缘（原来那档 2500 是配 0.6~0.9 秒的 `deepseek-chat` 用的）
 decision_style = "aggressive"  # 决策档位：conservative / normal / aggressive（也认 保守/平常/激进）；只改提示词，不用重编译 exe
-training_model = ""  # 【训练功能】读卡文推 combo、写脚本、复盘、写结论用哪只。⚠ 要填**不思考**的（如 deepseek-chat）：宿主对插件的单次模型调用有 30 秒硬超时（cap.call），会思考的模型（本机的 `ds`/`deepseekV4.1flash`）光"想"就超时；留空＝跟 utils 走
+training_model = ""  # 【训练功能】读卡文推 combo、写脚本、复盘、写结论用哪只。⚠ 要填**不思考**的（本机用 `deepseek-flash`，即模型条目里 thinking = disabled 的那条）：宿主对插件的单次模型调用有 30 秒硬超时（cap.call），会思考的模型（本机的 `ds`/`deepseekV4.1flash`）光"想"就超时；留空＝跟 utils 走
 training_timeout_ms = 25000  # 【训练功能】单次等模型的上限（毫秒）。**给不大**：宿主那侧 30 秒就断（cap.call），给 120000 也无效；给 25 秒是为了让失败由插件先发现，并在记录里说清"是模型太慢、该换哪只"
 training_script_max_tokens = 4096  # 【写脚本】一次让模型写多少 token（默认 4096）。脚本是分批写的（每批 8 张卡的处理函数、一次调用一批），所以这个数决定"一批能写多细"，不是整份脚本的长度上限（总长＝批数 × 每批）。想更细可以调大，但**别超 8000**：宿主对插件单次调用有 30 秒硬超时，写不完整批白写
 

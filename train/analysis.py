@@ -50,7 +50,7 @@ _FAILURE_HINTS: Tuple[Tuple[str, str], ...] = (
     (
         "cap.call",
         "宿主对插件的单次模型调用有 30 秒硬超时（插件改不了）："
-        "训练模型请填一只**不思考**的（如 deepseek-chat；`ds` / `deepseekV4.1flash` 这类会思考的会撞上）",
+        "训练模型请填一只**不思考**的（本机是 `deepseek-flash`；`ds` / `deepseekV4.1flash` 这类会思考的会撞上）",
     ),
     (
         "空内容",
