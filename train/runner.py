@@ -163,15 +163,21 @@ class TrainingRunner:
         return self._task is not None and not self._task.done()
 
     def active(self) -> Optional[Dict[str, Any]]:
-        """当前任务的一行摘要（面板用；没有就是 None）。"""
+        """**正在跑**的那个任务的一行摘要（面板用；没有就是 None）。
 
-        if not self._run_id:
+        ⚠ 这里必须同时判 `busy`：面板拿 `active` 决定"开始按钮能不能点"与要不要继续轮询，
+        而 `_run_id` 在正常跑完之后**不会**被清掉（只有 stop/stop_now 清）。只看 `_run_id`
+        的话，跑完的任务会一直占着这个位置——面板上那条"正在跑"的气泡与「有任务在跑」的
+        禁用状态永远挂着，用户下一件事就点不动了。跑完的记录照旧在历史列表里。
+        """
+
+        if not self._run_id or not self.busy:
             return None
         run = self.store.get(self._run_id)
         if run is None:
             return None
         payload = run.to_dict()
-        payload["live"] = self.busy
+        payload["live"] = True
         if run.log_path:
             payload["tail"] = tail_lines(run.log_path, PANEL_TAIL_LINES)
         return payload

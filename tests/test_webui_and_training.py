@@ -836,6 +836,32 @@ async def _write_script_record_says_how_much_it_wrote() -> None:
         assert saved.summary["warnings"] == ["这些卡没写出处理函数，只登记了通用行为：某卡（9）"]
 
 
+async def _active_reports_only_a_running_task() -> None:
+    """面板靠 `active()` 判断"有没有任务在跑"：**跑完的任务不能一直占着它**。
+
+    这条是 bug 的回归测试：`active()` 原来只看 `_run_id`，而正常跑完不会清它（只有 stop 才清），
+    于是跑完之后面板上那条"正在跑"的气泡与「有任务在跑」的禁用状态永远挂着——
+    用户跑完一件事就再也点不动下一件。跑完的记录必须照旧留在历史里。
+    """
+
+    store_module = _load("train.store")
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        store = store_module.TrainingStore(tmp / "training.db")
+        runner = _make_runner(tmp, store)
+        run = store.create("arena", "测试任务", {}, tmp / "a.log")
+        runner._run_id = run.run_id
+        assert runner.active() is None, "没有任务在跑时不该报 active"
+
+        running = asyncio.create_task(asyncio.sleep(0.2))
+        runner._task = running
+        payload = runner.active()
+        assert payload is not None and payload["live"] is True, payload
+        await running
+        assert runner.active() is None, "跑完的任务不该继续占着 active（面板会一直禁用开始按钮）"
+        assert store.get(run.run_id) is not None, "记录照旧在历史里"
+
+
 async def _arena_refused_while_room_is_active() -> None:
     """房间里有人在打时不许起擂台（会再拉一套内核与两个 WindBot，把真人那局打坏）。"""
 
@@ -1179,6 +1205,7 @@ def main() -> int:
         _script_tokens_and_iteration_prompts_come_from_config,
         _write_script_record_says_how_much_it_wrote,
         _unknown_deck_is_refused_before_a_record_exists,
+        _active_reports_only_a_running_task,
         _arena_refused_while_room_is_active,
         _arena_needs_two_different_styles,
         _subprocess_run_writes_log_and_stops,
