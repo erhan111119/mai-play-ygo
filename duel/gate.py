@@ -39,6 +39,7 @@ from .protocol import (
     parse_join_game_version,
     parse_player_enter,
     parse_player_info_name,
+    parse_stoc_error,
     parse_type_change,
 )
 
@@ -46,6 +47,11 @@ from .protocol import (
 # 连接角色
 ROLE_BOT = "bot"
 ROLE_HUMAN = "human"
+
+# ``STOC_ERROR_MSG`` 的消息号：内核不收这副卡组（WindBot 的 ``OnErrorMsg`` 里写的
+# ``ERRMSG_DECKERROR``）。实测张数超过内核上限时就是这个，随后内核断开这条连接、
+# WindBot 静默退出——所以这条报文是"房间起不来"的唯一线索，必须记下来。
+_ERRMSG_DECKERROR = 2
 
 # 透传时单次读取的字节数
 _READ_CHUNK = 65536
@@ -336,6 +342,18 @@ class DuelGate:
                 if not self._duel_finished:
                     self._duel_finished = True
                     self._emit("duel_ended", {"port": self._listening_port})
+            elif message_id == Stoc.ERROR_MSG:
+                msg, pcode = parse_stoc_error(frame.payload)
+                if msg == _ERRMSG_DECKERROR:
+                    # 内核不收这个客户端注册的卡组：它接着就会断开这条连接（bot 那侧是静默退出，
+                    # 日志里什么都看不到），所以这里必须自己记一条，会话那边才能说出原因。
+                    self._logger.warning(
+                        "内核拒收了 %s 的卡组（DECKERROR，附带码 0x%08x）", client.describe(), pcode
+                    )
+                    self._emit(
+                        "deck_error",
+                        {"client": client.describe(), "role": client.role, "pcode": pcode},
+                    )
         except ProtocolError as exc:
             self._logger.warning("状态报文解析失败：%s", exc)
 

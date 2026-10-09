@@ -25,6 +25,7 @@ import secrets
 import time
 
 from .cards import CardDatabase
+from .deckcode import DeckCodeError, DeckUnplayableError, describe_room_limits, parse_deck_code
 from .deckpool import StoredDeck
 from .gate import ROLE_BOT, DuelGate
 from .netutil import format_endpoint
@@ -202,6 +203,11 @@ class DuelSession:
         self._info: Optional[SessionInfo] = None
         self._finished = asyncio.Event()
         self._started_at = 0.0
+        # bot 的连接在开局前就没了（对局没开始）时置位：这时候房间再等下去也不会有结果，
+        # `wait_finished` 要据此报"出错"而不是"打完了"
+        self._bot_lost_before_start = False
+        # 内核回过的卡组错误（由闸门观测到后转进来），用来解释 bot 为什么退出
+        self._deck_error = ""
         self._taunt_picker = TauntPicker(config.taunt_lines or None)
         self._taunt_task: Optional[asyncio.Task[None]] = None
         self._taunt_count = 0
@@ -240,9 +246,47 @@ class DuelSession:
 
         return self._deck
 
-    async def start(self, *, password: str = "") -> SessionInfo:
-        """起房间、起闸门、把 bot 放进去，返回给群友的连接信息。"""
+    def _ensure_bot_deck_playable(self) -> None:
+        """开房前核一遍 bot 这一局实际要用的 ``.ydk``。
 
+        WindBot 读的是 ``DeckFile``（配置里指定或抽中卡组的存档）；没给就是它自带卡组，
+        没有文件可读，不用核（自带卡组都是常规张数）。
+
+        **张数直接从文件现算**，不用卡组记录里的 ``main_count``：``.ydk`` 是活的（改文件即生效），
+        记录里那个数可能是导入时的旧值。
+
+        Raises:
+            DeckUnplayableError: 卡表读不到、解析不了，或踩到 `duel.deckcode.describe_room_limits`
+                里的硬限制。
+        """
+
+        path = self._config.bot_deck_file or (self._deck.ydk_path if self._deck is not None else None)
+        if path is None:
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise DeckUnplayableError(f"读不到 bot 的卡表 {path}：{exc}") from exc
+        try:
+            deck = parse_deck_code(text)
+        except DeckCodeError as exc:
+            raise DeckUnplayableError(f"bot 的卡表 {path} 解析不了：{exc}") from exc
+        issue = describe_room_limits(deck)
+        if issue:
+            label = self._deck.display_name if self._deck is not None else Path(path).name
+            raise DeckUnplayableError(f"「{label}」{issue}（卡表：{path}）")
+
+    async def start(self, *, password: str = "") -> SessionInfo:
+        """起房间、起闸门、把 bot 放进去，返回给群友的连接信息。
+
+        开房之前先核 bot 这副牌（见 :meth:`_ensure_bot_deck_playable`）：踩到硬限制的卡组要
+        在这里就拦住。内核遇到不接受的卡组只会回一条 ``STOC_ERROR_MSG`` 然后把 bot 踢出去，
+        而 WindBot 对这条是静默退出——群里只会看到"房间开好了但 bot 进不去"，一句提示都没有
+        （2026-10-10 用户报障）；超过 60 张的卡组更隐蔽：房间照常开、对局照常打，
+        只是多出来的牌根本没进卡组。
+        """
+
+        self._ensure_bot_deck_playable()
         room_password = password or generate_password()
         bot_password = generate_password(10)
         self._started_at = time.time()
@@ -409,7 +453,8 @@ class DuelSession:
             deadline = hard_deadline if human_seen else min(join_deadline, hard_deadline)
             try:
                 await asyncio.wait_for(self._finished.wait(), timeout=max(deadline - now, 0.1))
-                return OUTCOME_FINISHED
+                # 开局前 bot 就没了（见 `_on_gate_status`）：这局根本没打起来，不能报"打完了"
+                return OUTCOME_ERROR if self._bot_lost_before_start else OUTCOME_FINISHED
             except asyncio.TimeoutError:
                 continue
 
@@ -490,15 +535,27 @@ class DuelSession:
     def _on_gate_status(self, event: str, payload: Dict[str, object]) -> None:
         """闸门状态回调：对局结束时唤醒等待方，并把事件透传给插件。"""
 
-        if event == "duel_ended":
+        if event == "deck_error":
+            # 内核拒收了某个客户端的卡组（闸门已经把原因写进日志）。要是拒的是 bot 自己，
+            # 它随后就会静默退出——下面 `client_left` 那条负责收摊，这里只把原因记下来。
+            self._deck_error = f"内核拒收卡组（DECKERROR，附带码 0x{int(payload.get('pcode') or 0):08x}）"
+            self._logger.warning("本局 %s；%s 会被踢出房间", self._deck_error, payload.get("client"))
+        elif event == "duel_ended":
             self._finished.set()
-        elif event == "client_left" and payload.get("role") == ROLE_BOT and self._recorder.started:
+        elif event == "client_left" and payload.get("role") == ROLE_BOT:
             # bot 进程掉了，对局不可能继续，直接收摊。对局已经结束时这只是正常收尾
             # （WindBot 打完就退），训练时一局一条会很吵，所以分级别。
             if self._recorder.finished:
                 self._logger.debug("bot 已离场（对局已结束）")
-            else:
+            elif self._recorder.started:
                 self._logger.warning("bot 连接已断开，提前结束本局")
+            else:
+                # 对局还没开始 bot 就没了：内核拒收它的卡组时就是这个样子（WindBot 静默退出）。
+                # 房间再等下去也不会有结果，按出错收摊，别让群里的人对着一个空房间干等。
+                self._bot_lost_before_start = True
+                self._logger.warning(
+                    "bot 在开局前就退出了，对局起不来%s", f"：{self._deck_error}" if self._deck_error else ""
+                )
             self._finished.set()
         if self._config.on_status is not None:
             self._config.on_status(event, payload)

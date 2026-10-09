@@ -793,6 +793,20 @@ def encode_chat_payload(text: str) -> bytes:
     return text.encode("utf-16-le") + b"\x00\x00"
 
 
+def parse_stoc_error(payload: bytes) -> Tuple[int, int]:
+    """解析 ``STOC_ERROR_MSG``，返回 ``(消息号, 附带码)``。
+
+    布局与 WindBot 的 ``Game/GameBehavior.cs::OnErrorMsg`` 一致：1 字节消息号 + 3 字节对齐
+    + int32 附带码。``消息号 == 2``（``ERRMSG_DECKERROR``）表示内核不收这副卡组，此时附带码
+    带的是出问题的那张卡（或张数）的信息——实测"张数超上限"时这个值为 0。
+    """
+
+    _require(payload, 8, Stoc.ERROR_MSG)
+    msg = payload[0]
+    pcode = struct.unpack_from("<i", payload, 4)[0]
+    return msg, pcode
+
+
 def parse_type_change(payload: bytes) -> tuple:
     """解析 ``STOC_TYPE_CHANGE``，返回 ``(座位号, 是否房主)``。
 

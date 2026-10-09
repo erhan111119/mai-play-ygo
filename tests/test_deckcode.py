@@ -17,12 +17,14 @@ if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
 from duel.deckcode import (  # noqa: E402  导入顺序受 sys.path 补丁影响
+    DUEL_MAIN_MAX,
     FORMAT_OURYGO,
     FORMAT_RAW,
     FORMAT_YDK,
     Deck,
     DeckCodeError,
     describe_issues,
+    describe_room_limits,
     detect_format,
     parse_deck_code,
 )
@@ -204,6 +206,36 @@ def test_describe_issues_reports_limits() -> None:
     assert any("超过 3 张" in issue for issue in describe_issues(too_many_copies))
 
     assert describe_issues(Deck(tuple(SAMPLE_MAIN), tuple(SAMPLE_EXTRA), tuple(SAMPLE_SIDE))) == []
+
+
+def test_room_limits_boundary() -> None:
+    """开房前的硬限制：主卡组 60 张是边界（实测 >60 时对局只放 60 张进卡组）。
+
+    边界写成测试是为了它被改动时立刻有反馈：拦松了会开出一个"多出来的牌白带"或"bot 进不去"
+    的房间，拦紧了会把能打的娱乐牌挡在门外（同名张数**不在**这里的规则里——"赖皮卡组"
+    那种 5 张同名是要能打的）。
+    """
+
+    at_limit = Deck(tuple(range(100000000, 100000000 + DUEL_MAIN_MAX)), (), ())
+    assert describe_room_limits(at_limit) is None
+
+    over_limit = Deck(tuple(range(100000000, 100000000 + DUEL_MAIN_MAX + 1)), (), ())
+    issue = describe_room_limits(over_limit)
+    assert issue is not None and "主卡组" in issue and "60" in issue, issue
+
+    # 同名 10 张不在这里拦（投稿规则才会拦）
+    duplicates = Deck((89631139,) * DUEL_MAIN_MAX, (), ())
+    assert describe_room_limits(duplicates) is None
+
+    # 额外/副卡组超 15 张：WindBot 会丢掉整副卡组
+    extra_over = Deck(tuple(range(100000000, 100000040)), tuple(range(200000000, 200000016)), ())
+    extra_issue = describe_room_limits(extra_over)
+    assert extra_issue is not None and "额外卡组" in extra_issue, extra_issue
+    side_over = Deck(
+        tuple(range(100000000, 100000040)), (), tuple(range(200000000, 200000016))
+    )
+    side_issue = describe_room_limits(side_over)
+    assert side_issue is not None and "副卡组" in side_issue, side_issue
 
 
 def test_main_kinds_and_card_count() -> None:

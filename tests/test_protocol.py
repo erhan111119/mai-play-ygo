@@ -31,6 +31,7 @@ from duel.protocol import (  # noqa: E402  导入顺序受 sys.path 补丁影响
     parse_join_game_version,
     parse_player_enter,
     parse_player_info_name,
+    parse_stoc_error,
     parse_type_change,
 )
 
@@ -287,6 +288,30 @@ def test_handshake_field_layouts() -> None:
     assert parse_type_change(bytes([0x02])) == (2, False)
     assert parse_type_change(bytes([0x10])) == (0, True)
     assert parse_type_change(bytes([0x11])) == (1, True)
+
+
+def test_stoc_error_layout() -> None:
+    """STOC_ERROR_MSG 是 1 字节消息号 + 3 字节对齐 + int32 附带码。
+
+    消息号 2（DECKERROR）是"内核不收这副卡组"的唯一线索：实测张数超上限时收到的就是它，
+    附带码为 0。布局按 WindBot 的 ``OnErrorMsg`` 写，所以这里也照那 8 字节验一遍。
+    """
+
+    payload = bytes([2]) + b"\x00\x00\x00" + struct.pack("<i", 0)
+    assert parse_stoc_error(payload) == (2, 0)
+
+    # 附带卡号的情形（高 4 位是类别标志，低 28 位是卡号）
+    card_payload = bytes([2]) + b"\x00\x00\x00" + struct.pack("<i", 0x10000000 | 89631139)
+    msg, pcode = parse_stoc_error(card_payload)
+    assert msg == 2
+    assert pcode & 0xFFFFFFF == 89631139
+
+    try:
+        parse_stoc_error(bytes([2]) + b"\x00" * 6)
+    except ProtocolError:
+        pass
+    else:
+        raise AssertionError("不足 8 字节的 ERROR_MSG 本应报错")
 
 
 def test_player_enter_layout() -> None:

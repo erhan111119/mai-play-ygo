@@ -20,7 +20,9 @@ _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
+from duel.deckcode import DeckUnplayableError  # noqa: E402  导入顺序受 sys.path 补丁影响
 from duel.session import (  # noqa: E402  导入顺序受 sys.path 补丁影响
+    OUTCOME_ERROR,
     OUTCOME_FINISHED,
     OUTCOME_NO_PLAYER,
     OUTCOME_TIMEOUT,
@@ -66,7 +68,12 @@ class FakeRoom:
             raise RuntimeError("模拟关闭失败")
 
 
-def make_session(*, join_timeout: float = 5.0, max_duration: float = 30.0) -> DuelSession:
+def make_session(
+    *,
+    join_timeout: float = 5.0,
+    max_duration: float = 30.0,
+    bot_deck_file: Optional[Path] = None,
+) -> DuelSession:
     """造一个不启动真进程的会话，房间与闸门都用替身。"""
 
     config = SessionConfig(
@@ -76,11 +83,24 @@ def make_session(*, join_timeout: float = 5.0, max_duration: float = 30.0) -> Du
         windbot_dir=Path("."),
         join_timeout=join_timeout,
         max_duration=max_duration,
+        bot_deck_file=bot_deck_file,
     )
     session = DuelSession(config, group_id="111", human_name_hint="群友A")
     session._room = FakeRoom()  # type: ignore[assignment]  测试里用替身替换真实进程
     session._gate = FakeGate()  # type: ignore[assignment]
     return session
+
+
+def write_ydk(path: Path, main: int, extra: int = 0, side: int = 0) -> Path:
+    """写一副只关心张数的卡表（卡号随便，只有张数参与校验）。"""
+
+    lines = ["#main"] + [str(100000000 + index) for index in range(main)]
+    if extra:
+        lines += ["#extra"] + [str(200000000 + index) for index in range(extra)]
+    if side:
+        lines += ["!side"] + [str(300000000 + index) for index in range(side)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
 
 
 def test_generate_password_alphabet_and_length() -> None:
@@ -228,6 +248,43 @@ async def test_bot_disconnect_ends_duel_early() -> None:
     outcome = await asyncio.wait_for(session.wait_finished(), timeout=3.0)
     await task
     assert outcome == OUTCOME_FINISHED
+
+
+async def test_start_refuses_oversized_bot_deck(tmp_path: Path) -> None:
+    """超过对局上限的卡组要在开房前拦下（用户报障：1000 张灰流丽那副开出来的是个死房间）。
+
+    这里刻意让 `ygopro.exe` 路径不存在：抛出的如果是 DeckUnplayableError，就证明校验
+    发生在起进程之前——否则先撞上的会是 ProcessError（找不到可执行文件）。
+    """
+
+    deck_file = write_ydk(tmp_path / "too-big.ydk", main=1000)
+    session = make_session(bot_deck_file=deck_file)
+    try:
+        await session.start()
+    except DeckUnplayableError as exc:
+        assert "1000" in str(exc) and "60" in str(exc), exc
+    else:
+        raise AssertionError("超过对局上限的卡组本应被拒绝")
+
+
+def test_bot_deck_within_room_limits_passes(tmp_path: Path) -> None:
+    """常规张数的卡表要能过校验（拦多了会把能打的娱乐牌挡在门外）。"""
+
+    # 60 张主卡组 + 15 张额外 + 15 张副卡组：三条硬限制都踩在边界上，都应当放行
+    deck_file = write_ydk(tmp_path / "at-limit.ydk", main=60, extra=15, side=15)
+    session = make_session(bot_deck_file=deck_file)
+    session._ensure_bot_deck_playable()  # 不抛异常即为通过
+
+
+async def test_bot_left_before_duel_start_is_an_error() -> None:
+    """开局前 bot 就退出时不能报"打完了"：内核拒收卡组时就是这个现象。"""
+
+    session = make_session(join_timeout=5.0, max_duration=30.0)
+    session._gate = FakeGate(humans=[object()])  # type: ignore[assignment]
+    # 真实顺序：内核对卡组回 DECKERROR →（WindBot 静默退出）→ bot 那条连接断开
+    session._on_gate_status("deck_error", {"client": "机器人 憨憨", "role": "bot", "pcode": 0})
+    session._on_gate_status("client_left", {"role": "bot"})
+    assert await asyncio.wait_for(session.wait_finished(), timeout=3.0) == OUTCOME_ERROR
 
 
 async def test_stop_closes_everything_even_if_one_fails() -> None:

@@ -16,9 +16,22 @@
 格式 2 与格式 3 都是裸 base64，只能靠结构校验区分，因此 :func:`parse_deck_code`
 在两者同时成立时会标记 ``ambiguous``，由调用方决定是否提醒用户。
 
-另需注意 WindBot 的卡组装载行为：它在 ``Deck.Load`` 里只要主卡组超过 60 张、
-额外或副卡组超过 15 张，就会**直接丢弃整个卡组**并静默退化。所以本模块提供
-:func:`describe_issues`，在存档前就把不合法的卡组拦下来。
+另需注意卡组张数上有**三条**限制，出自三个不同的地方，混成一条就会得出错误结论
+（三条都是 2026-10-10 用 `tools/probe_deck_size.py` 实测的，那个工具能重新量）：
+
+1. **对局引擎**：一场对局实际用的主卡组**最多 60 张**。注册多少张它都收，但对局开场只把 60 张
+   放进卡组——注册 61 / 235 / 250 张时，内核发给客户端的分组报文里都写着"对局内主卡组 = 60"
+   （多出来的牌等于白带，WindBot 自己的卡组计数器还会因此一直报 mismatch）。
+2. **内核**（``clients/ygopro`` 的 ``ygopro.exe`` 服务端模式）：注册的卡组**主卡组+额外最多 250 张**，
+   超了当场回 ``STOC_ERROR_MSG``（``msg=2`` DECKERROR）并把 bot 踢出房间；而 WindBot 对这条
+   **静默退出**（它只在 DEBUG 构建里打日志）。群友看到的现象就是"房间开好了但 bot 进不去"。
+3. **WindBot** 的 ``Deck.Load``：主卡组 > 60、额外 > 15、副卡组 > 15 都**丢弃整副卡组**，
+   于是 bot 带着空卡组进房（随后是异常退出）。它的 60 与第 1 条同源，所以没必要去放行。
+
+:func:`describe_issues` 是**投稿路径**的规则（40~60 张、同名 ≤3，那是"像一副正常卡组"）；
+:func:`describe_room_limits` 是**开房前**的硬限制（只留三条里真正会炸的那些，不查同名张数——
+"赖皮卡组"那种 5 张同名是要能打的）。开房前拦一道比让内核把 bot 踢出去、群里对着一个
+没有 bot 的房间干等要好得多。
 """
 
 from __future__ import annotations
@@ -38,6 +51,11 @@ MAIN_MAX = 60
 EXTRA_MAX = 15
 SIDE_MAX = 15
 
+# 一场对局实际会用的主卡组上限（实测：注册 61/235/250 张时，内核发给客户的报文里都写着 60）。
+# 与 :data:`MAIN_MAX` 数值相同但含义不同：`MAIN_MAX` 是"投稿要像正常卡组"的规则，
+# 这里是"对局引擎真的只放这么多张"的事实。
+DUEL_MAIN_MAX = 60
+
 # 裸卡组码格式中卡 ID 占用的位数，以及 YDKE / 萌卡格式中卡 ID 的位数
 _RAW_ID_MASK = (1 << 28) - 1
 _YAO_ID_MASK = (1 << 27) - 1
@@ -54,6 +72,14 @@ FORMAT_RAW = "code"
 
 class DeckCodeError(ValueError):
     """卡组码无法解析时抛出。"""
+
+
+class DeckUnplayableError(RuntimeError):
+    """卡组本身能解析，但开局这一套跑不起来（内核收不下 / 卡表读不到）。
+
+    与 :class:`DeckCodeError` 分开：那个是"卡组码格式不对"，这个是"这副牌内核打不了"，
+    调用方对两者的处理完全不同（前者让群友重发卡组码，后者要去改池子里的卡表）。
+    """
 
 
 @dataclass(frozen=True)
@@ -423,6 +449,31 @@ def describe_issues(deck: Deck) -> List[str]:
         if over_limit:
             issues.append(f"{name}里有卡出现超过 3 张：{over_limit}")
     return issues
+
+
+def describe_room_limits(deck: Deck) -> Optional[str]:
+    """开房前的硬限制：卡组踩到其中一条就返回中文原因（都没踩返回 None）。
+
+    只留**真会炸**的三条，都与"同名几张"无关（那是投稿规则的事）：
+
+    * 主卡组 > :data:`DUEL_MAIN_MAX`：对局只放 60 张进卡组，多出来的牌等于白带；
+    * 额外 > :data:`EXTRA_MAX` / 副卡组 > :data:`SIDE_MAX`：WindBot 直接丢掉整副卡组，
+      bot 会带着空卡组进房然后异常退出。
+
+    主卡组+额外 > 250 那条（内核注册上限）不用单独查：上面两条成立时最多 75 张。
+    """
+
+    if len(deck.main) > DUEL_MAIN_MAX:
+        return (
+            f"主卡组 {len(deck.main)} 张，超过对局上限 {DUEL_MAIN_MAX} 张"
+            f"（内核注册最多能收 250 张，但对局开场只把 {DUEL_MAIN_MAX} 张放进卡组，"
+            f"多出来的牌打不出来）"
+        )
+    if len(deck.extra) > EXTRA_MAX:
+        return f"额外卡组 {len(deck.extra)} 张，超过 {EXTRA_MAX} 张——WindBot 会丢掉整副卡组"
+    if len(deck.side) > SIDE_MAX:
+        return f"副卡组 {len(deck.side)} 张，超过 {SIDE_MAX} 张——WindBot 会丢掉整副卡组"
+    return None
 
 
 def deck_summary(deck: Deck, *, card_lookup: Any = None) -> str:

@@ -204,6 +204,41 @@ async def test_bot_and_human_roles_and_observation() -> None:
         await backend.stop()
 
 
+async def test_kernel_deck_error_is_reported() -> None:
+    """内核拒收卡组的报文要被记下来并上报（否则"bot 进不去"完全没有线索）。
+
+    实测场景：卡组张数超过内核上限时，内核回 ``STOC_ERROR_MSG``（msg=2 DECKERROR）后断开
+    连接，WindBot 那边是静默退出——插件能看到的只有这条报文。
+    """
+
+    backend = FakeBackend()
+    await backend.start()
+    backend.outgoing.append(encode_frame(Stoc.ERROR_MSG, bytes([2]) + b"\x00\x00\x00" + struct.pack("<i", 0)))
+    events: List[Tuple[str, dict]] = []
+    gate = DuelGate(
+        backend_host="127.0.0.1",
+        backend_port=backend.port,
+        public_password="",
+        bot_password=BOT_PASSWORD,
+        on_status=lambda event, payload: events.append((event, payload)),
+    )
+    await gate.start(listen_host="127.0.0.1")
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", gate.listening_port)
+        writer.write(build_handshake("WindBot", BOT_PASSWORD))
+        await writer.drain()
+        await asyncio.sleep(0.2)
+
+        deck_errors = [payload for event, payload in events if event == "deck_error"]
+        assert len(deck_errors) == 1, events
+        assert deck_errors[0]["role"] == ROLE_BOT
+        assert deck_errors[0]["pcode"] == 0
+        writer.close()
+    finally:
+        await gate.stop()
+        await backend.stop()
+
+
 async def test_open_room_accepts_any_password() -> None:
     """没配公开口令时按玩家放行，方便本机做可行性实验。"""
 
