@@ -2401,7 +2401,10 @@ function runExchange(run){
     : summary.style_name ? `出牌脚本 ${esc(summary.style_name)} 已编译通过（第 ${esc(summary.attempts || "?")} 轮）。`
     : summary.exit_code === 0 ? "跑完了（点开看输出尾巴）。"
     : (run.error ? esc(String(run.error)) : "（没有输出）");
-  const reply = [resultText, conclusion || (resultText ? "" : fallback)].filter(Boolean).join("\n\n");
+  // ⚠ 这段 JS 是**被 Python 字符串求值**过的：JS 里的换行转义必须写成 \\n（源码里两个反斜杠），
+  //   写成单个反斜杠会被 Python 先吃成真换行——JS 字符串不能跨行，整页脚本当场语法错误、
+  //   面板"载入不进去"（2026-10-09 就这么线上炸过一次）。
+  const reply = [resultText, conclusion || (resultText ? "" : fallback)].filter(Boolean).join("\\n\\n");
   // 失败原因（编译器输出、日志尾巴）经常很长：对话流里折起来，详情抽屉里看全文
   const replyHtml = reply.length > 400
     ? `<details class="long"><summary>展开详情（${esc(reply.length)} 字）</summary><div class="txt">${reply}</div></details>`

@@ -27,6 +27,7 @@ import asyncio
 import http.client
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -1032,6 +1033,84 @@ async def _review_apply_writes_backup_and_rolls_back_when_build_fails() -> None:
             runner_module.build_windbot = original_build  # type: ignore[attr-defined]
 
 
+
+def _first_line_stuck_in_string(script: str) -> Optional[int]:
+    """扫一遍 JS，返回第一处"这一行结束时还停在单/双引号字符串里"的行号。
+
+    模板串（反引号）允许跨行，所以不算；`//` 行注释与 `/* */` 块注释跳过。
+    这个检查专治一类**Python 看不出来的错**：页面里的 JS 是被 Python 字符串求值过的，
+    JS 想写 `\n` 就得在源码里写两个反斜杠；写成一个会被 Python 先吃成真换行，
+    JS 字符串跨行 → 整页脚本语法错误（面板"载入不进去"）。
+    """
+
+    in_single = in_double = in_template = in_block_comment = escaped = False
+    previous = ""
+    for line_no, line in enumerate(script.splitlines(), start=1):
+        index = 0
+        while index < len(line):
+            char = line[index]
+            nxt = line[index + 1] if index + 1 < len(line) else ""
+            if in_block_comment:
+                if char == "*" and nxt == "/":
+                    in_block_comment = False
+                    index += 2
+                    continue
+            elif escaped:
+                escaped = False
+            elif in_single:
+                if char == "\\":
+                    escaped = True
+                elif char == "'":
+                    in_single = False
+            elif in_double:
+                if char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_double = False
+            elif in_template:
+                if char == "\\":
+                    escaped = True
+                elif char == "`":
+                    in_template = False
+            else:
+                if char == "/" and nxt == "/":
+                    break                      # 行注释：这一行余下不用看
+                if char == "/" and nxt == "*":
+                    in_block_comment = True
+                    index += 2
+                    continue
+                if char == "/" and (previous == "" or previous in "(,=:[!&|?{};+-*%~^"):
+                    # 正则字面量（`/[&<>"']/g` 这种）：里面的引号不算字符串，跳到它结尾
+                    index += 1
+                    in_class = False
+                    while index < len(line):
+                        inner = line[index]
+                        if inner == "\\":
+                            index += 2
+                            continue
+                        if inner == "[":
+                            in_class = True
+                        elif inner == "]":
+                            in_class = False
+                        elif inner == "/" and not in_class:
+                            break
+                        index += 1
+                    previous = "/"
+                    index += 1
+                    continue
+                if char == "'":
+                    in_single = True
+                elif char == '"':
+                    in_double = True
+                elif char == "`":
+                    in_template = True
+            if not char.isspace():
+                previous = char
+            index += 1
+        if in_single or in_double:
+            return line_no
+    return None
+
 def test_duel_page_slots_hide_stats_outside_monster_zones_and_show_face_down() -> None:
     """对局页的格子：**只有怪兽区**给攻守；**盖卡必须画出来**（用户报的两条）。
 
@@ -1075,6 +1154,31 @@ def test_duel_page_slots_hide_stats_outside_monster_zones_and_show_face_down() -
     # ④ 空格才是 None
     assert webui._slot_json(None, names=names, details=details, monster_zone=True) is None
 
+
+
+def test_page_js_has_no_bare_newline_inside_strings() -> None:
+    """面板的 JS 不许出现"行尾停在字符串里"——那说明转义被 Python 吃掉了。
+
+    回归测试（2026-10-09 线上炸过）：`join("
+
+")` 在源码里写成单反斜杠 →
+    Python 求值成真换行 → JS 字符串跨行 → **整个面板脚本语法错误、载入不进去**。
+    Python 自己的语法检查完全看不出这类错，所以这里对**求值后**的页面做一次扫描。
+    """
+
+    webui = _load("webui")
+    page = webui._app_page()
+    scripts = re.findall(r"<script[^>]*>(.*?)</script>", page, re.S)
+    assert scripts, "页面里应该有内联脚本"
+    for script in scripts:
+        stuck = _first_line_stuck_in_string(script)
+        assert stuck is None, f"JS 第 {stuck} 行结束时还停在字符串里（多半是转义被 Python 吃掉了）"
+    # 顺带钉住那条具体写法：求值后必须是字面量的「反斜杠 + n」，不是真换行。
+    # 锚在 `const reply = [resultText` 那句上：页面里另有一处 `.filter(...).join("　")`，
+    # 直接找 join 会抓错地方（第一版就是这么误报的）。
+    reply_line = page[page.index("const reply = [resultText") :][:220]
+    piece = reply_line[reply_line.index('.join("') + len('.join("') :][:4]
+    assert piece == "\\n\\n", f"求值后应当是字面量（反斜杠 + n）两遍，实际是 {piece!r}"
 
 def test_training_tasks_end_with_a_plain_text_result() -> None:
     """四类训练任务结束时都要落一段**明文结果**（用户口径："结束后给我一个明文的结果"）。
@@ -2158,6 +2262,7 @@ def main() -> int:
         test_training_composer_keeps_the_kind_fields_on_screen,
         test_kill_tree_uses_taskkill_with_tree_flag,
         test_duel_page_slots_hide_stats_outside_monster_zones_and_show_face_down,
+        test_page_js_has_no_bare_newline_inside_strings,
         test_training_tasks_end_with_a_plain_text_result,
         test_deck_digest_and_combo_check_catch_cards_outside_the_deck,
         test_combo_tolerates_non_json_reply_but_says_so,
