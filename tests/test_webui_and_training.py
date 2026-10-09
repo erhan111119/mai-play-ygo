@@ -1156,6 +1156,45 @@ def test_duel_page_slots_hide_stats_outside_monster_zones_and_show_face_down() -
 
 
 
+def test_smoke_note_reads_load_and_progress() -> None:
+    """写完脚本的自检判读：**脚本真的上场了**（执行器核对）**且对局在推进**（回合数）。
+
+    为什么要这条：WindBot 对"Deck 名字没注册"不报错，会静默换一个通用执行器顶上——
+    对局照打、看着正常，但打出来的不是这副牌的脚本。用户口径："你确定编译的脚本有基础的运作吗，
+    或者说真的可以打吗"。所以自检必须同时看"核对通过"和"回合 > 0"，缺一条就不算通过。
+    """
+
+    runner = _load("train.runner")
+    good = "\n".join(
+        [
+            "A = Gen107（日志名 AI_Gen107）｜B = Test（日志名 AI_Test）",
+            "[1/2] A 在 bot     ｜胜者=A      ｜回合=7｜   9s｜✔ A侧['AI_Gen107'] B侧['AI_Test']",
+            "[2/2] A 在 opponent｜胜者=B      ｜回合=4｜   6s｜✔ A侧['AI_Gen107'] B侧['AI_Test']",
+            "================ 汇总 ================",
+            "局数：2",
+            "Gen107 赢：1",
+            "Test 赢：1",
+            "两侧脚本核对不通过的局数：0",
+        ]
+    )
+    ok, note = runner.smoke_note(good, "Gen107")
+    assert ok and "7 回合" in note and "Gen107 1 : Test 1" in note, note
+
+    # 脚本没上场（A 侧看到的是通用执行器）→ 不通过，且要把它看到的名字说出来
+    swapped = good.replace("AI_Gen107", "AI_Test").replace("不通过的局数：0", "不通过的局数：2")
+    ok2, note2 = runner.smoke_note(swapped, "Gen107")
+    assert not ok2 and "没上场" in note2, note2
+
+    # 上场了但一步没动（回合全是 0）→ 也不算通过
+    stuck = good.replace("回合=7", "回合=0").replace("回合=4", "回合=0")
+    ok3, note3 = runner.smoke_note(stuck, "Gen107")
+    assert not ok3 and "一步没推进" in note3, note3
+
+    # 输出里根本没有核对行（工具没跑起来）→ 不通过，并指出
+    ok4, note4 = runner.smoke_note("（工具没输出）", "Gen107")
+    assert not ok4 and "没有执行器核对行" in note4, note4
+
+
 def test_page_js_has_no_bare_newline_inside_strings() -> None:
     """面板的 JS 不许出现"行尾停在字符串里"——那说明转义被 Python 吃掉了。
 
@@ -2263,6 +2302,7 @@ def main() -> int:
         test_kill_tree_uses_taskkill_with_tree_flag,
         test_duel_page_slots_hide_stats_outside_monster_zones_and_show_face_down,
         test_page_js_has_no_bare_newline_inside_strings,
+        test_smoke_note_reads_load_and_progress,
         test_training_tasks_end_with_a_plain_text_result,
         test_deck_digest_and_combo_check_catch_cards_outside_the_deck,
         test_combo_tolerates_non_json_reply_but_says_so,

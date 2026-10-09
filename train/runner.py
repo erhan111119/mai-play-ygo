@@ -707,6 +707,10 @@ class TrainingRunner:
         if self._record_script is not None:
             # 不写回池子的话，刚写好的脚本不会被对局用上——那就白写了
             self._record_script(int(params.get("deck_id") or 0), script.style_name)
+        # **编译通过 ≠ 能打**：WindBot 对"Deck 名字没注册"不报错，会静默换一个通用执行器顶上
+        #（打法不对，但看着在打）。所以写完紧接着用同一份卡表跟通用脚本对打两局自检——
+        # 这一步才是"这份脚本真的上场了没有、能不能推进"的证据。
+        smoke = await self._smoke_check(params, script.style_name)
         # 编译产物在**源码树根**下的 bin/Release/：脚本文件躺在 <根>/Game/AI/Decks/ 里，
         # 所以得往上数四级才是根（数少一级就永远拿不到 mtime，面板上"exe 什么时候编的"一直是 0）
         exe = Path(script.file_path).parents[3] / "bin" / "Release" / "WindBot.exe"
@@ -730,6 +734,8 @@ class TrainingRunner:
             # 检索 agent 那一路：最多几轮、实际查了什么（复盘时要看"资料是怎么来的"）
             "research_rounds": int(getattr(self, "_search_rounds", 0) or 0),
             "research_queries": list(getattr(self, "_research_queries", []) or []),
+            # 写完就打两局的自检结果（脚本真的上场了吗、能不能推进）
+            "smoke": smoke,
         }
         # 明文结果（面板那一行直接显示它，不用点开详情）
         summary["result_text"] = write_script_result_text(summary)
@@ -1035,6 +1041,55 @@ class TrainingRunner:
                 "result_text": iterate_result_text(history, baseline),
             },
         )
+
+    async def _smoke_check(self, params: Dict[str, Any], style: str) -> Dict[str, Any]:
+        """写完脚本后**真打两局**自检：这份脚本上场了吗、能不能推进。
+
+        为什么必须有这一步：`dotnet build` 通过只证明 C# 语法没问题。WindBot 对"Deck 名字不在
+        注册表里"**不报错**——它会静默换一个通用执行器顶上（对局照打，但打出来的不是这副牌的
+        脚本）。用户口径："你确定编译的脚本有基础的运作吗，或者说真的可以打吗"。
+
+        做法：拿同一份卡表，A 侧用刚写好的脚本、B 侧用通用脚本打 `SMOKE_DUELS` 局，
+        读 `style_ab` 的"两侧脚本核对"（＝执行器真的加载了）与回合数（＝对局真的在推进）。
+
+        **失败/跳过都不影响写脚本任务成功**，但会如实写进 summary 与明文结果——不假装验过。
+        """
+
+        result: Dict[str, Any] = {"duels": SMOKE_DUELS, "ok": False, "note": ""}
+        deck_file = str(params.get("deck_file") or "")
+        tool = self.tools_dir / "style_ab.py"
+        if not deck_file or not Path(deck_file).is_file():
+            result["note"] = "没拿到卡表路径，跳过自检"
+            return result
+        if not tool.is_file():
+            result["note"] = "找不到 tools/style_ab.py，跳过自检"
+            return result
+        if self._active_rooms() > 0:
+            # 自检要再起一套内核 + 两个 WindBot：房间里有真人时绝不能抢资源
+            result["note"] = "有房间在打，自检跳过（等没人打的时候再点一次「编写脚本」就会补上）"
+            return result
+        argv = [
+            str(tool),
+            "--deck-file", deck_file,
+            "--style-a", style,
+            "--style-b", GENERIC_STYLE_NAME,
+            "--duels", str(SMOKE_DUELS),
+            "--max-duel-seconds", str(int(SMOKE_MAX_SECONDS)),
+        ]
+        log_path = self.log_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{int(params.get('deck_id') or 0)}-smoke.log"
+        try:
+            exit_code, tail = await self._spawn([sys.executable, "-u", *argv], log_path)
+        except Exception as exc:  # noqa: BLE001  自检失败不该把写脚本判成失败
+            result["note"] = f"自检没能跑起来：{exc}"
+            return result
+        result["exit_code"] = exit_code
+        result["log_path"] = str(log_path)
+        ok, note = smoke_note(tail, style)
+        result["ok"] = ok
+        result["note"] = note
+        if self.logger is not None:
+            self.logger.info("写完脚本的自检：%s（%s）", "通过" if ok else "没通过", note)
+        return result
 
     def _script_source(self, style: str) -> Tuple[str, str]:
         """找到这副牌**当前在用的出牌脚本源码**，返回 ``(来源说明, 正文)``（找不到给空串）。
@@ -1663,6 +1718,10 @@ def _patch_report(
     return "\n".join(lines)
 
 
+#: 写完脚本后的自检：打几局、每局最多等多久。两局够看出"脚本上场了吗 + 能不能推进"。
+SMOKE_DUELS = 2
+SMOKE_MAX_SECONDS = 90.0
+
 #: 复盘提示词里"结构摘要 / 决策日志"两段的长度上限（材料总长要装得下模型的窗口，
 #: 而且宿主对插件的单次调用有 30 秒硬超时——输入越长同一只模型回得越慢）。
 DIGEST_LIMIT = 6000
@@ -1724,6 +1783,34 @@ PATCH>>>
 ================ D. 最近一局的决策日志（截断） ================
 {decision_log}
 """
+
+
+def smoke_note(output: str, style: str) -> Tuple[bool, str]:
+    """读 `style_ab` 的输出，判断"这份脚本真的上场了吗 + 对局有没有推进"。
+
+    两个判据都来自工具自己打的字：
+    * `A侧['AI_xxx']` / `两侧脚本核对不通过的局数：0` —— 执行器真的加载了
+      （WindBot 对没注册的 Deck 名**不报错**，会静默换通用执行器，所以必须核这一条）；
+    * `回合=N` —— 对局在推进（全是 0 就是没动起来）。
+    """
+
+    text = str(output or "")
+    seen = re.findall(r"A侧\[([^\]]*)\]", text)
+    style_seen = any(f"AI_{style}" in item for item in seen)
+    mismatch = _match_once(r"两侧脚本核对不通过的局数：(\d+)", text)
+    turns = [int(value) for value in re.findall(r"回合=(\d+)", text)]
+    max_turns = max(turns) if turns else 0
+    wins = re.findall(r"^(.+?) 赢：(\d+)\s*$", text, re.M)
+    score = ""
+    if len(wins) >= 2:
+        score = f"｜{wins[0][0]} {wins[0][1]} : {wins[1][0]} {wins[1][1]}"
+    if not seen and not mismatch:
+        return False, f"自检输出里没有执行器核对行（看 {output[-200:]!r}）"
+    if not style_seen or mismatch not in ("0", ""):
+        return False, f"自检发现脚本没上场（A 侧看到的是 {seen or '空'}，核对不通过 {mismatch or '?'} 局）"
+    if max_turns <= 0:
+        return False, "自检：脚本上场了但对局一步没推进（回合=0）"
+    return True, f"自检通过：脚本上场、对局推进到 {max_turns} 回合{score}"
 
 
 def _match_once(pattern: str, text: str) -> str:
@@ -1803,6 +1890,12 @@ def write_script_result_text(summary: Dict[str, Any]) -> str:
         parts.append(f"联网资料 {summary['research_chars']} 字（{queries} 次检索）")
     elif summary.get("research_model"):
         parts.append("联网资料没取到")
+    smoke = summary.get("smoke") or {}
+    if isinstance(smoke, dict) and smoke:
+        if smoke.get("ok"):
+            parts.append(str(smoke.get("note") or "自检通过"))
+        else:
+            parts.append("⚠ " + str(smoke.get("note") or "自检没通过"))
     warnings = list(summary.get("warnings") or [])
     if warnings:
         parts.append("⚠ " + "；".join(str(item)[:60] for item in warnings[:3]))

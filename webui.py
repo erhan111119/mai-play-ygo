@@ -744,6 +744,13 @@ class _PanelHandler(BaseHTTPRequestHandler):
                 runs = []
         kinds = runner.describe_kinds() if runner is not None else []
         active = runner.active() if runner is not None else None
+        # ⚠ **正在跑的那条要从 `runs` 里摘掉**：它本来就在 store 里（状态 running），
+        # 而面板会为 `runs` 各画一条、再为 `active` 画一条 → 同一条任务显示两遍
+        #（用户报："每次发消息会显示两次，只有跑完或者切换下一个项目才会回归正常"）。
+        # 摘掉之后"在跑"只剩带实时日志与停止按钮的那一条；跑完它自然回到 `runs` 里。
+        active_id = str((active or {}).get("run_id") or "")
+        if active_id:
+            runs = [item for item in runs if str(item.get("run_id") or "") != active_id]
         return {
             "ok": True,
             "enabled": bool(plugin.config.training.enabled),
@@ -2363,7 +2370,11 @@ async function loadTraining(){
   const active = d.active;
   ensureComposer(d, active);
 
-  const runs = (d.runs || []).slice().reverse();   // 对话流：旧的在上、新的在下
+  // ⚠ 正在跑的那条只画一次：服务端已经把它从 `runs` 里摘掉了，这里再兜一道
+  //（同一 run_id 同时出现在两边时，用户看到的就是"发一次显示两条"）
+  const activeId = String((active || {}).run_id || "");
+  const runs = (d.runs || []).filter(r => !activeId || String(r.run_id || "") !== activeId)
+    .slice().reverse();                          // 对话流：旧的在上、新的在下
   const stream = $("training-stream");
   const stick = nearBottom(stream);
   const blocks = runs.map(runExchange);
