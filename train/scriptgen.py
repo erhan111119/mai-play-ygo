@@ -136,7 +136,7 @@ namespace WindBot.Game.AI.Decks
   `Grave` `Removed` `Extra` `Overlay` `Onfield` `FieldZone` `PendulumZone`
   * ⚠ 墓区是 **`CardLocation.Grave`**——写成 `CardLocation.Graveyard` 就是编译错误（真机上连着 5 轮
     都被这一条卡住过；`Bot.HasInGraveyard(...)` 那种才是带 Graveyard 的名字）
-* `ClientCard` 常用成员（**只有这些**）：`Id`、`Alias`、`Attack`、`Defense`、`Level`、`Race`、`Attribute`、
+* `ClientCard` 常用成员（**只有这些**）：`Id`、`Alias`、`Name`、`Attack`、`Defense`、`Level`、`Race`、`Attribute`、
   `Controller`、`Location`、`LinkCount`、`IsCode(卡号)`、`IsMonster()`、`IsSpell()`、`IsTrap()`、
   `IsFaceup()`、`IsFacedown()`、`IsAttack()`、`IsDefense()`、`IsExtraCard()`、
   `HasType(CardType.xxx)`、`HasRace(CardRace.xxx)`、`HasAttribute(CardAttribute.xxx)`
@@ -151,6 +151,14 @@ namespace WindBot.Game.AI.Decks
   * ⚠ **不要发明方法名**：`c.IsPsychic()` / `c.IsLight()` / `c.IsSynchro()` 这类都不存在，写了就是编译错误
     （真机上连着两轮都栽在这一条）。速查表里没有的判断就用数值字段自己比较：
     "星级 4 以下"写 `c.Level <= 4`、"攻击力够不够"写 `c.Attack >= 2000`
+* ⚠ **不要发明辅助函数**：`IsYiJieCard(c)` / `Is本家(c)` / `CheckXxx(...)` 这种调用一律编译不过
+  （真机上连着两轮都栽在这一条，CS0103）。你**只写本批的处理函数**，没有别的地方定义辅助函数——
+  "是不是本家"就用 `c.Name.Contains("异解")`（`Name` 是 `ClientCard` 的字符串成员）或 `c.IsCode(卡号)`
+  写在函数体里。
+* ⚠ **这些集合只能 `foreach`**：`IList<ClientCard>` / `List<ClientCard>`（`Bot.GetMonsters()`、
+  `Bot.Hand`、`Enemy.GetMonsters()`、选择函数的候选参数等）**不要调** `FindAll` / `Where` / `Sort` /
+  `ConvertAll`（真机上写 `xxx.FindAll(...)` 直接 CS1061：`IList<ClientCard>` 没这个成员）。
+  筛选就自己 `foreach` + `if` 往 `var result = new List<ClientCard>();` 里塞。
 * 工具（执行器上的 `Util`，类型是 `AIUtil`）——**返回类型要看清，别把数值当卡用**：
   * `int Util.GetBestAttack(Bot)` / `int Util.GetBestAttack(Enemy)`：返回的是**攻击力数值**，不是卡
     （要找"场上攻击力最高的那只怪"自己写循环或 `Bot.GetMonsters().OrderByDescending(c => c.Attack).FirstOrDefault()`）
@@ -174,6 +182,62 @@ namespace WindBot.Game.AI.Decks
 
 class ScriptGenerationError(RuntimeError):
     """生成或编译出牌脚本失败。"""
+
+
+#: 编译报错 → "该提醒模型什么"的对照表。**只有实测栽过的才写进来**，每条都注明真机现象。
+#: 为什么要这张表：把 msbuild 的原文整段丢回去，模型经常照着原样再写一遍
+#: （真机上 `FindAll`、`IsYiJieCard` 各连着两轮报同一个错）；点出"错在哪个用法、该换成什么"
+#: 它才改得动。
+_COMPILE_HINTS: Tuple[Tuple[str, str], ...] = (
+    (
+        "CS1061",
+        "`IList<ClientCard>` 上没有这个方法——**不要用 `FindAll` / `Where` / `Sort` / `ConvertAll`**，"
+        "自己 `foreach` + `if` 往 `new List<ClientCard>()` 里筛。",
+    ),
+    (
+        "CS0103",
+        "用到了不存在的名字——**不许发明辅助函数**（`IsXxxCard()` 这类没有地方定义），"
+        "要反复用的判断就写在函数体里，或者直接用 `c.Name.Contains(\"前缀\")` / `c.IsCode(卡号)`。",
+    ),
+    (
+        "CardAttribute",
+        "`HasAttribute` 只接枚举值：写 `c.HasAttribute(CardAttribute.Light)`，**不能写数字**。",
+    ),
+    (
+        "CardRace",
+        "`HasRace` 只接枚举值：写 `c.HasRace(CardRace.Psycho)`，**不能写数字**（念动力是 `Psycho`）。",
+    ),
+    (
+        "CardType",
+        "`HasType` 只接枚举值：写 `c.HasType(CardType.Synchro)`，**不能写数字**。",
+    ),
+    (
+        "CS1503",
+        "传参类型不对：`AI.SelectCard(...)` 只接**卡号(int)**、**`ClientCard`** 或 **`IList<ClientCard>`**；"
+        "`AI.SelectPlace(...)` 接 `Zones.` 常量；别把列表/型号混着传。",
+    ),
+    (
+        "CS0117",
+        "用了不存在的枚举成员：只用速查表里列出的那些值。",
+    ),
+)
+
+
+def _compile_hint(output: str) -> str:
+    """按报错特征给一句"该改哪里"（最多两句，没命中就返回空串）。"""
+
+    text = str(output or "")
+    picked: List[str] = []
+    for needle, hint in _COMPILE_HINTS:
+        if needle in text and hint not in picked:
+            picked.append(hint)
+        if len(picked) >= 3:
+            break
+    if not picked:
+        return ""
+    return "上次这一批编译报错，按这个口径改（对照报错原文看）：\n" + "\n".join(
+        f"- {item}" for item in picked
+    )
 
 
 @dataclass(frozen=True)
@@ -455,7 +519,10 @@ class DeckScriptGenerator:
             # 把报错那几行**原文**放最前面（后面才是 msbuild 的原始输出）：只给"第 911 行类型不匹配"
             # 它还得自己去数行，实测会照着原来的写法再写一遍（真机上就是这么连着两轮报同一个错的）
             excerpt = self._error_excerpt(last_code, output)
-            batch_error = (excerpt + "\n\n" if excerpt else "") + output
+            hint = _compile_hint(output)
+            batch_error = "\n".join(
+                part for part in (excerpt, hint, output) if part.strip()
+            )
             if self._logger is not None:
                 head = " ".join(line.strip() for line in output.splitlines() if "error" in line.lower())[:300]
                 self._logger.warning(
@@ -829,7 +896,10 @@ class DeckScriptGenerator:
             "",
             "硬性要求：",
             "1. **只输出函数本身**（`private bool …() { … }`），不要代码块以外的解释文字，也不要任何别的东西。",
-            "2. 只用下面速查表里列出的 API，以及 `CardId.` 开头的常量；卡号必须来自上面的清单。",
+            "2. 只用下面速查表里列出的 API，以及 `CardId.` 开头的常量；卡号必须来自上面的清单。"
+            "**不许发明函数名**（`IsXxxCard()` 这类辅助函数没有地方定义，写了就是 CS0103）、"
+            "**不许对 `IList<ClientCard>` 调 `FindAll`/`Where` 这类集合方法**（CS1061）"
+            "——这两条在真机上各卡住过一整轮，只能 `foreach` + `if` 自己筛。",
             "3. 每个函数都要判空、判场面：找不到目标或条件不成立就 `return false`，绝不能抛异常。",
             "4. **一定要写选择逻辑**：效果要取对象时用 `AI.SelectCard(...)`（候选按优先级排成 "
             "`AI.SelectCard(a, b, c)`），要放格子时用 `AI.SelectPlace(...)`，"

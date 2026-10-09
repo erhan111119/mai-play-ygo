@@ -2460,7 +2460,9 @@ function renderExtraFields(active){
     html += `<label class="field"><span>每轮局数</span><input id="c-duels" type="number" value="20" min="2"></label>`;
   }
   if (kind === "write_script") {
-    html += `<label class="field"><span>生成→编译轮数</span><input id="c-rounds" type="number" value="3" min="1" max="6"></label>`;
+    // 默认 5 轮（原来 3）：重试只重问**编译报错的那几批**，多两轮很便宜；而真机上连着栽在
+    // 拼错 API 上（`IsYiJieCard` / `FindAll` / 给 HasAttribute 传数字），3 轮常常刚好差一轮
+    html += `<label class="field"><span>生成→编译轮数</span><input id="c-rounds" type="number" value="5" min="1" max="6"></label>`;
   }
   if (kind === "review") {
     html += `<label class="field"><span>复盘最近几局</span><input id="c-latest" type="number" value="3" min="1" max="20"></label>`;
@@ -2510,7 +2512,7 @@ async function sendTask(){
   if (opponent) payload.opponent_deck_id = opponent;
   if (kind === "arena") payload.duels = num("c-duels") ?? 60;
   if (kind === "iterate") { payload.rounds = num("c-rounds") ?? 2; payload.duels = num("c-duels") ?? 20; }
-  if (kind === "write_script") payload.rounds = num("c-rounds") ?? 3;
+  if (kind === "write_script") payload.rounds = num("c-rounds") ?? 5;
   if (kind === "review") payload.latest = num("c-latest") ?? 3;
 
   const d = await postApi("/api/training/start", payload);

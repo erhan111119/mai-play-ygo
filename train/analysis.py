@@ -441,14 +441,19 @@ _RESEARCH_SYSTEM = """你在为「游戏王」的一副卡组做资料搜集，�
 要求：
 1. 只写与卡表里**实际有的卡**有关的战术。资料里出现的卡如果不在卡表里，就不要写进结论；
    宁愿少写，也不要为了凑数把别的构筑的卡混进来。
-2. 重点回答这四件事：
+2. **卡组名可能只是社区译名或群友自取的名字，按它查不到很正常**：那就改用上面的**卡名**
+   去查——一张卡一张卡地查"这张卡的效果怎么用、和卡表里谁配合、该在什么时点发动"，
+   再拼出这套牌的打法。卡名比卡组名可靠。
+3. 重点回答这五件事：
    * 典型展开路线：起手有哪几张 → 做到什么终场（按"先手"和"后手"分开写）；
    * 卡的用法时机：哪些是启动点、哪些要留着应对、同一个效果的多个用法里哪个优先；
+   * **同一张卡有多条效果时，哪一条先发动、哪一条要留着**（脚本作者最缺的就是这一层）；
    * 常见失误：打得不好的人通常错在哪一步、错在哪张卡上；
    * 这套牌怕什么（手坑/除去/特定压制），以及怎么躲。
-3. 不确定的地方**直接写"不确定"**，查不到就写"没查到"——不要用记忆里的旧信息把空补上。
-4. 最后单独一段列出来源（站点名或标题即可；一条都没拿到就别写这段）。
-5. 输出纯文本条目（每条 `- ` 开头），不要 JSON、不要表格、不要代码块。"""
+4. 不确定的地方**直接写"不确定"**，查不到就写"没查到"——不要用记忆里的旧信息把空补上；
+   逐卡查也查不到的卡，就列出卡名说明"这几张没查到用法"。
+5. 最后单独一段列出来源（站点名或标题即可；一条都没拿到就别写这段）。
+6. 输出纯文本条目（每条 `- ` 开头），不要 JSON、不要表格、不要代码块。"""
 
 
 async def research_archetype(
@@ -457,6 +462,7 @@ async def research_archetype(
     deck_name: str,
     digest: str,
     model: str,
+    card_names: Sequence[str] = (),
     extra_prompt: str = "",
     logger: Optional[logging.Logger] = None,
 ) -> ResearchResult:
@@ -471,6 +477,8 @@ async def research_archetype(
         generate: 发请求的协程，签名 ``generate(prompt, model, max_tokens) -> str``。
         deck_name / digest: 卡组名与 :func:`build_deck_digest` 的产物。
         model: 联网模型名（空串＝没配，调用方应该干脆不要调这个函数）。
+        card_names: 卡表里的卡名（会在问句里点名，让模型在"卡组名查不到"时改按卡名逐张查）。
+            本机踩过：异解那副按卡组名问，联网模型只回了"没查到"（32 字节），换成卡名就有东西可查。
         extra_prompt: 作者额外要求（特别想弄清楚什么就写在这）。
         logger: 日志器。
 
@@ -481,9 +489,14 @@ async def research_archetype(
 
     extra = str(extra_prompt or "").strip()
     extra_block = f"\n\n作者特别想弄清楚的问题：\n{extra[:1000]}" if extra else ""
+    names = [str(name).strip() for name in card_names if str(name).strip()]
+    names_block = ""
+    if names:
+        shown = names[:14]
+        names_block = "\n（这套牌的主要卡片：" + "、".join(shown) + ("…）" if len(names) > len(shown) else "）")
     prompt = (
         f"{_RESEARCH_SYSTEM}\n\n{digest}{extra_block}\n\n"
-        f"请检索「{deck_name}」这套牌的打法，整理成上面要求的资料。"
+        f"请检索「{deck_name}」这套牌的打法{names_block}，整理成上面要求的资料。"
     )
     try:
         raw = await generate(prompt, model, RESEARCH_MAX_TOKENS)

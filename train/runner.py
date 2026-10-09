@@ -755,6 +755,9 @@ class TrainingRunner:
                 deck_name=str(params["deck_name"]),
                 digest=self._deck_digest(params),
                 model=model,
+                # 卡组名常常只是社区译名/群友自取的名字，按它问只会得到"没查到"；
+                # 把卡名一起递过去，模型才能改按卡名逐张查（异解那副就是这么救回来的）
+                card_names=sorted(self._known_names(params)),
                 extra_prompt=str(params.get("extra_prompt") or ""),
                 logger=self.logger,
             )

@@ -443,12 +443,16 @@ def test_research_asks_the_online_model_and_keeps_its_material() -> None:
             deck_name="异解",
             digest="# 卡组：异解\n- 100 测试怪兽｜效果：抽 1 张。",
             model="联网搜索",
+            card_names=["测试怪兽", "另一张卡"],
             extra_prompt="重点看先手",
             logger=None,
         )
     )
     assert seen["model"] == "联网搜索", "必须发给配置里那只联网模型"
     assert "异解" in seen["prompt"] and "测试怪兽" in seen["prompt"], "卡表要一起给"
+    # 卡组名常常只是社区译名（异解那副按名字问只回"没查到"），所以问句里要**点名卡名**，
+    # 让模型在"按卡组名查不到"时改按卡名逐张查
+    assert "主要卡片：测试怪兽、另一张卡" in seen["prompt"], seen["prompt"][-260:]
     assert "重点看先手" in seen["prompt"], "作者的要求要带上"
     assert int(seen["max_tokens"]) > 0
     assert result.text.startswith("- 先手做 500"), result.text

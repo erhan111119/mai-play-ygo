@@ -711,6 +711,9 @@ def test_script_generator_writes_compiles_and_reports_attempts() -> None:
         # 也可能过时，模型不能拿它覆盖卡文
         assert "网上说：先手优先做 500" in prompt, "联网资料没进提示词"
         assert "网上查到的打法资料" in prompt and "卡文与上面的卡表是唯一依据" in prompt
+        # 真机上各卡住过一整轮的两条硬约束（CS0103 / CS1061）：不许发明辅助函数、不许对 IList 用 Linq 方法
+        assert "不许发明函数名" in prompt and "FindAll" in prompt, "拼错 API 的两条硬约束要写进提示词"
+        assert "c.Name.Contains" in prompt, "本家判断要给出可用的写法（Name 成员）"
         # 两个真机上栽过的 API 名要写在速查表里（模型最容易自己编名字的两处）：
         # 墓区是 CardLocation.Grave（不是 Graveyard）、"这次问的是哪种动作"是 Type（不是 ExecutorType）
         for needle in ("CardLocation.Grave", "CardLocation.Graveyard", "Type == ExecutorType"):
