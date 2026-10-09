@@ -184,7 +184,8 @@ class FieldState:
             card = self.zones.get((int(controller), int(location), int(sequence)))
             if card is None:
                 continue
-            if position:
+            # position 为 -1＝这条数据块没带表示形式（只更新了攻守），别把它当成 0 写进去
+            if int(position) > 0:
                 card.position = int(position)
             if attack >= 0:
                 card.attack = int(attack)

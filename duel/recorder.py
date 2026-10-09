@@ -41,6 +41,11 @@ from .protocol import (
 # 记入「最活跃的卡」榜单的卡数量上限
 _TOP_CARD_LIMIT = 3
 
+#: 抓帧调试开关：设了环境变量 `YGO_DUMP_FRAMES=<文件路径>` 就把每条对局报文原样落盘
+#: （每行 `消息号 十六进制payload`）。面板上某个数字不对时拿真报文逐字节核对——`MSG_UPDATE_DATA`
+#: 那套字段（攻守的当前值）就是这么查出来的，别当成"以后可能用不上"的东西删掉。
+_FRAME_DUMP_ENV = "YGO_DUMP_FRAMES"
+
 # 亮点事件保留条数上限，避免长局把内存吃满
 _HIGHLIGHT_LIMIT = 24
 _PLACEMENT_LIMIT = 40
@@ -265,6 +270,7 @@ class DuelRecorder:
     def _on_game_message(self, frame: Frame) -> None:
         """处理一条游戏消息。"""
 
+        self._dump_frame(frame)
         try:
             event = parse_frame_payload(frame.payload)
         except Exception:  # noqa: BLE001  同上，坏包只计数
@@ -273,6 +279,27 @@ class DuelRecorder:
         if event is None:
             return
         self._apply(event)
+
+    def _dump_frame(self, frame: Frame) -> None:
+        """把对局报文原样落盘（**只在设了环境变量 `YGO_DUMP_FRAMES=<文件路径>` 时**）。
+
+        为什么留着这个开关：面板上某个数字不对时（例如"攻守显示的不是实际值"），
+        有真报文的十六进制就能对着协议逐字节核对，而不是靠猜——`MSG_UPDATE_CARD` /
+        `MSG_UPDATE_DATA` 那两套字段（攻守的当前值）就是这么查出来的。
+
+        格式：每行 `游戏消息号 十六进制payload`。注意游戏消息号取自 **payload 的第一个字节**
+        （外层 `STOC_GAME_MSG` 的 message_id 恒为 1，把它写进去等于没有信息）。
+        """
+
+        path = os.environ.get(_FRAME_DUMP_ENV, "").strip()
+        if not path or not frame.payload:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(f"{frame.payload[0]} {frame.payload[1:].hex()}\n")
+        except OSError:
+            # 抓帧是排查用的旁路：写不进去（目录没了/盘满了）不该影响对局记录
+            return
 
     def _apply(self, event: DuelEvent) -> None:
         """把事件累加进统计。"""

@@ -140,6 +140,69 @@ def test_set_card_lands_in_its_zone_and_kernel_stats_are_applied() -> None:
     assert (card.attack, card.defense) == (3000, 2500), card
 
 
+#: **真报文**（从本机一局自测对局里抓的，`YGO_DUMP_FRAMES` 就是为这种核对留的开关）。
+#: 这几条串起来是一个完整故事，直接喂给记录器就能验"面板上的攻守是不是内核给的实际值"：
+#:   特召（`MSG_SPSUMMONING`，青眼白龙）→ 移动进怪兽区 2 号位（`MSG_MOVE`）→
+#:   这一格的当前攻守（`MSG_UPDATE_CARD`，3000/2500，表侧攻击）→ 对手在魔陷区盖了一张（`MSG_SET`）
+_REAL_FRAMES: List[str] = [
+    "62 a3a9570500040201",
+    "50 a3a9570500100a050004020100080000",
+    "7 00040250000000ff1ff800a3a9570500040201a3a957051100000008000000000000001000000000200000b80b0000c4090000b80b0000c4090000000800000000000000000000000000000000000000000000",
+    "54 000000000108020a",
+]
+
+#: 怪兽区（`loc=0x4`）的 `MSG_UPDATE_DATA`：整条都是 `len=4` 的空条目（真报文就是这样）。
+#: ⚠ 它证明"空条目必须跳过、不能当成坏包停止解析"——停下来会把后面真有数据的格一起丢掉。
+_REAL_UPDATE_DATA_EMPTY = "6 000404000000040000000400000004000000040000000400000004000000"
+
+
+def _frame(row: str) -> Frame:
+    """把抓帧文件里的一行（``消息号 十六进制payload``）还原成一条帧。"""
+
+    message_id, hex_body = row.split(" ", 1)
+    return Frame(message_id=Stoc.GAME_MSG, payload=bytes([int(message_id)]) + bytes.fromhex(hex_body))
+
+
+def test_real_update_card_gives_the_field_monster_current_stats() -> None:
+    """**场上怪兽的当前攻守走 `MSG_UPDATE_CARD`**（用真报文验）。
+
+    为什么必须单独测这条：`MSG_UPDATE_DATA`（整片区域）里的**怪兽区**数据块只带"卡号 + 位置"、
+    **不带攻守**（真机抓包：141+141 条怪兽区报文全是 `flag=0x3`）。第一版只接了 UPDATE_DATA，
+    于是面板上永远显示卡面数值——用户看到的就是"看不到怪兽的实际攻击力"。
+    """
+
+    event = parse_game_message(Msg.UPDATE_CARD, _frame(_REAL_FRAMES[2]).payload[1:])
+    assert event is not None and event.kind == "card_data", event
+    # 真报文里的那块：玩家 0、怪兽区 2 号位、表侧攻击（0x1）、攻 3000 守 2500
+    assert event.blocks == ((0, MONSTER, 2, 0x1, 3000, 2500),), event.blocks
+
+    # 同时确认：怪兽区那条 UPDATE_DATA 只给位置（全是空条目 → 不产出数据块）
+    empty = parse_game_message(Msg.UPDATE_DATA, _frame(_REAL_UPDATE_DATA_EMPTY).payload[1:])
+    assert empty is None, "全是空条目的 UPDATE_DATA 不该产出数据块"
+
+
+def test_real_frames_drive_the_field_state_end_to_end() -> None:
+    """真报文走完整链路：特召 → 移动 → 当前攻守 → 盖牌，落成面板要的那份局面。"""
+
+    field = FieldState()
+    for row in _REAL_FRAMES:
+        payload = _frame(row).payload
+        event = parse_game_message(payload[0], payload[1:])
+        assert event is not None, row
+        field.apply(event)
+
+    card = field.zones.get((0, MONSTER, 2))
+    assert card is not None and card.card_id == 89631139, card  # 青眼白龙
+    assert card.face_up is True and card.attack_position is True, card
+    assert (card.attack, card.defense) == (3000, 2500), card
+    assert card.known_stats is True, "这一格必须拿到内核给的实际攻守"
+
+    # 对手盖的那张：进了格位表（面板上看得见），但观测方拿不到卡号
+    hidden = field.zones.get((1, SPELL, 2))
+    assert hidden is not None and hidden.face_up is False, hidden
+    assert hidden.card_id == 0 and hidden.known_stats is False, hidden
+
+
 def test_update_data_message_parses_blocks_with_position_and_stats() -> None:
     """`MSG_UPDATE_DATA` 的报文形状要解对（攻守的**当前值**只有它给）。"""
 

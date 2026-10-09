@@ -1183,6 +1183,21 @@ def test_panel_has_no_external_asset_references() -> None:
     assert "<svg" in webui._app_page(), "图标应该是内联 svg"
 
 
+def test_deck_card_opens_its_detail_from_the_whole_card() -> None:
+    """卡组卡片**整张**都能点开详情，而卡上的两个控件（随机池 / AI 决策）不能顺带打开抽屉。
+
+    回归测试：给卡片加内联控件时把整卡的 `onclick` 挪到了卡名那一行——卡片本身还留着
+    `cursor:pointer`，于是"看着能点、点了一点反应没有"（用户报的正是"卡组界面不能查看卡组详情了"）。
+    """
+
+    webui = _load("webui")
+    page = webui._app_page()
+    assert 'class="deck" onclick="showDeck(' in page, "整张卡组卡要能点开详情"
+    assert 'class="deckctl" onclick="event.stopPropagation()"' in page, (
+        "卡上的开关/下拉要自己吞掉点击，否则点控件会顺带打开详情抽屉"
+    )
+
+
 def main() -> int:
     """逐个执行测试；协程测试用 asyncio.run 驱动。"""
 
@@ -1195,6 +1210,7 @@ def main() -> int:
         test_webui_art_endpoint_serves_local_art_only_for_numeric_ids,
         test_deck_names_and_head_cards_come_from_the_card_db,
         test_panel_has_no_external_asset_references,
+        test_deck_card_opens_its_detail_from_the_whole_card,
         test_kill_tree_uses_taskkill_with_tree_flag,
         test_deck_digest_and_combo_check_catch_cards_outside_the_deck,
         test_combo_tolerates_non_json_reply_but_says_so,

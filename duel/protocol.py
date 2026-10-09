@@ -422,20 +422,55 @@ def _parse_update_data(payload: bytes, message_id: int) -> Optional[DuelEvent]:
     offset = 2
     while offset + 4 <= len(payload):
         (length,) = struct.unpack_from("<I", payload, offset)
-        if length < 8 or offset + length > len(payload):
+        if length < 4 or offset + length > len(payload):
             # 长度不合法：后面的字节已经不可信，直接收手（坏包不该拖垮整局记录）
             break
         block = payload[offset + 4 : offset + length]
         offset += length
-        position = _update_block_position(block)
-        if position is None:
+        if len(block) < 4:
+            # ⚠ `len == 4` 是"这一格这次没有数据"的空条目（真报文里占大多数，
+            # 例如怪兽区那几帧 —— WindBot 也是 `len > 8` 才去读）。**必须 continue 而不是 break**：
+            # 停下来会把这条报文后面那些真有数据的格一起丢掉。
             continue
-        controller, block_location, sequence, face = position
-        attack, defense = _update_block_stats(block)
-        blocks.append((controller, block_location, sequence, face, attack, defense))
+        walked = _walk_update_block(block)
+        if walked is not None:
+            blocks.append(walked)
     if not blocks:
         return None
     return DuelEvent("card_data", player=player, value=location, message_id=message_id, blocks=tuple(blocks))
+
+
+def _parse_update_card(payload: bytes, message_id: int) -> Optional[DuelEvent]:
+    """解析 ``MSG_UPDATE_CARD``：**场上这张卡现在的攻守**走的就是它。
+
+    报文形状::
+
+        u8  玩家编号
+        u8  区域
+        u8  序号
+        u32 数据块长度（含自身）
+        u8[长度-4] 数据块（``flag`` + 按 flag 排列的字段）
+
+    为什么必须单接这一条：``MSG_UPDATE_DATA``（整片区域）里的**怪兽区**数据块只带
+    "卡号 + 位置"，**不带攻守**——真机上抓包确认过（141+141 条怪兽区报文全是 `flag=0x3`）。
+    场上怪的当前攻守（含装备/场地加成）只在这条里下发，少了它面板只能显示卡面数值。
+    """
+
+    if len(payload) < 7:
+        return None
+    controller, location, sequence = payload[0], payload[1], payload[2]
+    walked = _walk_update_block(payload[7:], need_position=False)
+    if walked is None:
+        return None
+    _block_controller, _block_location, _block_sequence, position, attack, defense = walked
+    # 位置以报文头为准（它一定带），表示形式与攻守从数据块里取
+    return DuelEvent(
+        "card_data",
+        player=controller,
+        value=location,
+        message_id=message_id,
+        blocks=((controller, location, sequence, position, attack, defense),),
+    )
 
 
 #: ``Query`` 的位标志（取自 WindBot 的 ``YGOSharp.OCGWrapper.Enums/Query.cs``）
@@ -450,75 +485,63 @@ _QUERY_ATTRIBUTE = 0x40
 _QUERY_RACE = 0x80
 _QUERY_ATTACK = 0x100
 _QUERY_DEFENCE = 0x200
-_QUERY_BASE_ATTACK = 0x400
-_QUERY_BASE_DEFENCE = 0x800
-_QUERY_REASON = 0x1000
-_QUERY_REASON_CARD = 0x2000
-_QUERY_EQUIP_CARD = 0x4000
-_QUERY_TARGET_CARD = 0x8000
-_QUERY_OVERLAY_CARD = 0x10000
-_QUERY_COUNTERS = 0x20000
-_QUERY_OWNER = 0x40000
-_QUERY_STATUS = 0x80000
-_QUERY_LINK = 0x100000
-_QUERY_LEVELLIST = 0x200000
+
+#: 走到攻守为止需要依次跳过的字段（``(位, 字节数, 名字)``）。
+#: ⚠ **位置位前面还有 code**：忘了跳过它就会把卡号的低字节当成"控制者/区域/序号"读出来。
+#: 真机上这一处踩过——面板上每个格子的攻守都不对，抓一份真报文（`YGO_DUMP_FRAMES`）一比对就现形。
+#: 攻守之后的字段（原攻守、原因、装备卡、目标卡、超量素材、指示物、等级列表…）这里不需要，
+#: 所以列表到守备力为止。
+_UPDATE_FIELDS: Tuple[Tuple[int, int, str], ...] = (
+    (_QUERY_CODE, 4, "code"),
+    (_QUERY_POSITION, 4, "position"),
+    (_QUERY_ALIAS, 4, "alias"),
+    (_QUERY_TYPE, 4, "type"),
+    (_QUERY_LEVEL, 4, "level"),
+    (_QUERY_RANK, 4, "rank"),
+    (_QUERY_ATTRIBUTE, 4, "attribute"),
+    (_QUERY_RACE, 4, "race"),
+    (_QUERY_ATTACK, 4, "attack"),
+    (_QUERY_DEFENCE, 4, "defence"),
+)
 
 
-def _update_block_position(block: bytes) -> Optional[Tuple[int, int, int, int]]:
-    """数据块里的"在哪一格 + 表示形式"；没带位置位时返回 ``None``。"""
+def _walk_update_block(
+    block: bytes, *, need_position: bool = True
+) -> Optional[Tuple[int, int, int, int, int, int]]:
+    """按位走一遍数据块，取出 ``(控制者, 区域, 序号, 表示形式, 攻击力, 守备力)``。
 
-    flags, offset = _update_block_head(block)
-    if flags is None or not (flags & _QUERY_POSITION) or offset + 4 > len(block):
+    数据块里"没带"的字段保持 ``-1``（攻守为 -1＝内核没说过，不能拿卡库的数值假装是它给的）。
+
+    Args:
+        need_position: 是否必须有位置位。``MSG_UPDATE_DATA`` 要靠它才知道这一块属于哪一格，
+            所以缺了就整块跳过；``MSG_UPDATE_CARD`` 的"哪一格"在报文头里，不要求块里再带一遍。
+
+    Returns:
+        走不通时返回 ``None``（没带位置 / 块被截断——这一块的信息不可信，跳过）。
+    """
+
+    if len(block) < 4:
         return None
-    controller, location, sequence, position = struct.unpack_from("<BBBB", block, offset)
-    return int(controller), int(location), int(sequence), int(position)
-
-
-def _update_block_stats(block: bytes) -> Tuple[int, int]:
-    """数据块里的攻守；**没带就是未知（-1）**——不能拿卡库的数值假装是内核给的。"""
-
-    flags, offset = _update_block_head(block)
-    if flags is None:
-        return -1, -1
+    (flags,) = struct.unpack_from("<I", block, 0)
+    if need_position and not flags & _QUERY_POSITION:
+        return None
+    controller = location = sequence = position = -1
     attack = defense = -1
-    # 按位逐个跳过字段（顺序照抄 ClientCard.Update），只把攻守读出来
-    for flag, size, key in (
-        (_QUERY_CODE, 4, "code"),
-        (_QUERY_POSITION, 4, "position"),
-        (_QUERY_ALIAS, 4, "alias"),
-        (_QUERY_TYPE, 4, "type"),
-        (_QUERY_LEVEL, 4, "level"),
-        (_QUERY_RANK, 4, "rank"),
-        (_QUERY_ATTRIBUTE, 4, "attribute"),
-        (_QUERY_RACE, 4, "race"),
-        (_QUERY_ATTACK, 4, "attack"),
-        (_QUERY_DEFENCE, 4, "defence"),
-        (_QUERY_BASE_ATTACK, 4, "base_attack"),
-        (_QUERY_BASE_DEFENCE, 4, "base_defence"),
-        (_QUERY_REASON, 4, "reason"),
-        (_QUERY_OWNER, 4, "owner"),
-        (_QUERY_STATUS, 4, "status"),
-        (_QUERY_LINK, 4, "link"),
-    ):
+    offset = 4
+    for flag, size, key in _UPDATE_FIELDS:
         if not flags & flag:
             continue
         if offset + size > len(block):
-            break
-        if key == "attack":
+            # 块本身被截断（长度字段与实际不符）：这一块整个不可信
+            return None
+        if key == "position":
+            controller, location, sequence, position = struct.unpack_from("<BBBB", block, offset)
+        elif key == "attack":
             (attack,) = struct.unpack_from("<i", block, offset)
         elif key == "defence":
             (defense,) = struct.unpack_from("<i", block, offset)
         offset += size
-    return int(attack), int(defense)
-
-
-def _update_block_head(block: bytes) -> Tuple[Optional[int], int]:
-    """数据块开头的 ``flag``；长度不够时返回 ``(None, 0)``。"""
-
-    if len(block) < 4:
-        return None, 0
-    (flags,) = struct.unpack_from("<I", block, 0)
-    return int(flags), 4
+    return int(controller), int(location), int(sequence), int(position), int(attack), int(defense)
 
 
 def parse_game_message(message_id: int, payload: bytes) -> Optional[DuelEvent]:
@@ -639,6 +662,9 @@ def parse_game_message(message_id: int, payload: bytes) -> Optional[DuelEvent]:
 
     if message_id == Msg.UPDATE_DATA:
         return _parse_update_data(payload, message_id)
+
+    if message_id == Msg.UPDATE_CARD:
+        return _parse_update_card(payload, message_id)
 
     if message_id == Msg.POS_CHANGE:
         # u32 卡 ID、u8 控制者、u8 位置、i8 序号、i8 原表示形式、i8 新表示形式

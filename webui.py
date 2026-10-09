@@ -2075,14 +2075,15 @@ function deckCard(deck){
   else if (deck.style_now) chips.push(`<span class="chip dim">${esc(deck.style_now)}</span>`);
   if (deck.file_missing) chips.push('<span class="chip err">卡表文件丢了</span>');
   const scope = deck.brain_scope || "";
-  const scopeClass = scope === "off" ? "dim" : (scope ? "run" : "dim");
-  return `<div class="deck">
+  // 整张卡点开详情（一直如此，卡片本身的 cursor 就是 pointer）；下面那两个控件
+  // 必须自己把点击吞掉——不吞的话点开关/下拉也会顺带打开详情抽屉。
+  return `<div class="deck" onclick="showDeck('${esc(deck.deck_id)}','${esc(deck.group_id)}')">
     ${art(deck.head_card, "art")}
     <div class="meta">
-      <div class="nm" title="${esc(deck.name)}" onclick="showDeck('${esc(deck.deck_id)}','${esc(deck.group_id)}')">${esc(deck.name)}</div>
+      <div class="nm" title="${esc(deck.name)}">${esc(deck.name)}</div>
       <div class="ln">${chips.join("")}</div>
       <div class="cnt">#${esc(deck.deck_id)}　主 ${esc(deck.main)}·额 ${esc(deck.extra)}·副 ${esc(deck.side)}${deck.contributor ? "　by " + esc(deck.contributor) : ""}</div>
-      <div class="deckctl">
+      <div class="deckctl" onclick="event.stopPropagation()">
         <label class="switch sm" title="加入/移出随机池">
           <input type="checkbox" ${deck.in_random ? "checked" : ""}
             onchange="deckToggle('${esc(deck.deck_id)}','${esc(deck.group_id)}','random', this.checked)">
