@@ -1356,6 +1356,54 @@ async def test_finished_duel_summary_goes_through_the_model() -> None:
             await instance.on_unload()
 
 
+async def test_config_update_keeps_the_card_db_alive_while_a_room_runs() -> None:
+    """配置热更新**不能**把正在打的那局手里的卡库关掉。
+
+    房间的 `DuelSession`（记录器/查房）与决策层 `BrainBridge` 都是**直接引用卡库实例**
+    （不是回调），`on_config_update` 当场 `close()` 的话，它们下一次查卡名/卡文会抛
+    `sqlite3.ProgrammingError: Cannot operate on a closed database`——
+    用户看到的现象是"改了配置之后这局的 AI 决策就不动了"。
+
+    所以换下来但还有房间在用的旧卡库要留着，等房间空了（`_close_retired_card_dbs`）再关。
+    """
+
+    if not _sdk_available():
+        print("      （跳过：未找到 maibot_sdk）")
+        return
+
+    with tempfile.TemporaryDirectory() as directory:
+        instance, _context = make_plugin(Path(directory))
+        await instance.on_load()
+        try:
+            old_db = instance._card_db
+            assert old_db is not None and old_db.available, "on_load 该把卡库建出来"
+            # 假装有一局正在打（会话替身够用：这里只关心"房间占用"这件事）
+            instance._rooms["s1"] = load_plugin_module().ActiveRoom(
+                session=_StubSession(outcome="finished", summary=[], result={}),
+                stream_id="s1",
+                group_id="111",
+                task=asyncio.create_task(asyncio.sleep(5)),
+                deck_name="升鹏月",
+            )
+
+            await instance.on_config_update("self", {}, "1.3.0")
+            assert instance._card_db is not old_db, "配置热更新要换上新的卡库实例"
+            assert instance._retired_card_dbs == [old_db], "旧卡库要挂起来，而不是当场关掉"
+
+            # 关键断言：旧实例还能用（真查一次库；close 过的连接到这里会抛 ProgrammingError）
+            sample = old_db.card_details([89631139])
+            assert sample, "房间还握着的那份卡库必须仍然可查"
+
+            # 房间空了：现在才关
+            instance._rooms.clear()
+            instance._close_retired_card_dbs()
+            assert instance._retired_card_dbs == [], "房间空了就该把旧卡库收掉"
+        finally:
+            for room in list(instance._rooms.values()):
+                room.task.cancel()
+            await instance.on_unload()
+
+
 async def test_finished_room_duel_lands_in_the_review_material() -> None:
     """每局打完要落一条 `kind=duel` 记录，而且**带着卡组编号**——复盘优化靠它取最近几局。
 

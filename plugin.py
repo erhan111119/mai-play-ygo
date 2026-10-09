@@ -763,6 +763,13 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         super().__init__()
         self._deck_pool: Optional[DeckPool] = None
         self._card_db: Optional[CardDatabase] = None
+        self._retired_card_dbs: List[CardDatabase] = []
+        """配置热更新换下来、但**还有房间在用**的旧卡库（等房间空了再关）。
+
+        房间的 `DuelSession` 与决策层 `BrainBridge` 都是直接引用实例（不是回调），
+        当场 close 会让它们的下一次查卡名/查卡文抛
+        `sqlite3.ProgrammingError: Cannot operate on a closed database`。
+        """
         self._rooms: Dict[str, ActiveRoom] = {}
         # ⚠ 这里原来有一批"重活"与 AI 打牌的句柄：`_knowledge_cache`（知识库缓存）、
         # `_background_tasks`（导入卡组后写展开流程的后台任务）、`_training_task` / `_optimize_task`
@@ -1185,6 +1192,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         if self._deck_pool is not None:
             self._deck_pool.close()
             self._deck_pool = None
+        # 卸载时房间已经停了（见上面），所以顺手把配置热更新换下来的旧卡库也一起关掉
+        self._close_retired_card_dbs()
         if self._card_db is not None:
             self._card_db.close()
             self._card_db = None
@@ -1211,9 +1220,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         del version
         if scope != "self":
             return
-        if self._card_db is not None:
-            self._card_db.close()
-        self._card_db = CardDatabase(self._resolve_cards_cdb())
+        # 卡库换实例时**房间在打就不能关旧的那个**（见 `_swap_card_db`）
+        self._swap_card_db(CardDatabase(self._resolve_cards_cdb()))
         if self._deck_pool is not None:
             self._deck_pool.close()
             self._deck_pool = DeckPool(
@@ -1226,6 +1234,40 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         self._restart_train_runner()
         self._restart_webui()
         self._log_effective_config()
+
+    def _swap_card_db(self, fresh: CardDatabase) -> None:
+        """换掉卡库实例（配置热更新走这里）。
+
+        ⚠ **还有房间在打时不能当场关掉旧实例**：`DuelSession`（记录器/查房）与决策层
+        `BrainBridge` 都直接引用着那个对象，不是回调。关掉之后它们下一次查卡名/卡文会抛
+        `sqlite3.ProgrammingError: Cannot operate on a closed database`——
+        用户看到的现象是"改了配置之后这局的 AI 决策就不动了"。
+        所以旧的先记下来，等房间都空了再关（`_close_retired_card_dbs`）。
+        """
+
+        previous, self._card_db = self._card_db, fresh
+        if previous is None:
+            return
+        if self._rooms:
+            self._retired_card_dbs.append(previous)
+            if self._logger is not None:
+                self._logger.info(
+                    "配置热更新：还有 %s 个房间在打，旧卡库先留着（这局打完再关）", len(self._rooms)
+                )
+            return
+        previous.close()
+
+    def _close_retired_card_dbs(self) -> None:
+        """房间都空了就把换下来的旧卡库关掉（每局收摊与卸载时各调一次）。"""
+
+        if self._rooms or not self._retired_card_dbs:
+            return
+        for database in self._retired_card_dbs:
+            try:
+                database.close()
+            except Exception:  # noqa: BLE001  关不上只是回收没做干净，不该影响收尾
+                continue
+        self._retired_card_dbs.clear()
 
     # ------------------------------------------------------------------ 工具
 
@@ -2439,6 +2481,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             # 有没有在工作"的凭据，别删。
             self._stop_room_brain(stream_id)
             await session.stop()
+            # 房间空了：配置热更新期间换下来的旧卡库现在可以关了
+            self._close_retired_card_dbs()
             if self._logger is not None:
                 self._logger.info("房间已收摊：群 %s，结束原因 %s", group_id, outcome)
 
