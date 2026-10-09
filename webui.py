@@ -40,6 +40,7 @@ import threading
 import time
 
 from .duel.card_images import cache_dir_for
+from .duel.deckpool import list_numbering_key
 from .duel.field_image import _archetype_guess
 from .duel.fieldstate import MONSTER_ZONE, SPELL_ZONES
 from .train.analysis import tail_lines
@@ -185,8 +186,25 @@ def resolve_api_key(configured: str, data_dir: Path) -> Tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 
+def _number_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """给每行卡组补上 `number` ＝ **列表编号**（群里 `/卡组列表` 显示的那个号）。
+
+    ⚠ 面板只读卡组池的数据库（跨线程用插件的 sqlite 连接是未定义行为），所以这里自己排一遍，
+    排序键必须与 `duel/deckpool.py::list_numbering_key` **完全一致**（内置在前、其余按加入顺序）；
+    否则面板上的 `#N` 会和群里看到的编号对不上——这正是 2026-10-09 用户报的
+    "卡组编号到底是多少，一切都统一到卡组列表里面的编号，包括 webui 里面的"。
+    数据库里的 `deck_id` 只是内部主键，只留在接口参数里（值本身不显示给用户）。
+    """
+
+    ordered = sorted(
+        rows,
+        key=lambda row: list_numbering_key(str(row.get("group_id") or ""), int(row.get("deck_id") or 0)),
+    )
+    return [dict(row, number=index) for index, row in enumerate(ordered, start=1)]
+
+
 def _read_deck_rows(db_path: Path) -> List[Dict[str, Any]]:
-    """读卡组池全部卡组（跨群），按群号与创建时间排序。"""
+    """读卡组池全部卡组（跨群）；**编号要另外算**（见 :func:`_number_rows`）。"""
 
     if not db_path.exists():
         return []
@@ -939,7 +957,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
 
     def _api_decks(self) -> Dict[str, Any]:
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
-        rows = _read_deck_rows(panel.deck_db_path)
+        rows = _number_rows(_read_deck_rows(panel.deck_db_path))
         groups: Dict[str, List[Dict[str, Any]]] = {}
         for row in rows:
             group_id = str(row.get("group_id") or "") or "(未分组)"
@@ -948,6 +966,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
             picked = str(row.get("picked_style") or "")
             groups.setdefault(group_id, []).append(
                 {
+                    # `number` ＝ 群友在 `/卡组列表` 里看到的编号（前端显示它；`deck_id` 只用来调接口）
+                    "number": row.get("number") or "",
                     "deck_id": row.get("deck_id") or "",
                     "name": row.get("display_name") or "",
                     "contributor": row.get("contributor_name") or "",
@@ -1005,7 +1025,7 @@ class _PanelHandler(BaseHTTPRequestHandler):
     def _api_deck_detail(self, deck_id: str, query: Dict[str, List[str]]) -> Dict[str, Any]:
         panel: "WebUIServer" = self.server.panel  # type: ignore[attr-defined]
         group_id = str((query.get("group") or [""])[0])
-        for row in _read_deck_rows(panel.deck_db_path):
+        for row in _number_rows(_read_deck_rows(panel.deck_db_path)):
             if str(row.get("deck_id") or "") != deck_id:
                 continue
             if group_id and str(row.get("group_id") or "") != group_id:
@@ -1029,6 +1049,8 @@ class _PanelHandler(BaseHTTPRequestHandler):
             return {
                 "ok": True,
                 "deck": {
+                    # 详情页也显示**列表编号**（和列表卡片、和群里 `/卡组详情 <编号>` 是同一个号）
+                    "number": row.get("number") or "",
                     "deck_id": row.get("deck_id") or "",
                     "group_id": row.get("group_id") or "",
                     "name": row.get("display_name") or "",
@@ -2094,7 +2116,7 @@ function deckCard(deck){
     <div class="meta">
       <div class="nm" title="${esc(deck.name)}">${esc(deck.name)}</div>
       <div class="ln">${chips.join("")}</div>
-      <div class="cnt">#${esc(deck.deck_id)}　主 ${esc(deck.main)}·额 ${esc(deck.extra)}·副 ${esc(deck.side)}${deck.contributor ? "　by " + esc(deck.contributor) : ""}</div>
+      <div class="cnt" title="编号与群里 /卡组列表 的编号一致">#${esc(deck.number)}　主 ${esc(deck.main)}·额 ${esc(deck.extra)}·副 ${esc(deck.side)}${deck.contributor ? "　by " + esc(deck.contributor) : ""}</div>
       <div class="deckctl" onclick="event.stopPropagation()">
         <label class="switch sm" title="加入/移出随机池">
           <input type="checkbox" ${deck.in_random ? "checked" : ""}
@@ -2141,11 +2163,11 @@ async function showDeck(deckId, group){
         ${art(c.id, "thumb")}<div class="nm" title="${esc(c.name)}">${esc(c.name)}</div>
         <div class="ct">×${esc(c.count)}</div></div>`).join("")}</div></div>`;
   };
-  $("sheet-title").textContent = deck.name || `卡组 #${deck.deck_id}`;
+  $("sheet-title").textContent = deck.name || `卡组 #${deck.number}`;
   $("sheet-body").innerHTML = `
     <div class="hero">${art(deck.head_card, "art")}
       <div style="min-width:0"><div class="ln" style="display:flex;gap:6px;flex-wrap:wrap">${chips}</div>
-        <div class="faint mono ell" style="margin-top:8px;font-size:11.5px" title="${esc(deck.ydk_path)}">#${esc(deck.deck_id)}　${esc(deck.ydk_path)}</div></div></div>
+        <div class="faint mono ell" style="margin-top:8px;font-size:11.5px" title="${esc(deck.ydk_path)}">#${esc(deck.number)}　${esc(deck.ydk_path)}</div></div></div>
     <div class="toolbar" style="margin-top:4px">
       <button class="btn sm" onclick="deckRandom('${esc(deck.deck_id)}','${esc(deck.group_id)}',${deck.in_random ? "false" : "true"})">
         ${deck.in_random ? "移出随机池" : "加入随机池"}</button>
@@ -2383,7 +2405,7 @@ function ensureComposer(d, active){
     const keep = deckSel.value;
     State.decks = d.decks || [];
     deckSel.innerHTML = State.decks.map(x =>
-      `<option value="${esc(x.deck_id)}">${x.is_builtin?"[内置] ":""}${esc(x.name)}（#${esc(x.deck_id)}）${x.script ? "｜脚本 " + esc(x.script) : "｜还没脚本"}</option>`).join("");
+      `<option value="${esc(x.deck_id)}">${x.is_builtin?"[内置] ":""}${esc(x.name)}（#${esc(x.number)}）${x.script ? "｜脚本 " + esc(x.script) : "｜还没脚本"}</option>`).join("");
     if (keep) deckSel.value = keep;
   }
   if (!kindSel.options.length) {
@@ -2413,7 +2435,7 @@ function renderExtraFields(active){
   const mine = $("c-deck").value;
   const options = (State.decks || [])
     .filter(x => String(x.deck_id) !== String(mine))
-    .map(x => `<option value="${esc(x.deck_id)}">${x.is_builtin ? "[内置] " : ""}${esc(x.name)}（#${esc(x.deck_id)}）${x.script ? "｜脚本 " + esc(x.script) : "｜还没脚本"}</option>`)
+    .map(x => `<option value="${esc(x.deck_id)}">${x.is_builtin ? "[内置] " : ""}${esc(x.name)}（#${esc(x.number)}）${x.script ? "｜脚本 " + esc(x.script) : "｜还没脚本"}</option>`)
     .join("");
   let html = "";
   if (needOpponent) {
@@ -2448,7 +2470,7 @@ async function loadDeckWorks(){
   box.innerHTML = `<div class="worksrow">
       ${art(deck.head_card, "art sm")}
       <div class="winfo">
-        <div class="nm">${esc(deck.name)} <span class="faint mono" style="font-size:11px">#${esc(deck.deck_id)}</span></div>
+        <div class="nm">${esc(deck.name)} <span class="faint mono" style="font-size:11px">#${esc(deck.number)}</span></div>
         <div class="ln">
           ${deck.script ? `<span class="chip brand">脚本 ${esc(deck.script)}</span>` : '<span class="chip dim">还没写过脚本</span>'}
           ${deck.picked_style ? `<span class="chip">挑样式 ${esc(deck.picked_style)}</span>` : ""}

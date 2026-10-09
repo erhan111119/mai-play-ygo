@@ -86,6 +86,22 @@ _FIXED_DECK_KEY = "fixed_deck_id"
 _GROUP_DIR_OK = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
+def list_numbering_key(group_id: str, deck_id: int) -> Tuple[int, int]:
+    """卡组在**列表里的排序键**：内置卡组在前，其余按加入顺序（即数据库编号）。
+
+    ⚠ 这是"**编号**"这个词的唯一口径（2026-10-09 用户："卡组编号到底是多少，一切都统一到
+    卡组列表里面的编号，包括 webui 里面的"）：群友在 `/卡组列表` 里看到的、`/加入随机 7`
+    `/固定卡组 7` `/删卡组 7` 里写的，都是**这个顺序的 1 起序号**；数据库里的 `deck_id` 只是
+    内部主键（会随投稿/删除一直增长，和列表编号不是一回事）。
+
+    `_visible_decks()` 的 SQL 顺序、`numbered_decks()`、以及 WebUI 面板上的 `#N`
+    （`webui.py` 的 `_number_rows`——面板只读数据库、不能碰池子的连接）都按这一个函数排，
+    别在任何地方另写一套排序。
+    """
+
+    return (0 if group_id == BUILTIN_GROUP else 1, int(deck_id))
+
+
 def _group_dir_name(group_id: str) -> str:
     """把群号变成安全的目录名（白名单之外的字符一律换成下划线）。
 
@@ -271,6 +287,16 @@ class DeckPool:
         if fixed is not None and all(deck.deck_id != fixed.deck_id for deck in decks):
             decks = decks + [fixed]
         return decks
+
+    def numbered_decks(self, group_id: str = "") -> List[Tuple[int, StoredDeck]]:
+        """``[(编号, 卡组)]``——**编号就是这个顺序的 1 起序号**（见 :func:`list_numbering_key`）。
+
+        群里 `/卡组列表` 显示它、`/加入随机 <编号>` 这类指令收的也是它；
+        WebUI 面板只读数据库没法调用这里，但它按同一个键排序（`webui.py::_number_rows`），
+        所以两边的数字是同一个。新投稿追加在**末尾**，已有编号不会被顶掉。
+        """
+
+        return list(enumerate(self.list_decks(group_id), start=1))
 
     def own_decks(self, group_id: str) -> List[StoredDeck]:
         """取"非内置"的卡组（不含内置）。

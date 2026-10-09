@@ -418,6 +418,40 @@ def test_delete_all_removes_rows_before_files() -> None:
             pool.close()
 
 
+def test_numbering_is_the_number_users_see() -> None:
+    """**编号＝列表编号**（用户口径 2026-10-09："一切都统一到卡组列表里面的编号，包括 webui 里面的"）。
+
+    群友在 `/卡组列表` 看到的、`/加入随机 <编号>` 写的、WebUI 面板显示的，都是同一个 1 起序号：
+    内置卡组在前、投稿按加入顺序（`list_numbering_key`）；数据库里的 `deck_id` 只是内部主键，
+    它会随投稿/删除一直增长，**不是**用户看到的编号。
+    """
+
+    from duel.deckpool import DeckPool, list_numbering_key
+
+    assert list_numbering_key("__builtin__", 999) < list_numbering_key("100907480", 1), "内置永远在前"
+    with tempfile.TemporaryDirectory() as directory:
+        pool = DeckPool(Path(directory))
+        try:
+            first = submit(pool, "111", "第一副")
+            second = submit(pool, "222", "第二副")
+            numbered = pool.numbered_decks()
+            assert [number for number, _deck in numbered] == list(range(1, len(numbered) + 1))
+            by_name = {deck.display_name: number for number, deck in numbered}
+            assert by_name["第一副"] == 1 and by_name["第二副"] == 2, by_name
+            # 追加新卡组 → 已有编号不变（投稿只会排到末尾）
+            third = submit(pool, "333", "第三副")
+            after = {deck.display_name: number for number, deck in pool.numbered_decks()}
+            assert after["第一副"] == 1 and after["第二副"] == 2 and after["第三副"] == 3, after
+            # 删掉第一副 → 编号会**重新排**，而数据库编号不会：两者是两回事（用户踩的就是这个）
+            assert pool.remove("111", first.deck_id)
+            renumbered = {deck.display_name: number for number, deck in pool.numbered_decks()}
+            assert renumbered["第二副"] == 1 and renumbered["第三副"] == 2, renumbered
+            assert second.deck_id == 2, second.deck_id        # 数据库编号照旧
+            assert renumbered["第二副"] != second.deck_id, "列表编号与数据库编号不是一回事"
+        finally:
+            pool.close()
+
+
 def test_default_windbot_deck_applied() -> None:
     """未显式指定风格卡组时应当套用配置里的默认值。"""
 
