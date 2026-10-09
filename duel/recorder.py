@@ -543,9 +543,12 @@ class DuelRecorder:
         location, sequence = slot
         label = (zone_label(sequence) if new_location == int(CardLocation.MONSTER_ZONE)
                  else spell_zone_label(location, sequence))
+        # 卡名看不到时（里侧的盖牌、观测方拿不到卡号）说明白：留一个空的「← 」既难看，
+        # 复盘时也读不出"这里其实是盖了一张"
+        name = self._card(event.card_id) or "（里侧，看不到卡名）"
         text = (
             f"第 {self.turn_count} 回合 {self._seat_label(event.player)} "
-            f"{label} ← {self._card(event.card_id)}"
+            f"{label} ← {name}"
         )
         self.placements.append(text)
         if len(self.placements) > _PLACEMENT_LIMIT:

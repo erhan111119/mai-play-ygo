@@ -706,6 +706,10 @@ def test_script_generator_writes_compiles_and_reports_attempts() -> None:
         prompt = prompts[0]
         for needle in ("抽 1 张", "Card100Handler", "先通召 100", "先手优先做阻抗", "上一轮太爱盖牌"):
             assert needle in prompt, f"提示词里缺少 {needle}"
+        # 两个真机上栽过的 API 名要写在速查表里（模型最容易自己编名字的两处）：
+        # 墓区是 CardLocation.Grave（不是 Graveyard）、"这次问的是哪种动作"是 Type（不是 ExecutorType）
+        for needle in ("CardLocation.Grave", "CardLocation.Graveyard", "Type == ExecutorType"):
+            assert needle in prompt, f"速查表里缺少 {needle}"
 
 
 def test_script_generator_registers_what_it_got_and_warns_about_the_rest() -> None:

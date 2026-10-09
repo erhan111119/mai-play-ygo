@@ -75,6 +75,9 @@ PANEL_TAIL_LINES = 80
 #: 需要模型写结论的种类（写脚本 / 自动迭代的模型调用本身就是任务，不在此列）。
 KINDS_WITH_CONCLUSION = frozenset({KIND_ARENA})
 
+#: 「生成 → 编译」默认重试几轮（写脚本任务用面板上那一栏；迭代任务固定用它）。
+DEFAULT_SCRIPT_ATTEMPTS = 3
+
 #: 写脚本时**每次模型调用**的输出上限（token）。可以在配置里改（`llm.training_script_max_tokens`）：
 #: 脚本是分批写的（每批 `scriptgen.HANDLERS_PER_CALL` 张卡），所以这个数只决定"一批能写多细"。
 #: 给太大没用——宿主对插件的单次调用有 30 秒硬超时，写不完一样是白写。
@@ -590,7 +593,13 @@ class TrainingRunner:
         return Path(source_dir), Path(windbot_dir)
 
     async def _generate_script(
-        self, params: Dict[str, Any], *, feedback: str = "", combo_guide: str = "", previous_code: str = ""
+        self,
+        params: Dict[str, Any],
+        *,
+        feedback: str = "",
+        combo_guide: str = "",
+        previous_code: str = "",
+        attempts: int = DEFAULT_SCRIPT_ATTEMPTS,
     ) -> Any:
         """跑一次「写脚本」：读卡表 + 卡文 → 模型写 C# → 编译（失败自动重写几轮）。
 
@@ -611,7 +620,10 @@ class TrainingRunner:
             source_dir=source_dir,
             windbot_dir=windbot_dir,
             style_name=style_name,
-            max_attempts=int(params.get("rounds") or 3),
+            # ⚠ 这里的重试次数是「生成 → 编译」的轮数，**不要**借 `params["rounds"]`：
+            # 迭代任务里的 rounds 是"迭代几轮"（用户填 5 就传 5），借过来会让一次写脚本
+            # 白重试 5 遍，失败信息也会写成"生成 5 轮都没能编译通过"（真机上就这么误导过一次）
+            max_attempts=max(1, int(attempts)),
             logger=self.logger,
         )
         request = DeckScriptRequest(
@@ -643,7 +655,9 @@ class TrainingRunner:
         """
 
         guide = await self._derive_combo_for(params)
-        script = await self._generate_script(params, combo_guide=guide)
+        script = await self._generate_script(
+            params, combo_guide=guide, attempts=int(params.get("rounds") or DEFAULT_SCRIPT_ATTEMPTS)
+        )
         if self._record_script is not None:
             # 不写回池子的话，刚写好的脚本不会被对局用上——那就白写了
             self._record_script(int(params.get("deck_id") or 0), script.style_name)
@@ -898,6 +912,23 @@ class TrainingRunner:
             f"# 依据：最近 {len(records)} 局房间对局记录\n\n"
         )
         path.write_text(head + answer + "\n", encoding="utf-8")
+        # 任务日志也要写：面板的「详情」读的就是它。不写的话复盘看着"（没有输出）"，
+        # 而用户真正想看的**依据**（这几局的事实）也就无从查起。
+        write_run_log(
+            run.log_path,
+            [
+                f"# 复盘优化：{params['deck_name']}（脚本 {params.get('style') or '未设置'}）",
+                f"# 依据：最近 {len(records)} 局房间对局记录（每局打完由插件自动记录）",
+                f"# 存档：{path}",
+                "",
+                "================ 这几局的事实（记录器在对局里活着看到的） ================",
+                material,
+                "",
+                "================ 模型的复盘结论 ================",
+                answer,
+                "",
+            ],
+        )
         self.store.finish(
             run.run_id,
             STATUS_DONE,
@@ -907,10 +938,11 @@ class TrainingRunner:
                 "duels": len(records),
                 "conclusion": answer[:4000],
                 "review_path": str(path),
+                "log_path": str(run.log_path),
             },
         )
         if self.logger is not None:
-            self.logger.info("复盘优化已存档：%s", path)
+            self.logger.info("复盘优化已存档：%s（依据 %s 局，过程写进 %s）", path, len(records), run.log_path)
 
     def _recent_duels(self, deck_id: int, latest: int) -> List[Any]:
         """这副牌最近的房间对局记录（新的在前）。"""
@@ -1247,32 +1279,84 @@ _REVIEW_PROMPT = """你在帮一副游戏王卡组做复盘。下面是它最近
 
 
 def _duel_brief(index: int, record: Any) -> str:
-    """把一条对局记录压成几行事实（给复盘提示词用）。"""
+    """把一条对局记录压成几行事实（给复盘提示词用）。
+
+    ⚠ 这里踩过一次：键名按"我以为的结构"写（`self` / `opponent` / `card_usage`），而记录里
+    实际是 `players`（**按对局座位号做键**的字符串 → 统计）+ `top_cards` + `placements`，
+    于是每条记录只剩一行"第 N 局：我方输｜回合 4"。模型只能回"记录里没有给出动作数、
+    无法指出具体问题"——用户看到的就是复盘给不出有用建议。**读的是记录的真实结构。**
+    """
 
     summary = dict(getattr(record, "summary", {}) or {})
     params = dict(getattr(record, "params", {}) or {})
+    players = summary.get("players") or {}
+    self_seat = summary.get("self_seat")
+    started = getattr(record, "started_at", 0) or 0
+    when = time.strftime("%m-%d %H:%M", time.localtime(started)) if isinstance(started, (int, float)) and started > 0 else str(started)
     lines = [
-        f"第 {index} 局（{getattr(record, 'started_at', '') or ''}）："
+        f"第 {index} 局（{when}）："
         f"{'我方赢' if summary.get('winner_is_self') else '我方输' if summary.get('winner_is_self') is False else '未判定'}"
         f"｜回合 {summary.get('turns', '?')}"
+        f"｜时长 {summary.get('duration_seconds', '?')} 秒"
+        + (f"｜胜负原因 {summary['reason']}" if summary.get("reason") else "")
     ]
-    for label, key in (("我方", "self"), ("对手", "opponent")):
-        stats = summary.get(key)
-        if isinstance(stats, dict):
-            lines.append(
-                f"  {label}：召唤 {stats.get('normal_summons', 0)}"
-                f"｜特召 {stats.get('sp_summons', 0)}｜发动 {stats.get('effects', 0)}"
-                f"｜盖放 {stats.get('sets', 0)}｜攻击 {stats.get('attacks', 0)}"
-                f"｜造成伤害 {stats.get('damage_dealt', 0)}｜受到伤害 {stats.get('damage_taken', 0)}"
-                f"｜剩 LP {stats.get('lp_final', '?')}"
-            )
-    usage = summary.get("card_usage") or {}
-    if isinstance(usage, dict) and usage:
-        top = sorted(usage.items(), key=lambda pair: -int(pair[1] or 0))[:8]
-        lines.append("  用过的卡：" + "、".join(f"{card}×{count}" for card, count in top))
+
+    def side_line(label: str, stats: Any) -> str:
+        """一方的动作台账（键名与 `duel/recorder.py` 的 PlayerStats 一致）。"""
+
+        if not isinstance(stats, dict) or not stats:
+            return f"  {label}：（这一侧的统计没记到）"
+        return (
+            f"  {label}（{stats.get('name') or '未知名'}）："
+            f"召唤 {stats.get('normal_summons', 0)}｜特召 {stats.get('sp_summons', 0)}"
+            f"｜发动 {stats.get('effects', 0)}｜盖放 {stats.get('sets', 0)}"
+            f"｜抽牌 {stats.get('draws', 0)}｜攻击 {stats.get('attacks', 0)}"
+            f"（直接攻击 {stats.get('direct_attacks', 0)}）"
+            f"｜造成伤害 {stats.get('damage_dealt', 0)}｜受到伤害 {stats.get('damage_taken', 0)}"
+            f"｜最大一击 {stats.get('biggest_hit_taken', 0)}｜回复 {stats.get('lp_recovered', 0)}"
+        )
+
+    if self_seat in (0, 1):
+        lines.append(side_line("我方", players.get(str(self_seat))))
+        lines.append(side_line("对手", players.get(str(1 - self_seat))))
+    else:
+        # 座位没记到时两条都列（宁可多一行，也别让模型以为"只有一方在动"）
+        for seat in ("0", "1"):
+            lines.append(side_line(f"座位{seat}", players.get(seat)))
+
+    top_cards = summary.get("top_cards") or []
+    if isinstance(top_cards, list) and top_cards:
+        lines.append("  用过的卡：" + "、".join(str(card) for card in top_cards[:10]))
+
+    placements = summary.get("placements") or []
+    if isinstance(placements, list) and placements:
+        lines.append(f"  落位（共 {len(placements)} 条，前 8 条）：")
+        lines.extend(f"    {str(item)}" for item in placements[:8])
+
     if params.get("deck_name"):
-        lines.append(f"  （这一局机器人用的是「{params['deck_name']}」）")
+        lines.append(
+            f"  （这一局机器人用的是「{params['deck_name']}」，脚本 {summary.get('deck_style') or '未设置'}）"
+        )
     return "\n".join(lines)
+
+
+def write_run_log(path: Any, lines: Sequence[str]) -> None:
+    """把内容写进任务日志文件（面板的「详情」读的就是它）。
+
+    为什么要有这个：不需要起子进程的任务（复盘优化这类"只问模型"的活、每局打完的
+    `kind=duel` 记录）以前压根不写日志，于是面板上永远是"（没有输出）"——
+    用户想看"它到底依据了什么 / 那一局发生了什么"就无从查起。写失败只记日志，
+    任务本身已经成功了，不该因为写不进去而报失败。
+    """
+
+    if not path:
+        return
+    target = Path(path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(chr(10).join(lines) + chr(10), encoding="utf-8")
+    except OSError:
+        return
 
 
 def kill_tree_command(pid: int) -> List[str]:

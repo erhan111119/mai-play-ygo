@@ -126,6 +126,16 @@ namespace WindBot.Game.AI.Decks
   `HasInHand(卡号)`、`HasInDeck(卡号)`、`HasInGraveyard(卡号)`、`HasInExtra(卡号)`、
   `HasInBanished(卡号)`、`HasInMonstersZone(卡号)`、`HasInSpellZone(卡号)`、
   `GetMonsters()`、`GetSpells()`、`GetMonstersInExtraZone()`（后几个返回 `List<ClientCard>`）
+* 处理函数里可以直接用的**继承来的东西**（都是基类 `Executor` 上的）：
+  * `Card`：**这次要处理的那张卡**（`ClientCard`），判"手上还是墓地里"就看它
+  * `Type`：**这次内核问的是哪种动作**（`ExecutorType`），例如 `if (Type == ExecutorType.SpSummon)`
+    —— 注意名字是 `Type`，**不是** `ExecutorType`（写 `ExecutorType == ...` 是编译错误）
+  * `ActivateDescription` / `CurrentTiming`：同一个效果有多个发动时机时用它区分（进阶，不确定就别用）
+  * `Bot` / `Enemy` / `Duel` / `AI` / `Util` 同上
+* `card.Location` 是 `CardLocation` 枚举，可用值**只有**：`Deck` `Hand` `MonsterZone` `SpellZone`
+  `Grave` `Removed` `Extra` `Overlay` `Onfield` `FieldZone` `PendulumZone`
+  * ⚠ 墓区是 **`CardLocation.Grave`**——写成 `CardLocation.Graveyard` 就是编译错误（真机上连着 5 轮
+    都被这一条卡住过；`Bot.HasInGraveyard(...)` 那种才是带 Graveyard 的名字）
 * `ClientCard` 常用成员（**只有这些**）：`Id`、`Alias`、`Attack`、`Defense`、`Level`、`Race`、`Attribute`、
   `Controller`、`Location`、`LinkCount`、`IsCode(卡号)`、`IsMonster()`、`IsSpell()`、`IsTrap()`、
   `IsFaceup()`、`IsFacedown()`、`IsAttack()`、`IsDefense()`、`IsExtraCard()`、

@@ -862,6 +862,174 @@ async def _active_reports_only_a_running_task() -> None:
         assert store.get(run.run_id) is not None, "记录照旧在历史里"
 
 
+async def _review_writes_its_material_into_the_run_log() -> None:
+    """复盘优化要把"依据的这几局"与结论写进任务日志——面板的「详情」读的就是它。
+
+    回归测试：它以前根本不写日志，面板上是"（没有输出）"，用户想看"它到底依据了什么"无从查起
+    （用户报"复盘优化不能看到该对局的日志吗"）。
+    """
+
+    store_module = _load("train.store")
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        store = store_module.TrainingStore(tmp / "training.db")
+        runner = _make_runner(tmp, store)
+
+        # 造一条"打完的房间对局"记录（复盘就是读它）
+        duel = store.create(
+            "duel",
+            "房间对局：测试牌",
+            {"deck_id": 5, "group_id": "111"},
+            tmp / "duel.log",
+        )
+        # 按**记录的真实结构**造：players 是按对局座位号做键的字符串统计
+        # （以前复盘读的是 self/opponent/card_usage 这些不存在的键，于是什么都看不到）
+        store.finish(
+            duel.run_id,
+            "done",
+            summary={
+                "winner_is_self": False,
+                "turns": 6,
+                "duration_seconds": 123,
+                "reason": "基本分变成0",
+                "self_seat": 0,
+                "deck_name": "测试牌",
+                "deck_style": "Gen5",
+                "players": {
+                    "0": {"name": "憨憨", "normal_summons": 1, "sp_summons": 4, "effects": 3,
+                          "sets": 2, "draws": 5, "attacks": 2, "direct_attacks": 0,
+                          "damage_dealt": 1200, "damage_taken": 3000, "biggest_hit_taken": 2500},
+                    "1": {"name": "群友", "normal_summons": 3, "sp_summons": 9, "effects": 11,
+                          "sets": 4, "draws": 7, "attacks": 4, "direct_attacks": 2,
+                          "damage_dealt": 3000, "damage_taken": 1200, "biggest_hit_taken": 1200},
+                },
+                "top_cards": ["「测试白板A」x4", "「测试白板B」x3"],
+                "placements": ["第 1 回合 憨憨（我方） 主怪兽区1 ← 「测试白板A」"],
+            },
+        )
+
+        seen_prompts: List[str] = []
+
+        async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+            del model, max_tokens
+            seen_prompts.append(prompt)
+            return "先把 XX 的阈值收紧。"
+
+        runner = _make_runner(tmp, store, generate=fake_generate)
+        run = store.create(
+            "review", "复盘优化：测试牌", {"deck_id": 5, "deck_name": "测试牌"}, tmp / "review.log"
+        )
+        await runner._run_review(
+            run,
+            {"deck_id": 5, "deck_name": "测试牌", "deck_file": str(tmp / "牌.ydk"), "style": "Gen5",
+             "latest": 1},
+        )
+        saved = store.get(run.run_id)
+        assert saved is not None and saved.status == store_module.STATUS_DONE, saved and saved.error
+        log_text = (tmp / "review.log").read_text(encoding="utf-8")
+        assert "这几局的事实" in log_text and "模型的复盘结论" in log_text, log_text[:300]
+        assert "先把 XX 的阈值收紧。" in log_text, log_text[-200:]
+        assert saved.summary["log_path"].endswith("review.log"), saved.summary
+        # 事实要真的进提示词/日志：回合数、双方动作数、用过的卡、落位、胜负原因
+        prompt = seen_prompts[0]
+        for needle in ("回合 6", "时长 123 秒", "胜负原因 基本分变成0", "我方（憨憨）", "召唤 1", "发动 3",
+                       "对手（群友）", "直接攻击 2", "最大一击 2500", "用过的卡", "测试白板A", "主怪兽区1"):
+            assert needle in prompt, f"复盘提示词里缺少 {needle}"
+            assert needle in log_text, f"复盘的日志里缺少 {needle}"
+
+
+def _duel_brief_reads_the_real_record_shape() -> None:
+    """复盘事实按记录**真实的结构**读（`players` 按座位 / `top_cards` / `placements`）。
+
+    回归测试：键名想当然写成 `self` / `opponent` / `card_usage` 时，每条记录只剩一行
+    "第 N 局：我方输｜回合 4"，模型只能回"记录里没有给出动作数、无法指出具体问题"——
+    用户看到的就是"复盘优化给不出有用建议"。
+    """
+
+    runner_module = _load("train.runner")
+    record = types.SimpleNamespace(
+        started_at=1791511637.0,
+        params={"deck_id": 5, "deck_name": "测试牌"},
+        summary={
+            "winner_is_self": False,
+            "turns": 4,
+            "duration_seconds": 376,
+            "reason": "基本分变成0",
+            "self_seat": 0,
+            "deck_style": "Gen5",
+            "players": {
+                "0": {"name": "憨憨", "normal_summons": 0, "sp_summons": 7, "effects": 7, "sets": 0,
+                      "draws": 6, "attacks": 1, "direct_attacks": 1, "damage_dealt": 2900,
+                      "damage_taken": 9900, "biggest_hit_taken": 5100, "lp_recovered": 0},
+                "1": {"name": "二憨", "normal_summons": 2, "sp_summons": 17, "effects": 26, "sets": 4,
+                      "draws": 9, "attacks": 3, "direct_attacks": 1, "damage_dealt": 9900,
+                      "damage_taken": 6200, "biggest_hit_taken": 2900, "lp_recovered": 2300},
+            },
+            "top_cards": ["「机巧蛇-丛云远吕智」x4", "「碧之异解△屠奥内拉」x3"],
+            "placements": ["第 1 回合 憨憨（我方） 主怪兽区3 ← 「机巧蛇-丛云远吕智」"],
+        },
+    )
+    brief = runner_module._duel_brief(1, record)
+    for needle in ("我方输", "回合 4", "时长 376 秒", "基本分变成0",
+                   "我方（憨憨）", "特召 7", "发动 7", "直接攻击 1", "受到伤害 9900",
+                   "对手（二憨）", "特召 17", "发动 26", "回复 2300",
+                   "用过的卡", "机巧蛇", "落位", "主怪兽区3", "脚本 Gen5"):
+        assert needle in brief, "复盘事实里缺少 " + needle + "：" + chr(10) + brief
+
+
+async def _iterate_does_not_borrow_its_round_count_as_compile_retries() -> None:
+    """迭代的"轮数"是迭代几轮，不能拿去当"生成 → 编译"的重试次数。
+
+    真机上踩过：迭代填 5 轮 → 写脚本那一步白重试 5 遍，失败信息也写成"生成 5 轮都没能编译通过"，
+    把真正的原因（模型用了不存在的 API 名）盖住了。写脚本任务的"生成→编译轮数"仍按面板那一栏走。
+    """
+
+    runner_module = _load("train.runner")
+    scriptgen = _load("train.scriptgen")
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        store = _load("train.store").TrainingStore(tmp / "training.db")
+        runner = _make_runner(tmp, store)
+        source, windbot = tmp / "windbot-src", tmp / "windbot"
+
+        seen: List[int] = []
+
+        class RecordingGenerator:
+            """只记下 max_attempts 就被构造出来的替身（不真的写文件、不编译）。"""
+
+            def __init__(self, generate: Any, **kwargs: Any) -> None:
+                seen.append(int(kwargs["max_attempts"]))
+                raise scriptgen.ScriptGenerationError("替身：到此为止")
+
+            @staticmethod
+            def style_name_for(deck_id: int) -> str:
+                return f"Gen{deck_id}"
+
+        original = runner_module.DeckScriptGenerator
+        runner_module.DeckScriptGenerator = RecordingGenerator  # type: ignore[attr-defined]
+        try:
+            runner._windbot_dirs = lambda: (source, windbot)  # type: ignore[method-assign]
+            (source / "Game" / "AI" / "Decks").mkdir(parents=True, exist_ok=True)
+            (source / "WindBot.csproj").write_text("<Project />", encoding="utf-8")
+            (windbot / "Decks").mkdir(parents=True, exist_ok=True)
+            deck_path = tmp / "牌.ydk"
+            _write_deck(deck_path, [101])
+            params = {"deck_id": 5, "deck_name": "测试牌", "deck_file": str(deck_path), "rounds": 5}
+            try:
+                await runner._generate_script(params)
+            except Exception:  # noqa: BLE001  替身故意抛错，这里只关心传进去的重试次数
+                pass
+            assert seen and seen[-1] == runner_module.DEFAULT_SCRIPT_ATTEMPTS, seen
+            # 写脚本那条路仍旧按面板上的"生成→编译轮数"走
+            try:
+                await runner._generate_script(params, attempts=5)
+            except Exception:  # noqa: BLE001  同上
+                pass
+            assert seen[-1] == 5, seen
+        finally:
+            runner_module.DeckScriptGenerator = original  # type: ignore[attr-defined]
+
+
 async def _arena_refused_while_room_is_active() -> None:
     """房间里有人在打时不许起擂台（会再拉一套内核与两个 WindBot，把真人那局打坏）。"""
 
@@ -1238,6 +1406,9 @@ def main() -> int:
         _write_script_record_says_how_much_it_wrote,
         _unknown_deck_is_refused_before_a_record_exists,
         _active_reports_only_a_running_task,
+        _duel_brief_reads_the_real_record_shape,
+        _review_writes_its_material_into_the_run_log,
+        _iterate_does_not_borrow_its_round_count_as_compile_retries,
         _arena_refused_while_room_is_active,
         _arena_needs_two_different_styles,
         _subprocess_run_writes_log_and_stops,

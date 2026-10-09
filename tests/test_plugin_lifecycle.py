@@ -1435,6 +1435,11 @@ async def test_finished_room_duel_lands_in_the_review_material() -> None:
             )
             duels = store.list_recent(limit=10, kind="duel")
             assert len(duels) == 1, [record.title for record in duels]
+            # 这条记录的日志文件要真有内容：复盘优化与"点开看看那一局发生了什么"都读它
+            # （以前建了文件从不写，面板上永远是"（没有输出）"）
+            duel_log = Path(duels[0].log_path).read_text(encoding="utf-8")
+            assert "过程复述" in duel_log and "结构化结果" in duel_log, duel_log[:200]
+            assert "麦麦 获胜" in duel_log, duel_log[:400]
             assert "青眼白龙" in duels[0].title, duels[0].title
             assert duels[0].params["deck_id"] == 88, duels[0].params
             assert duels[0].summary["turns"] == 5, duels[0].summary

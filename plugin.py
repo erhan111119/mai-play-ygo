@@ -41,6 +41,7 @@ from maibot_sdk.types import ToolParameterInfo, ToolParamType
 import asyncio
 import concurrent.futures
 import dataclasses
+import json
 import logging
 import sys
 import time
@@ -70,7 +71,7 @@ from .duel.windbot_decks import (
     load_available_decks,
     pick_best_match,
 )
-from .train.runner import TrainingError, TrainingRunner
+from .train.runner import TrainingError, TrainingRunner, write_run_log
 from .train.store import TrainingStore
 from .webui import WebUIServer, resolve_api_key
 from .wiki import YugiohWikiTools
@@ -2362,7 +2363,12 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
     # （原来那两支 CLI——写打法数据 / 写展开流程——也一起删了，所以现在没有人调它）。
 
     def _record_room_duel(
-        self, stream_id: str, group_id: str, result_data: Dict[str, object], deck_id: int = 0
+        self,
+        stream_id: str,
+        group_id: str,
+        result_data: Dict[str, object],
+        deck_id: int = 0,
+        summary: Optional[List[str]] = None,
     ) -> None:
         """把这一局房间对局写进训练记录（`kind=duel`），给「复盘优化」当素材。
 
@@ -2373,6 +2379,10 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
 
         ``deck_id`` 必须带上：「复盘优化」是按这副牌的编号找最近几局的（`_recent_duels`），
         只记卡组名的话那份记录谁也匹配不上，用户看到的永远是"还没有对局记录"。
+
+        ``summary`` 是这一局的过程复述（`session.summary_lines()`）——**要写进这条记录的日志文件**：
+        复盘优化读的就是这些事实，用户点开这条记录想看"那一局到底发生了什么"看的也是它。
+        以前建了日志文件却从不写内容，面板上永远是"（没有输出）"。
 
         写失败只记日志：这是训练功能的素材，不该影响对局播报。
         """
@@ -2392,6 +2402,20 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 log_path,
             )
             store.finish(record.run_id, "done", summary=dict(result_data))
+            write_run_log(
+                log_path,
+                [
+                    f"# {title}（机器人用「{result_data.get('deck_name') or '未知卡组'}」）",
+                    f"# 群 {group_id}｜这一局打完由记录器自动记下（复盘优化的素材）",
+                    "",
+                    "================ 过程复述 ================",
+                    *(summary or ["（这一局没有过程复述）"]),
+                    "",
+                    "================ 结构化结果 ================",
+                    json.dumps(result_data, ensure_ascii=False, indent=2, default=str),
+                    "",
+                ],
+            )
         except Exception:  # noqa: BLE001  记录失败不该影响播报
             if self._logger is not None:
                 self._logger.exception("写对局记录失败（不影响播报）")
@@ -2435,9 +2459,12 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             # 写进擂台那张结果库，arena="room"）。AI 打牌 / 复盘 / 训练调优整条链路已按
             # 2026-10-07 用户口径删除，这两步连同 duel/duelrecord.py 与 train/store.py 一起去掉了。
             # 打完就记一条：复盘优化要有"这一局到底发生了什么"才能说问题。
-            # 只有真的打完（不是没人来/超时收摊）才记。
+            # 只有真的打完（不是没人来/超时收摊）才记；过程复述一起写进那条记录的日志文件
+            # （复盘优化读的就是它，用户点开这条记录看到的也是它）。
             if outcome == OUTCOME_FINISHED:
-                self._record_room_duel(stream_id, group_id, result_data, deck_id=deck_id)
+                self._record_room_duel(
+                    stream_id, group_id, result_data, deck_id=deck_id, summary=summary
+                )
             report = self._compose_result_message(outcome, summary)
             if outcome == OUTCOME_FINISHED:
                 # 打完的总结交给模型写成一段人话，再由插件直接发到群里。
