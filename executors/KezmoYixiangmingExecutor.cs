@@ -31,13 +31,19 @@ namespace WindBot.Game.AI.Decks
     /// 12. 手卡「剑式阴极」特召 → ② 检索「外燃」→ 外燃① 送墓额外「蚀之双子」并特召
     ///     → 剑式 + 外燃 R4「雷火沸动死旋爆震机」（① 吸墓地「蚀之双子」= 3 素材 3 次阻抗）。
     ///
-    /// **四条踩过的坑（改之前先读）**：
+    /// **六条踩过的坑（改之前先读）**：
     /// 1. `Func` 返回 false **只跳过这一条规则**，不是否决动作 → "禁止某行为"必须替换掉基类那条笼统规则；
     ///    所以下面 ⓪ 先把基类 `CardId == -1` 的四条笼统规则全摘掉，再按想要的顺序重加。
     /// 2. 规则匹配按**注册顺序**扫（`GameAI.OnSelectIdleCmd`）→ "这张卡先发"必须排在前面；
     ///    战阶那两条用 `Insert(0)` 加，否则"还有事可做"会一直把战阶推后（对面是墙时会被抽干判负）。
     /// 3. 手卡 ignition 的候选卡是 **`Card`**（不是 `CurrentEffect()`），分支选项值＝`卡号*16 + aux.Stringid 序号`。
     /// 4. `OnSelectCard` 框架默认从**尾部**取 → 素材、检索、丢弃、拿哪张都自己写偏好分支。
+    /// 5. **触发型效果的 `ActivateDescription` 常常是 `-1`**（2026-10-09 用 `KZ_DIAG=1` 实测到）
+    ///    → 判定一律走 `IsEffect(desc, 卡号, 序号)`（"-1 也算"）。写成 `desc == Util.GetStringId(...)`
+    ///    的闸门**永远不成立**：本文件里三个闸门就这么变成了死代码，其中「刻魔 落泪之日」③ 的后果最重
+    ///    ——它把墓地里的镇魂棺洗回额外卡组，直接掐断 大圣棺① → 赫赫君王 → 阎摩 那半条线。
+    /// 6. **`HintMsg.Target` 也要自己写分支**（2026-10-09 加）：漏了会掉进 `default`（按丢弃顺序挑），
+    ///    「落泪之日」① 就会去拉镇魂棺而不是 4 星的「红泪之魔 落泪」，R4/大圣棺当场缺素材。
     ///
     /// **雷火沸动四只（内燃/剑式/节式/外燃）的手卡特召都带自肃**（脚本里 `splimit`：
     /// "这个效果特召后，自己不能从额外卡组特召 4 阶以外的怪"）→ 它们的特召规则必须排在
@@ -122,6 +128,13 @@ namespace WindBot.Game.AI.Decks
         private static readonly bool GoblinFree =
             System.Environment.GetEnvironmentVariable("KZ_GOBLIN_FREE") == "1";
 
+        /// <summary>
+        /// 诊断输出（`KZ_DIAG=1` 时才打）：核对"内核问的效果序号 / 分支选项 / 选择目标"三条链路
+        /// 跟脚本的假设对不对得上。**只在排查时开**，正常对局是关的（每步一行会刷屏）。
+        /// </summary>
+        private static readonly bool Diag =
+            System.Environment.GetEnvironmentVariable("KZ_DIAG") == "1";
+
         public KezmoYixiangmingExecutor(GameAI ai, Duel duel)
             : base(ai, duel)
         {
@@ -195,6 +208,16 @@ namespace WindBot.Game.AI.Decks
             AddExecutor(ExecutorType.Activate, CardId.TripleTactics, AlwaysPlay);
             AddExecutor(ExecutorType.Activate, CardId.TripleThrust, AlwaysPlay);
             AddExecutor(ExecutorType.Activate, CardId.BlackGoat, BlackGoatActivate);
+
+            // ============================================================
+            // 六·五、主线第一步：通召起手件（教程每节的第一步）
+            // ⚠ 2026-10-09 加：不单独排在这里的话，通召被压在规则表最后一节（八），
+            //    只要场上先攒出别的素材，链接/超量的规则就把通召点让出去了。实测决策日志里
+            //    选姬的通召被推到"贴 P → 发选择 → 发邀请 → 出镇魂棺 → 特召内燃"之后，
+            //    而教程二/三/四节的第一步都是「通召选姬 / 通召恶魔之声」。
+            // ============================================================
+            AddExecutor(ExecutorType.SummonOrSet, CardId.ChooserHime, SummonStarter);
+            AddExecutor(ExecutorType.SummonOrSet, CardId.DevilVoice, SummonStarter);
 
             // ============================================================
             // 七、额外卡组的召唤顺序（教程第二节的展开顺序，一条一条排队）
@@ -304,6 +327,9 @@ namespace WindBot.Game.AI.Decks
         /// 「刻魔的镇魂棺」：①（场上）解放自身 → 从卡组·手卡特召 1 只「刻魔」（红泪之魔 落泪）；
         /// ②（墓地/场上）把自己当装备给场上 1 只光恶魔族**非连接**怪（+600 攻，并让它能当怜歌② 的融合素材）。
         /// **② 只在墓地发动**：场上发动等于把 LINK1 的链接值换成一件装备，后面 阎摩/狮鹫 就没素材了。
+        /// ⚠ 这里的 `== GetStringId(...)` 判定在触发型效果上是**拿不到 desc 的**（见 `IsEffect` 注释），
+        /// 实际等效于"两条都放行"。没有改成 -1 判定是因为 ①/② **都能从场上问**，靠 desc 也分不开；
+        /// 实测这段行为是对的（镇魂棺 ① 拉红泪 → 墓地装备 → 怜歌② 融合，链条走通），所以保持原样。
         /// </summary>
         private bool SoulCoffinActivate()
         {
@@ -316,6 +342,8 @@ namespace WindBot.Game.AI.Decks
         /// 「刻魔的大圣棺」：①（场上）用**墓地**怪兽当融合素材，融合 1 只恶魔族融合怪（赫赫君王）；
         /// ②（墓地/场上）当装备给光恶魔族非连接怪（给对象抗性）。
         /// **② 只在墓地发动**：它的素材价值比一件装备高得多（教程用它 + 赫赫君王 出阎摩）。
+        /// ⚠ 同 `SoulCoffinActivate`：触发型效果拿不到 desc，这条判定实际等效于"两条都放行"。
+        /// 实测该放行是对的（大圣棺 ① 融合赫赫君王 / ② 墓地装备 都在用），保持原样只加说明。
         /// </summary>
         private bool DaiSeikanActivate()
         {
@@ -325,18 +353,69 @@ namespace WindBot.Game.AI.Decks
         }
 
         /// <summary>
+        /// 判断"内核这次问的是不是这张卡的第 `index` 个效果"。
+        ///
+        /// ⚠ **触发型效果的 `ActivateDescription` 常常是 `-1`**——实测诊断（`KZ_DIAG=1`）：
+        /// `[诊断] 落泪之日 被询问：desc=-1`，而那一次问的正是 ①。所以判定必须写成
+        /// "`-1` 也算"，只写 `== Util.GetStringId(...)` 会**永远不成立**：本文件里三个闸门
+        ///（镇魂棺②／大圣棺②／落泪之日③）原来就是这么变成死代码的。后果最重的是 ③ —— 它会把
+        /// 墓地的「刻魔的镇魂棺」洗回额外卡组，于是「大圣棺①」当场没有融合素材，
+        /// 教程的后半条线（赫赫君王→阎摩→哥布林→狮鹫）整条断在这里。
+        /// </summary>
+        private bool IsEffect(int description, int cardId, int index)
+        {
+            return description == -1 || description == Util.GetStringId(cardId, index);
+        }
+
+        /// <summary>
         /// 「刻魔 落泪之日 6★」：①（融合召唤成功）把墓地/除外的 1 只光·恶魔族特召或加手；
         /// ③（进墓）把墓地 1 只光·恶魔族洗回卡组/额外换 1200 伤害。
-        /// **③ 要挑时机**：它的费用会把墓地一只光恶魔族洗回去，而墓地里的「刻魂棺」正是
+        /// **③ 要挑时机**：它的费用会把墓地一只光恶魔族洗回去，而墓地里的「镇魂棺」正是
         /// 大圣棺① 融合赫赫君王的必备素材——实测（`temp/rounds/agent-kezmo.log` 第 4 回合）
         /// 6★ 一进墓就把镇魂棺洗回额外，紧接着大圣棺① 无素材可用，整条线断。
         /// 所以只在"墓地里躺着便宜的光恶魔"（大圣棺/神圣棺/路里）时才换这 1200。
+        /// ⚠ ① 与 ③ 都是触发型、`ActivateDescription` 都可能是 `-1`，所以按**卡在哪**分：
+        /// 在墓地＝问 ③，在场上＝问 ①（① 的拉谁由 `OnSelectCard` 的 `HintMsg.Target` 分支定）。
         /// </summary>
         private bool Lacrimosa6Activate()
         {
-            if (ActivateDescription == Util.GetStringId(CardId.Lacrimosa6, 1))
-                return HasCheapLightFiendInGrave();
-            return true;
+            bool asksThird = Card != null && Card.Location == CardLocation.Grave;
+            if (!asksThird)
+                asksThird = IsEffect(ActivateDescription, CardId.Lacrimosa6, 1)
+                    && !IsEffect(ActivateDescription, CardId.Lacrimosa6, 0);
+            bool allow = asksThird ? HasCheapLightFiendInGrave() : true;
+            if (Diag)
+                Logger.WriteLine("[诊断] 落泪之日 被询问：desc=" + ActivateDescription
+                    + " 位置=" + (Card != null ? Card.Location.ToString() : "?")
+                    + "（desc0=" + Util.GetStringId(CardId.Lacrimosa6, 0)
+                    + " desc1=" + Util.GetStringId(CardId.Lacrimosa6, 1) + "）"
+                    + " 判为=" + (asksThird ? "③进墓" : "①融合")
+                    + " 墓地·除外的光恶魔=" + DescribeLightFiends()
+                    + " → " + (allow ? "发" : "不发"));
+            return allow;
+        }
+
+        /// <summary>诊断用：把墓地/除外里的光·恶魔族列出来（看"该拉谁"到底有没有得选）。</summary>
+        private string DescribeLightFiends()
+        {
+            string text = "";
+            foreach (ClientCard card in Bot.Graveyard)
+            {
+                if (card == null || !card.IsMonster())
+                    continue;
+                if (!card.HasRace(CardRace.Fiend) || !card.HasAttribute(CardAttribute.Light))
+                    continue;
+                text += (text.Length > 0 ? "、" : "") + card.Name;
+            }
+            foreach (ClientCard card in Bot.Banished)
+            {
+                if (card == null || !card.IsMonster())
+                    continue;
+                if (!card.HasRace(CardRace.Fiend) || !card.HasAttribute(CardAttribute.Light))
+                    continue;
+                text += (text.Length > 0 ? "、" : "") + card.Name + "(除外)";
+            }
+            return text.Length > 0 ? text : "（无）";
         }
 
         /// <summary>
@@ -620,6 +699,22 @@ namespace WindBot.Game.AI.Decks
             CardId.AngelVoice,   // 天使之声（同上）
             CardId.Demonsmith,   // 锻冶师（素材不够时的补点）
         };
+
+        /// <summary>
+        /// 主线的起手通召（教程一/二/三/四节的第一步都是"通召选姬 / 通召恶魔之声"）。
+        /// 只放行这两张：别的怪（内燃、路里…）仍走最后那条通用 `SummonOrSet`，免得把
+        /// 一回合一次的通召点浪费在它们身上（内燃的追加通召窗口由哥布林① 开，见通用规则里的闸门）。
+        /// </summary>
+        private bool SummonStarter()
+        {
+            if (Card == null || Card.Location != CardLocation.Hand)
+                return false;
+            if (Card.IsCode(CardId.ChooserHime))
+                return true;
+            if (Card.IsCode(CardId.DevilVoice))
+                return !Bot.HasInHand(CardId.ChooserHime);   // 手上有选姬时先出选姬（它能检索）
+            return false;
+        }
 
         private bool SummonOrSet()
         {
@@ -1053,6 +1148,31 @@ namespace WindBot.Game.AI.Decks
                     {
                         CardId.RexTremende, CardId.Lacrimosa4, CardId.Demonsmith, CardId.Lacrimosa6,
                     });
+                case HintMsg.Target:
+                {
+                    // ⚠ **2026-10-09 补**：这条原来是漏的 → 掉进 `default`（按 DiscardOrder 挑），
+                    // 于是「刻魔 落泪之日」① 去拉了「刻魔的镇魂棺」，教程要的 4 星身体
+                    // 「红泪之魔 落泪」没回来，紧接着大圣棺①/油电双动机都缺素材、主线当场断。
+                    // ① 的对象是"墓地·除外的光恶魔"，教程每一条线都靠它把红泪拉回来：
+                    if (Diag)
+                    {
+                        string names = "";
+                        foreach (ClientCard card in cards)
+                            if (card != null)
+                                names += (names.Length > 0 ? "、" : "") + card.Name + "(" + card.Location + ")";
+                        Logger.WriteLine("[诊断] 取对象：候选=" + names + " min=" + min + " max=" + max
+                            + " hint=" + hint + " → 命中 Target 分支");
+                    }
+                    return PickPreferred(cards, min, max, new[]
+                    {
+                        CardId.Lacrimosa4,     // 红泪之魔 落泪：4 星身体（R4 油电双动机 / 大圣棺 都等它）
+                        CardId.Lacrimosa6,
+                        CardId.Demonsmith,     // 锻冶师：墓③ 自跳 + R6 素材
+                        CardId.Lurrie,         // 路里
+                        CardId.SoulCoffin,     // 镇魂棺：只有前几张都没有时才拿它（它回场只是 1 点链接值）
+                        CardId.DaiSeikan,
+                    });
+                }
                 case HintMsg.Destroy:
                     return PickDestroyTarget(cards, min, max);
                 case HintMsg.SpSummon:
@@ -1165,8 +1285,14 @@ namespace WindBot.Game.AI.Decks
 
             // 「刻魔 落泪之日」①：`Duel.SelectOption(tp,1190,1152)` → 1152（特殊召唤）才是
             // "特召墓地的红泪之魔"（教程第一步的最后一下）；1190 是加入手卡。
-            if (options.Count == 2 && options.Contains(1152) && options.Contains(1190))
+            // ⚠ 2026-10-09：原来还要求 `options.Count == 2`，等于"选项表里多一个就不管了"；
+            // 现在只要两个值都在就按 1152 走（多余的值只会是别处插进来的）。
+            if (options.Contains(1152) && options.Contains(1190))
+            {
+                if (Diag)
+                    Logger.WriteLine("[诊断] 落泪之日① 的选项表 → 选「特殊召唤」(1152)");
                 return options.IndexOf(1152);
+            }
 
             // 异响鸣三张魔法的两支：op1＝回血线、op2＝扣血线。
             // 教程第三节要的是**扣血线**（受 500 之后检索本家魔陷 / 把律导送墓 / 给 P 区恶魔加指示物），
@@ -1341,19 +1467,84 @@ namespace WindBot.Game.AI.Decks
         }
 
         /// <summary>
-        /// 进战斗阶段的判据（**保守**）：
-        /// * 对面空场 → 本回合能打出的伤害 ≥ 对面 LP 才进；
-        /// * 对面有怪 → 只要我方有一只表侧攻击表示的怪能**拆掉**对面一只**已知（表侧）**的怪就进。
-        ///   这里**不能**写成"对面有怪就不进"：实测那样会被一只 0 攻的墙钉住几十回合，最后抽干判负。
+        /// 进战斗阶段的判据：
+        /// * **能斩杀**（本回合能打出的血 ≥ 对面 LP）→ 进；
+        /// * **主线还有下一步**（<see cref="ComboHasNextStep"/>）→ **不进**，先把场做完；
+        /// * 其余（对面空场且打不死 / 对面有怪且能拆一只）→ 进。
+        ///
+        /// ⚠ 2026-10-09 修：原来只有第三档——对面有怪、我方能拆一只就进战阶。教程的主线是
+        /// "先做完整场再打"，这条规则让它在**做到「刻魔 落泪之日」就掉头去打**：
+        /// 实测决策日志（`Game/AI/Decks/` 那局的 `[诊断]`/落位记录）里 R4→大圣棺→赫赫君王→
+        /// 阎摩→哥布林→狮鹫→大怒涛→死旋 一条都没走。所以加了第二档"还有事做就别进"。
+        /// 反过来也不能写成"对面有怪就不进"：实测那样会被一只 0 攻的墙钉住几十回合、最后抽干判负。
         /// </summary>
         private bool LethalAvailable()
         {
             if (Duel.Player != 0 || Duel.MainPhase == null || !Duel.MainPhase.CanBattlePhase)
                 return false;
+            int damage = LethalDamage();
+            if (damage > 0 && damage >= Enemy.LifePoints)
+                return true;   // 真斩杀：什么时候都进
+            if (ComboHasNextStep())
+            {
+                if (Diag)
+                    Logger.WriteLine("[诊断] 主线还有下一步 → 先不进战阶");
+                return false;
+            }
             if (Enemy.GetMonsterCount() > 0)
                 return CanBreakDefender();
-            int damage = LethalDamage();
             return damage > 0 && damage >= Enemy.LifePoints;
+        }
+
+        /// <summary>
+        /// 教程的主线还有没有下一步可做（"今天还能接着做场就先别打"）。
+        ///
+        /// 只看**教程里真实存在的下一步**，不做泛化的"手上还有牌就不打"——后者会让它
+        /// 在长局里一直做场、把战阶永远推后（对面是墙时又回到"抽干判负"的老毛病）。
+        /// </summary>
+        private bool ComboHasNextStep()
+        {
+            // 1) 起手件还在手上、这一回合还没通召 → 教程一/二/三/四节的第一步都还没走
+            if (!_summonedThisTurn.Contains(CardId.ChooserHime) && !_summonedThisTurn.Contains(CardId.DevilVoice))
+            {
+                if (Bot.HasInHand(CardId.ChooserHime) || Bot.HasInHand(CardId.DevilVoice)
+                    || Bot.HasInHand(CardId.AngelVoice))
+                    return true;
+            }
+            // 2) 「刻魔 落泪之日」在场上 + 墓地有「红泪之魔 落泪」/镇魂棺 + 额外还有大圣棺
+            //    → 教程的"落泪之日 + 红泪 LINK2 大圣棺 → 融合赫赫君王"这一步还没走
+            //
+            // ⚠ 这里**不**看"手上有本家魔陷"：那些牌（邀请/选择/倒水）拿着不等于现在能落地，
+            //    按它拦战阶会把"对面站着一只拆不掉的怪"的长局拖成几十回合不进攻（老毛病：
+            //    被一只 0 攻墙钉住、抽干判负）。只认版面与墓地里**已经成立**的下一步。
+            if (BotHasOnField(CardId.Lacrimosa6) && ExtraHas(CardId.DaiSeikan)
+                && (Bot.HasInGraveyard(CardId.Lacrimosa4) || Bot.HasInGraveyard(CardId.SoulCoffin)))
+                return true;
+            // 3) 场上两只 4 星 + 额外还有 R4 油电双动机 → 中段的叠放还没做
+            int fourStar = 0;
+            foreach (ClientCard monster in Bot.GetMonsters())
+            {
+                if (monster != null && monster.IsFaceup() && monster.Level == 4)
+                    ++fourStar;
+            }
+            if (fourStar >= 2 && ExtraHas(CardId.DuoDrive))
+                return true;
+            // 4) 墓地里躺着「刻印群魔的刻魔锻冶师」而它还能自跳（洗回 1 只光恶魔）→ 链接段还没完
+            if (Bot.HasInGraveyard(CardId.Demonsmith) && HasCheapLightFiendInGrave()
+                && (ExtraHas(CardId.Goblin) || ExtraHas(CardId.Yama) || ExtraHas(CardId.Griffon)))
+                return true;
+            return false;
+        }
+
+        /// <summary>额外卡组里还有没有这张（判"链接/超量段还剩谁没出"）。</summary>
+        private bool ExtraHas(int cardId)
+        {
+            foreach (ClientCard card in Bot.ExtraDeck)
+            {
+                if (card != null && card.IsCode(cardId))
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>我方有没有一只表侧攻击表示的怪能打得穿对面某只**表侧**的怪。</summary>
