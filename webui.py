@@ -1214,9 +1214,12 @@ def _board_sides(
 def _slot_json(card: Any, *, names: Dict[int, str], details: Dict[int, Any]) -> Optional[Dict[str, Any]]:
     """场上一格 → 面板要的信息（``None`` 表示空格）。
 
-    ⚠ 记录器里存的是 `ZoneCard`（带 ``card_id`` / ``position``），**不是卡号**：
+    ⚠ 记录器里存的是 `ZoneCard`（带 ``card_id`` / ``position`` / 攻守），**不是卡号**：
     第一版按卡号写（`int(card)`）在对局中就炸了 `TypeError: int() argument must be ... not 'ZoneCard'`。
     里侧的卡**不报卡号**（只报"有卡 + 里侧"），与出图同一口径。
+
+    攻守取"内核说过的那份"（`ZoneCard.attack/defense`，来自 `MSG_UPDATE_DATA`），内核没说过时
+    退回**卡面数值**（卡库里的），并在 `stats_live` 里说明是哪一种——装备/场地加成之后两者会不一样。
     """
 
     if card is None:
@@ -1225,19 +1228,30 @@ def _slot_json(card: Any, *, names: Dict[int, str], details: Dict[int, Any]) -> 
     if not card_id:
         return None
     face_up = bool(getattr(card, "face_up", True))
+    attack_position = bool(getattr(card, "attack_position", False))
     if not face_up:
-        return {"id": 0, "face_up": False, "attack": bool(getattr(card, "attack_position", False))}
+        # 里侧的卡：只给"有卡 + 攻/守表示"，卡号卡名一律不出去（与出图同一口径）
+        return {"id": 0, "face_up": False, "attack": attack_position, "name": "", "kind": ""}
     detail = details.get(card_id)
     name = ""
     if detail is not None:
         name = str(getattr(detail, "name", "") or "")
+    live_atk = int(getattr(card, "attack", -1))
+    live_def = int(getattr(card, "defense", -1))
+    base_atk = getattr(detail, "atk", None) if detail is not None else None
+    base_def = getattr(detail, "defense", None) if detail is not None else None
+    atk = live_atk if live_atk >= 0 else base_atk
+    def_ = live_def if live_def >= 0 else base_def
     return {
         "id": card_id,
         "face_up": True,
-        "attack": bool(getattr(card, "attack_position", False)),
+        "attack": attack_position,
         "name": name or names.get(card_id, ""),
-        "atk": getattr(detail, "atk", None) if detail is not None else None,
-        "def_": getattr(detail, "def_", None) if detail is not None else None,
+        "atk": atk,
+        "def_": def_,
+        # 攻守是哪来的：内核当前值 / 卡面数值（面板上要能分辨，别把卡面当成现在的）
+        "stats_live": live_atk >= 0 or live_def >= 0,
+        "level": int(getattr(detail, "level", 0) or 0) if detail is not None else 0,
         "kind": _card_kind_translate(detail) if detail is not None else "",
     }
 
@@ -1803,6 +1817,8 @@ pre.log .lv-debug { color:#6f7d95; } pre.log .lv-info { color:#9fe8c8; }
 .slot .badge2 { position:absolute; right:2px; bottom:12px; font-size:9.5px; padding:0 3px; border-radius:4px;
   background:rgba(8,11,17,.85); border:1px solid #33405f; font-variant-numeric:tabular-nums; }
 .slot .badge2.atk { color:#ffd9a6; } .slot .badge2.def { color:#9fc8ff; }
+/* 内核下发的当前攻守（实心一点）与只有卡面数值时（写着"·卡面"）在视觉上分开 */
+.slot .badge2.live { border-color:#4a6ea8; background:rgba(10,18,32,.95); }
 .pile { border:1px solid var(--line-soft); border-radius:8px; background:#0d131f;
   display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2px; }
 .pile .k { font-size:10px; color:var(--faint); }
@@ -2172,15 +2188,25 @@ async function loadDuel(){
         <b>内核不给、这里也没有的：</b><ul style="margin:4px 0 0;padding-left:20px">${notes}</ul></div>` : "");
 }
 function cardSlot(card, label){
-  /* 一格：表侧给卡图 + 卡名 + 攻守角标；里侧只画卡背（不公开卡号）。
+  /* 一格：表侧给卡图 + 卡名 + 攻守角标；里侧只画卡背（不公开卡号），但**要看得见**。
      label 是格位名（主怪兽区3 / 额外怪兽区 / 场地区 / 灵摆区左…），空位也标出来，
      这样"这一格是干什么的"一眼就能看见，不会以为是排版歪了。 */
   if (!card) return `<div class="slot empty"><span class="zl">${esc(label)}</span></div>`;
   if (!card.face_up) {
-    return `<div class="slot back" title="${esc(label)}：里侧表示（不公开）">
-      <div class="backface">${ICON.back}</div><span class="zl">${esc(label)}</span></div>`;
+    return `<div class="slot back" title="${esc(label)}：里侧表示（不公开卡号）">
+      <div class="backface">${ICON.back}</div>
+      <span class="badge2 ${card.attack ? "atk" : "def"}">里侧 · ${card.attack ? "攻" : "守"}</span>
+      <span class="zl">${esc(label)}</span></div>`;
   }
-  const stats = (card.atk != null) ? `<span class="badge2 ${card.attack ? "atk" : "def"}">${card.attack ? "攻" : "守"} ${esc(card.atk)}${card.def_ != null ? "/" + esc(card.def_) : ""}</span>` : "";
+  const known = (card.atk != null || card.def_ != null);
+  // 攻守角标：内核给过当前值就打实心（`live`），只有卡面数值时标一下"卡面"——
+  // 装备/场地加成之后这两个数会不一样，不写清楚会让人以为面板算错了
+  const stats = known
+    ? `<span class="badge2 ${card.attack ? "atk" : "def"}${card.stats_live ? " live" : ""}"
+        title="${card.stats_live ? "内核下发的当前数值" : "卡面数值（内核还没下发当前值）"}">
+        ${card.attack ? "攻" : "守"} ${esc(card.atk ?? "?")}${card.def_ != null ? "/" + esc(card.def_) : ""}${
+        card.stats_live ? "" : "·卡面"}</span>`
+    : "";
   return `<div class="slot up ${esc(card.kind || "")}" title="${esc(card.name || ("卡号 " + card.id))}（${esc(label)}）｜卡号 ${esc(card.id)}">
     <img loading="lazy" src="/api/art/${esc(card.id)}" alt=""
       onerror="this.parentNode.classList.add('noart');this.remove()">

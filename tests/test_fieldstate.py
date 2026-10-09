@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List
 
 import random
+import struct
 import sys
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
@@ -18,7 +19,14 @@ if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
 from duel.fieldstate import FieldState  # noqa: E402  导入顺序受 sys.path 补丁影响
-from duel.protocol import CardLocation, DuelEvent, Frame, Msg, Stoc  # noqa: E402
+from duel.protocol import (  # noqa: E402  导入顺序受 sys.path 补丁影响
+    CardLocation,
+    DuelEvent,
+    Frame,
+    Msg,
+    Stoc,
+    parse_game_message,
+)
 from duel.recorder import DuelRecorder  # noqa: E402
 from duel.taunts import TAUNT_LINES, TauntPicker  # noqa: E402
 
@@ -100,6 +108,74 @@ def test_lp_follows_damage_events() -> None:
     # lp_update 到了就以它为准（权威覆盖，可用于纠正累计误差）
     field.apply(DuelEvent("lp_update", player=0, value=1234))
     assert field.players[0].lp == 1234
+
+
+def test_set_card_lands_in_its_zone_and_kernel_stats_are_applied() -> None:
+    """盖放要真的进格位表，内核下发的攻守/表示形式要覆盖到那张卡上。
+
+    两条都是真机上"看不到"的来源：
+
+    * 盖放**只发 MSG_SET**（不是 MSG_MOVE），第一版没处理它 → 场上的盖卡整片看不见；
+    * 攻守只有内核的 `MSG_UPDATE_DATA` 说了才有（装备/场地加成之后与卡面数值不一样），
+      第一版压根没记 → 面板上永远没有攻守角标。
+    """
+
+    field = FieldState()
+    # 自己盖一张魔陷到魔陷区 2 号位（里侧守备位 0x8）
+    field.apply(DuelEvent("set", player=0, card_id=300, data=(SPELL, 1, 0x8)))
+    card = field.zones.get((0, SPELL, 1))
+    assert card is not None, "盖卡必须进格位表，否则面板上那一格是空的"
+    assert card.card_id == 300 and card.face_up is False, card
+    assert field.players[0].spells == 1, "盖放的魔陷也要算进占用数"
+    assert card.known_stats is False, "内核还没说过攻守，就不能假装知道"
+
+    # 内核下发这一片的当前数据：把这张翻开成表侧攻击，攻守 3000/2500
+    field.apply(DuelEvent("card_data", player=0, blocks=((0, SPELL, 1, 0x1, 3000, 2500),)))
+    assert card.face_up is True and card.attack_position is True, card
+    assert (card.attack, card.defense) == (3000, 2500), card
+    assert card.known_stats is True
+
+    # 数据块里位置对不上（别的格）就不该动到这一张
+    field.apply(DuelEvent("card_data", player=0, blocks=((0, SPELL, 3, 0x4, 1800, 1200),)))
+    assert (card.attack, card.defense) == (3000, 2500), card
+
+
+def test_update_data_message_parses_blocks_with_position_and_stats() -> None:
+    """`MSG_UPDATE_DATA` 的报文形状要解对（攻守的**当前值**只有它给）。"""
+
+    def block(flags: int, body: bytes) -> bytes:
+        """按 WindBot 的读法造一块：u32 长度（含自身与 flag）+ u32 flag + 按 flag 排的字段。
+
+        长度值 = 4（长度字段自身）+ 4（flag）+ len(body)，即"这一块的线上总字节数"。
+        """
+
+        return struct.pack("<I", len(body) + 8) + struct.pack("<I", flags) + body
+
+    # 位置位（0x02）+ 攻击力（0x100）+ 守备力（0x200）
+    with_position = block(
+        0x02 | 0x100 | 0x200,
+        struct.pack("<BBBB", 0, MONSTER, 1, 0x1) + struct.pack("<ii", 3000, 2500),
+    )
+    # 只有卡号、没有位置：不知道是哪一格，应当被跳过
+    code_only = block(0x01, struct.pack("<I", 89631139))
+    payload = bytes([0, MONSTER]) + with_position + code_only
+
+    event = parse_game_message(Msg.UPDATE_DATA, payload)
+    assert event is not None and event.kind == "card_data", event
+    assert event.blocks == ((0, MONSTER, 1, 0x1, 3000, 2500),), event.blocks
+
+    # 一整片区域里没有一块带位置的：这条报文没有可用信息
+    assert parse_game_message(Msg.UPDATE_DATA, bytes([0, MONSTER]) + code_only) is None
+
+
+def test_set_message_carries_the_zone_it_lands_in() -> None:
+    """`MSG_SET` 要带出"哪一格"：不然盖放收不进格位表（场上看不到盖卡）。"""
+
+    payload = struct.pack("<IBBBB", 89631139, 1, MONSTER, 2, 0x8)
+    event = parse_game_message(Msg.SET, payload)
+    assert event is not None and event.kind == "set", event
+    assert event.player == 1 and event.card_id == 89631139, event
+    assert event.data == (MONSTER, 2, 0x8), event.data
 
 
 def test_zone_occupancy_follows_moves() -> None:

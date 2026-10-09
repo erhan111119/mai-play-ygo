@@ -298,29 +298,52 @@ def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> 
             self.extra = 2
 
     # 位号与内核一致：怪兽区 5/6 是额外怪兽区、魔陷区第 5 号位是场地魔法、灵摆区＝魔陷区最左/最右
+    # 攻守分三种情形各来一张：内核给过当前值（100）、只有卡面数值（400）、里侧（200/300）
+    table = {
+        (0, fieldstate.MONSTER_ZONE, 0): zone_card(100, 0x1, attack=3100, defense=2600),
+        (0, fieldstate.MONSTER_ZONE, 5): zone_card(400, 0x1),          # 额外怪兽区（内核还没说过攻守）
+        (1, fieldstate.MONSTER_ZONE, 2): zone_card(200, 0x8),          # 对手：里侧守备
+        (0, fieldstate.SPELL_ZONES[0], 1): zone_card(300, 0x2),        # 盖放的魔陷（里侧）
+        (0, fieldstate.SPELL_ZONES[0], 5): zone_card(500, 0x4),        # 场地魔法（表侧守备位＝表侧）
+        (0, fieldstate.SPELL_ZONES[1], 0): zone_card(600, 0x4),        # 灵摆区左
+    }
     state = types.SimpleNamespace(
-        zones={
-            (0, fieldstate.MONSTER_ZONE, 0): zone_card(100, 0x1),      # 表侧攻击
-            (0, fieldstate.MONSTER_ZONE, 5): zone_card(400, 0x1),      # 额外怪兽区
-            (1, fieldstate.MONSTER_ZONE, 2): zone_card(200, 0x8),      # 对手：里侧守备
-            (0, fieldstate.SPELL_ZONES[0], 1): zone_card(300, 0x2),    # 盖放的魔陷
-            (0, fieldstate.SPELL_ZONES[0], 5): zone_card(500, 0x4),     # 场地魔法（表侧守备位＝表侧）
-            (0, fieldstate.SPELL_ZONES[1], 0): zone_card(600, 0x4),     # 灵摆区左
-        },
+        zones=dict(table),
         players={0: Player(6800, 4), 1: Player(7200, 1)},
         zones_of=lambda seat: {
             (location, sequence): card
-            for (controller, location, sequence), card in {
-                (0, fieldstate.MONSTER_ZONE, 0): zone_card(100, 0x1),
-                (0, fieldstate.MONSTER_ZONE, 5): zone_card(400, 0x1),
-                (1, fieldstate.MONSTER_ZONE, 2): zone_card(200, 0x8),
-                (0, fieldstate.SPELL_ZONES[0], 1): zone_card(300, 0x2),
-                (0, fieldstate.SPELL_ZONES[0], 5): zone_card(500, 0x4),
-                (0, fieldstate.SPELL_ZONES[1], 0): zone_card(600, 0x4),
-            }.items()
+            for (controller, location, sequence), card in table.items()
             if controller == seat
         },
     )
+
+    class Detail:
+        """卡库查出来的卡面信息（面板画卡名 / 攻守角标要用）。"""
+
+        def __init__(
+            self, name: str, type_text: str, atk: Any = None, defense: Any = None, level: int = 0
+        ) -> None:
+            self.name = name
+            self.type_text = type_text
+            self.atk = atk
+            self.defense = defense
+            self.level = level
+            self.stats = f"攻{atk}/守{defense}/星{level}" if atk is not None else ""
+            self.effect = ""
+
+    class CardDb:
+        """只认识场上这几张卡。"""
+
+        available = True
+
+        def card_details(self, card_ids: List[int]) -> Dict[int, Any]:
+            known = {
+                100: Detail("混源龙", "怪兽 效果", 3000, 2500, 8),
+                400: Detail("渊兽", "怪兽 融合", 2500, 2000, 8),
+                500: Detail("王家的神殿", "魔法 场地"),
+                600: Detail("时读之魔术师", "怪兽 灵摆 效果", 1200, 800, 4),
+            }
+            return {int(cid): known[int(cid)] for cid in card_ids if int(cid) in known}
 
     class Recorder:
         self_seat = 0
@@ -342,6 +365,7 @@ def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> 
     secret = "r" * 32
     with tempfile.TemporaryDirectory() as directory:
         plugin = StubPlugin(Path(directory))
+        plugin._card_db = CardDb()
         plugin._rooms = {
             "qq:group:1": types.SimpleNamespace(
                 group_id="1", deck_name="升辉月", session=Session()
@@ -376,10 +400,26 @@ def test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards() -> 
             assert ours["field_zone"]["id"] == 500, ours["field_zone"]
             # ⚠ 灵摆区就是魔陷区最左那格：内核把这儿的牌报成 PENDULUM_ZONE，也要画在魔陷区 1
             assert ours["spells"][0] and ours["spells"][0]["id"] == 600, ours["spells"][0]
-            # 里侧：只报"有卡 + 里侧"，一个卡号都不能给（否则面板比对手本人知道得更多）
+            # 里侧：只报"有卡 + 里侧 + 攻/守表示"，一个卡号都不能给（否则面板比对手本人知道得更多）
             back = theirs["monsters"][2]
             assert back is not None and back["face_up"] is False, back
             assert back.get("id") in (0, None) and not back.get("name"), back
+            assert back["attack"] is False, f"里侧守备也要看得出是在守备：{back}"
+
+            # 攻守：内核给过当前值就用内核的（stats_live=True）；只有卡面数值时也照样给，并标明来源
+            front = ours["monsters"][0]
+            assert front["name"] == "混源龙" and front["kind"] == "monster", front
+            assert (front["atk"], front["def_"]) == (3100, 2600), front
+            assert front["stats_live"] is True, front
+            extra = ours["extra_monsters"][0]
+            assert (extra["atk"], extra["def_"]) == (2500, 2000), extra
+            assert extra["stats_live"] is False, "内核还没说过攻守，就要标明这是卡面数值"
+            # 盖着的魔陷：面板也要画得出来（只有"里侧 + 攻/守表示"，没有卡号）
+            hidden = ours["spells"][1]
+            assert hidden is not None and hidden["face_up"] is False, hidden
+            assert hidden["attack"] is True, f"里侧攻击位（0x2）的盖牌：{hidden}"
+            # 表侧魔陷没有攻守角标（不是怪兽）
+            assert ours["field_zone"].get("atk") is None, ours["field_zone"]
             # 台账（记录器数出来的东西）也要带上
             assert ours["stats"]["normal_summons"] == 2 and ours["stats"]["sp_summons"] == 3, ours["stats"]
         finally:

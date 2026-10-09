@@ -61,6 +61,19 @@ class CardDetail:
     type_text: str
     stats: str
     effect: str
+    atk: Optional[int] = None
+    """**卡面**攻击力（怪兽才有，其余是 None）。
+
+    与 :attr:`stats` 分开留着：`stats` 是给人看的一行字（"攻1800/守1200/星4"），
+    要拿数值的地方（对局页的攻守角标）不该去解析那行字——原来面板读的是
+    `detail.atk`，而这个字段压根不存在，于是场上永远没有攻守。
+    """
+
+    defense: Optional[int] = None
+    """**卡面**守备力（怪兽才有）。"""
+
+    level: int = 0
+    """星级/阶级（魔陷为 0）。"""
 
     @property
     def is_monster(self) -> bool:
@@ -225,7 +238,8 @@ class CardDatabase:
             name, desc, card_type, atk, defence, level = row
             type_text = decode_card_type(int(card_type or 0))
             stats = ""
-            if type_text.startswith("怪兽"):
+            is_monster = type_text.startswith("怪兽")
+            if is_monster:
                 stats = f"攻{atk or 0}/守{defence or 0}/星{level or 0}"
             elif type_text.startswith(("魔法", "陷阱")) and level:
                 # 灵摆魔法的等级字段是刻度，这里不展示，免得和怪兽星级混淆
@@ -237,6 +251,10 @@ class CardDatabase:
                 type_text=type_text,
                 stats=stats,
                 effect=effect,
+                # 数值另存一份：面板画攻守角标要用数字，不能去解析上面那行给人看的字
+                atk=int(atk) if is_monster and atk is not None else None,
+                defense=int(defence) if is_monster and defence is not None else None,
+                level=int(level or 0) if is_monster else 0,
             )
         return details
 

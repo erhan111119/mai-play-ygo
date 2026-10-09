@@ -323,6 +323,10 @@ class DuelEvent:
     extra: int = 0
     message_id: int = 0
     data: Tuple[int, ...] = ()
+    blocks: Tuple[Tuple[int, ...], ...] = ()
+    """一条报文里的多组数值（``card_data`` 用它装"一整片区域的卡面数据"：
+
+    每组是 ``(控制者, 区域, 序号, 表示形式, 攻击力, 守备力)``，攻守未知时为 -1）。"""
 
     @property
     def label(self) -> str:
@@ -390,6 +394,131 @@ def _require(payload: bytes, size: int, message_id: int) -> None:
         raise ProtocolError(
             f"消息 0x{message_id:02X} 的负载只有 {len(payload)} 字节，至少需要 {size} 字节"
         )
+
+
+def _parse_update_data(payload: bytes, message_id: int) -> Optional[DuelEvent]:
+    """解析 ``MSG_UPDATE_DATA``（内核下发的卡面数据：**攻守的当前值就在这里**）。
+
+    报文形状（与 WindBot 的 ``GameBehavior.OnUpdateData`` + ``ClientCard.Update`` 一致）::
+
+        u8  玩家编号
+        u8  区域
+        重复到报文结束：
+            u32 长度（**含这 4 字节自身**）
+            u8[长度-4] 这一张卡的数据块（``flag`` + 按 flag 排列的字段）
+
+    数据块按 `Query` 的位标志取值，顺序与 ``ClientCard.Update`` 逐个字段对齐；
+    只有带 ``POSITION`` 位的数据块才知道自己属于哪一格——没带位置的那些**跳过不动**
+    （宁可继续用卡库的卡面数值，也不猜一张卡的位置）。
+
+    一条报文里通常装着一整片区域（5~7 格）的数据块，所以这里返回的是**一组**
+    ``(控制者, 区域, 序号, 表示形式, 攻击力, 守备力)``，由记录器逐格套用。
+    """
+
+    if len(payload) < 2:
+        return None
+    player, location = payload[0], payload[1]
+    blocks: List[Tuple[int, ...]] = []
+    offset = 2
+    while offset + 4 <= len(payload):
+        (length,) = struct.unpack_from("<I", payload, offset)
+        if length < 8 or offset + length > len(payload):
+            # 长度不合法：后面的字节已经不可信，直接收手（坏包不该拖垮整局记录）
+            break
+        block = payload[offset + 4 : offset + length]
+        offset += length
+        position = _update_block_position(block)
+        if position is None:
+            continue
+        controller, block_location, sequence, face = position
+        attack, defense = _update_block_stats(block)
+        blocks.append((controller, block_location, sequence, face, attack, defense))
+    if not blocks:
+        return None
+    return DuelEvent("card_data", player=player, value=location, message_id=message_id, blocks=tuple(blocks))
+
+
+#: ``Query`` 的位标志（取自 WindBot 的 ``YGOSharp.OCGWrapper.Enums/Query.cs``）
+#: 字段的**读取顺序**与 ``ClientCard.Update`` 逐行一致，读错一位后面全歪。
+_QUERY_CODE = 0x01
+_QUERY_POSITION = 0x02
+_QUERY_ALIAS = 0x04
+_QUERY_TYPE = 0x08
+_QUERY_LEVEL = 0x10
+_QUERY_RANK = 0x20
+_QUERY_ATTRIBUTE = 0x40
+_QUERY_RACE = 0x80
+_QUERY_ATTACK = 0x100
+_QUERY_DEFENCE = 0x200
+_QUERY_BASE_ATTACK = 0x400
+_QUERY_BASE_DEFENCE = 0x800
+_QUERY_REASON = 0x1000
+_QUERY_REASON_CARD = 0x2000
+_QUERY_EQUIP_CARD = 0x4000
+_QUERY_TARGET_CARD = 0x8000
+_QUERY_OVERLAY_CARD = 0x10000
+_QUERY_COUNTERS = 0x20000
+_QUERY_OWNER = 0x40000
+_QUERY_STATUS = 0x80000
+_QUERY_LINK = 0x100000
+_QUERY_LEVELLIST = 0x200000
+
+
+def _update_block_position(block: bytes) -> Optional[Tuple[int, int, int, int]]:
+    """数据块里的"在哪一格 + 表示形式"；没带位置位时返回 ``None``。"""
+
+    flags, offset = _update_block_head(block)
+    if flags is None or not (flags & _QUERY_POSITION) or offset + 4 > len(block):
+        return None
+    controller, location, sequence, position = struct.unpack_from("<BBBB", block, offset)
+    return int(controller), int(location), int(sequence), int(position)
+
+
+def _update_block_stats(block: bytes) -> Tuple[int, int]:
+    """数据块里的攻守；**没带就是未知（-1）**——不能拿卡库的数值假装是内核给的。"""
+
+    flags, offset = _update_block_head(block)
+    if flags is None:
+        return -1, -1
+    attack = defense = -1
+    # 按位逐个跳过字段（顺序照抄 ClientCard.Update），只把攻守读出来
+    for flag, size, key in (
+        (_QUERY_CODE, 4, "code"),
+        (_QUERY_POSITION, 4, "position"),
+        (_QUERY_ALIAS, 4, "alias"),
+        (_QUERY_TYPE, 4, "type"),
+        (_QUERY_LEVEL, 4, "level"),
+        (_QUERY_RANK, 4, "rank"),
+        (_QUERY_ATTRIBUTE, 4, "attribute"),
+        (_QUERY_RACE, 4, "race"),
+        (_QUERY_ATTACK, 4, "attack"),
+        (_QUERY_DEFENCE, 4, "defence"),
+        (_QUERY_BASE_ATTACK, 4, "base_attack"),
+        (_QUERY_BASE_DEFENCE, 4, "base_defence"),
+        (_QUERY_REASON, 4, "reason"),
+        (_QUERY_OWNER, 4, "owner"),
+        (_QUERY_STATUS, 4, "status"),
+        (_QUERY_LINK, 4, "link"),
+    ):
+        if not flags & flag:
+            continue
+        if offset + size > len(block):
+            break
+        if key == "attack":
+            (attack,) = struct.unpack_from("<i", block, offset)
+        elif key == "defence":
+            (defense,) = struct.unpack_from("<i", block, offset)
+        offset += size
+    return int(attack), int(defense)
+
+
+def _update_block_head(block: bytes) -> Tuple[Optional[int], int]:
+    """数据块开头的 ``flag``；长度不够时返回 ``(None, 0)``。"""
+
+    if len(block) < 4:
+        return None, 0
+    (flags,) = struct.unpack_from("<I", block, 0)
+    return int(flags), 4
 
 
 def parse_game_message(message_id: int, payload: bytes) -> Optional[DuelEvent]:
@@ -497,9 +626,19 @@ def parse_game_message(message_id: int, payload: bytes) -> Optional[DuelEvent]:
         # u32 卡 ID、u8 控制者、u8 位置、i8 序号、i8 表示形式
         _require(payload, 8, message_id)
         code, controller = struct.unpack_from("<IB", payload, 0)
-        # 第 8 个字节是表示形式（盖放一律是里侧）：查房出图要靠它画卡背（见 SUMMONING 那条的说明）
-        return DuelEvent("set", player=controller, card_id=code, message_id=message_id,
-                         data=(payload[7],))
+        # 位置与序号一起带出来：盖放的怪兽/魔陷**只发这一条 MSG_SET**（不是 MSG_MOVE），
+        # 少了这两个数就不知道该把这张卡放进哪一格——真机上表现为「场上看不到盖卡」。
+        # 第 8 个字节是表示形式（盖放一律是里侧）：查房出图要靠它画卡背。
+        return DuelEvent(
+            "set",
+            player=controller,
+            card_id=code,
+            message_id=message_id,
+            data=(payload[5], payload[6], payload[7]),  # 位置、序号、表示形式
+        )
+
+    if message_id == Msg.UPDATE_DATA:
+        return _parse_update_data(payload, message_id)
 
     if message_id == Msg.POS_CHANGE:
         # u32 卡 ID、u8 控制者、u8 位置、i8 序号、i8 原表示形式、i8 新表示形式

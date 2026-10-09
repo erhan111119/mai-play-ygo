@@ -37,14 +37,19 @@ FACEDOWN = 0xA
 
 @dataclass
 class ZoneCard:
-    """场上一格里的卡：卡号 + 表示形式。
+    """场上一格里的卡：卡号 + 表示形式（+ 内核下发过的当前攻守）。
 
     为什么要连表示形式一起存：查房出图要画"表侧/里侧、攻击/守备"——**里侧的卡只能画卡背**，
     少了这个位就会把对手的盖牌当表侧画出来（等于替对手公开手牌）。
+
+    攻守是**内核下发过的当前值**（`MSG_UPDATE_DATA`，字段为 -1 表示内核还没说过）：
+    与卡库里的卡面数值分开存，免得把"卡面 1800"当成"现在就是 1800"（对面有场地/装备时会不一样）。
     """
 
     card_id: int
     position: int = 0
+    attack: int = -1
+    defense: int = -1
 
     @property
     def face_up(self) -> bool:
@@ -57,6 +62,12 @@ class ZoneCard:
         """是不是攻击表示（含里侧攻击）。"""
 
         return (self.position & 0x3) != 0
+
+    @property
+    def known_stats(self) -> bool:
+        """内核有没有说过这张卡的当前攻守。"""
+
+        return self.attack >= 0 or self.defense >= 0
 
 
 @dataclass
@@ -138,8 +149,47 @@ class FieldState:
             self._pos_change(event)
             return
 
+        if event.kind == "set":
+            self._set(event)
+            return
+
+        if event.kind == "card_data":
+            self._card_data(event)
+            return
+
         if event.kind == "move":
             self._move(event)
+
+    def _set(self, event: DuelEvent) -> None:
+        """盖放：把这张卡放进它占的那一格。
+
+        ⚠ 盖放**只发 MSG_SET**（不是 MSG_MOVE），所以别指望 `_move` 顺手把它收进来：
+        少了这一步，面板与出图上盖着的怪兽/魔陷整片看不见（真机上就是这么表现的）。
+        """
+
+        if len(event.data) < 3:
+            return
+        location, sequence, position = int(event.data[0]), int(event.data[1]), int(event.data[2])
+        if event.player in self.players and (location == MONSTER_ZONE or location in SPELL_ZONES):
+            self.zones[(event.player, location, sequence)] = ZoneCard(event.card_id, position)
+        self._recount()
+
+    def _card_data(self, event: DuelEvent) -> None:
+        """内核下发的卡面数据：把这一片区域里各格的**当前攻守/表示形式**抄进去。
+
+        报文里没带位置的块在解析层就被丢掉了，所以这里只管"格位对得上的"。
+        """
+
+        for controller, location, sequence, position, attack, defense in event.blocks:
+            card = self.zones.get((int(controller), int(location), int(sequence)))
+            if card is None:
+                continue
+            if position:
+                card.position = int(position)
+            if attack >= 0:
+                card.attack = int(attack)
+            if defense >= 0:
+                card.defense = int(defense)
 
     def _move(self, event: DuelEvent) -> None:
         """处理一次移动：清掉原格位，占住新格位。"""
