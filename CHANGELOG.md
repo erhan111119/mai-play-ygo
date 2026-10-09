@@ -2,6 +2,33 @@
 
 > 本文件从「麦麦玩游戏王」1.0.0 起版（合并前的「游戏王对局管家」历史已不随仓库保留）。
 
+## 1.2.2
+
+### 编写脚本：把"编译器看到的枚举成员"喂进提示词（修 107 那种"3 轮都没编译过"）
+
+用户报"生成 3 轮都没能编译通过"，失败原因是模型写的
+`AI.SelectPosition(CardPosition.FaceUpDefense)` —— 而 WindBot 的枚举是**英式拼写** `FaceUpDefence`，
+C# 直接 CS0117（"CardPosition 未包含 FaceUpDefense 的定义"），连着两轮同一个错。
+
+- **根治**：写脚本的提示词不再靠手写的枚举清单，而是**从源码树读**（`scriptgen.read_enums`）：
+  扫 `YGOSharp.OCGWrapper.Enums/*.cs` 与 `Game/AI/*.cs`，把 `CardPosition` / `CardLocation` /
+  `CardRace` / `CardAttribute` / `CardType` / `DuelPhase` / `ExecutorType` 的成员原样附在速查表末尾
+  （"枚举成员（**从源码树读的，拼写就按这些抄**）"）。读不到就退回原来的固定清单，不影响生成。
+  顺带纠正了几处旧速查表漏写的值（如 `DuelPhase.BattleStart/BattleStep/Damage/DamageCal`）。
+- 速查表里点名那条拼写坑（守备是英式 `Defence`）；`_COMPILE_HINTS` 的 CS0117 也写具体了，
+  重试时会把"该改成什么"直接告诉模型。
+- 顺手补两条同一次真机里新冒出来的编译错（各卡住一轮）：
+  * **`AI.SelectCard(卡1, 卡2)` 不能并列传卡**——那个重载只收卡号（`params int[]`），
+    两张卡并列会报 CS1503"参数 1/2 无法从 ClientCard 转换为 int"；多张卡要装进 `List<ClientCard>`；
+  * **`c.Attribute == CardAttribute.Light` 是错的**（CS0019：数值不能和枚举比），一律用
+    `c.HasAttribute(...)` / `c.HasRace(...)` / `c.HasType(...)`。
+- **验证**：卡组 #107 重跑一次「编写脚本」——**2235 行 / 41 个处理函数，第 3 轮编译通过**
+  （联网资料 4848 字 / 6 次检索），且过程里没再出现 CS0117 那一类错。
+
+### 细节
+
+- 新增回归用例：枚举从源码树读（含"源码树里没有那两处就退回固定速查表"）、美式拼写只允许出现在警告里。
+
 ## 1.2.1
 
 ### 修复：面板"载入不进去"（JS 转义被 Python 先吃掉了）

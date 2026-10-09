@@ -720,6 +720,68 @@ def test_script_generator_writes_compiles_and_reports_attempts() -> None:
             assert needle in prompt, f"速查表里缺少 {needle}"
 
 
+def test_cheatsheet_enums_come_from_the_source_tree() -> None:
+    """提示词里的枚举成员**从源码树读**，不让模型凭记忆拼。
+
+    回归测试（2026-10-10，卡组 #107）：模型写了美式 `CardPosition.FaceUpDefense`，而枚举里是
+    英式 `FaceUpDefence` → CS0117 连着两轮同一个错、脚本没写成。现在速查表末尾会附一段
+    "枚举成员（从源码树读的）"，就是编译器看到的定义；CS0117 的重试提示也点名了这条拼写。
+    """
+
+    scriptgen = _load("train.scriptgen")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source, windbot = _make_tree(root)
+        enums_dir = source / "YGOSharp.OCGWrapper.Enums"
+        enums_dir.mkdir(parents=True, exist_ok=True)
+        (enums_dir / "CardPosition.cs").write_text(
+            "\n".join(
+                [
+                    "namespace X",
+                    "{",
+                    "    public enum CardPosition",
+                    "    {",
+                    "        FaceUpAttack = 0x1,",
+                    "        FaceUpDefence = 0x4,",
+                    "    }",
+                    "}",
+                ]
+            ) + "\n",
+            encoding="utf-8",
+        )
+        executor_dir = source / "Game" / "AI"
+        executor_dir.mkdir(parents=True, exist_ok=True)
+        (executor_dir / "ExecutorType.cs").write_text(
+            "public enum ExecutorType { Activate, Summon, SummonOrSet }\n", encoding="utf-8"
+        )
+
+        async def generate(prompt: str) -> str:
+            return handler_reply(prompt)
+
+        generator = scriptgen.DeckScriptGenerator(
+            generate, source_dir=source, windbot_dir=windbot, style_name="Gen1"
+        )
+        sheet = generator._cheatsheet("Gen1")
+        assert "### 枚举成员（**从源码树读的，拼写就按这些抄**）" in sheet, sheet[-400:]
+        assert "`CardPosition`：FaceUpAttack FaceUpDefence" in sheet, sheet[-400:]
+        assert "`ExecutorType`：Activate Summon SummonOrSet" in sheet, sheet[-300:]
+        # 美式拼写只该出现在"别这么写"的警告里，绝不能出现在枚举清单里
+        assert sheet.count("FaceUpDefense") == 1, sheet.count("FaceUpDefense")
+
+        # 源码树里没有那两处 → 退回固定速查表，不报错
+        bare = Path(directory) / "bare-src"
+        (bare / "Game" / "AI" / "Decks").mkdir(parents=True)
+        plain = scriptgen.DeckScriptGenerator(
+            generate, source_dir=bare, windbot_dir=windbot, style_name="Gen1"
+        )
+        assert "### 枚举成员" not in plain._cheatsheet("Gen1")
+        assert "CardLocation.Grave" in plain._cheatsheet("Gen1")
+
+    # CS0117 的重试提示要点名英式拼写（不然模型会照着原样再写一遍）
+    hints = dict(scriptgen._COMPILE_HINTS)
+    assert "Defence" in hints["CS0117"] and "Defense" in hints["CS0117"]
+
+
 def test_script_generator_registers_what_it_got_and_warns_about_the_rest() -> None:
     """某一批最终没写成时：**不登记它的发动**（没判断就"能发就发"更糟），并在结果里说清少了哪些卡。"""
 

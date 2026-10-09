@@ -116,7 +116,14 @@ namespace WindBot.Game.AI.Decks
 * 选择目标 / 放置 / 表态：`AI.SelectCard(卡号)`、`AI.SelectCard(卡号1, 卡号2, ...)`、
   `AI.SelectCard(ClientCard 对象)`、`AI.SelectCard(IList<ClientCard>)`、
   `AI.SelectPlace(Zones.MainMonsterZones)`（不指定就 `AI.SelectPlace(0)`）、
-  `AI.SelectPosition(CardPosition.FaceUpAttack)`、`AI.SelectOption(序号)`、`AI.SelectYesNo(true/false)`
+  `AI.SelectPosition(CardPosition.FaceUpDefence)`、`AI.SelectOption(序号)`、`AI.SelectYesNo(true/false)`
+  * ⚠ 守备是**英式拼写 `Defence`**：写成美式 `CardPosition.FaceUpDefense` 就是 CS0117，
+    真机上就这么卡住过两轮。**枚举成员一律照下面「枚举成员（从源码树读的）」那一段抄。**
+  * ⚠ **一次给多张卡时，`ClientCard` 不能并列传**：`AI.SelectCard(卡1, 卡2)` 会报
+    CS1503（参数 1/2 无法从 `ClientCard` 转换为 `int`）——那个重载只收**卡号**。
+    多张卡请装进 `List<ClientCard>` 再 `AI.SelectCard(那个 list)`；单张卡可以直接 `AI.SelectCard(卡)`。
+  * ⚠ `c.Attribute` / `c.Race` 是**数值**，别写 `c.Attribute == CardAttribute.Light`（CS0019）：
+    一律用 `c.HasAttribute(CardAttribute.Light)` / `c.HasRace(...)` / `c.HasType(...)`。
 * `Zones` 常量：`Zones.z0`~`Zones.z6`（单格位，`z0` 是最左）、`Zones.MainMonsterZones`、
   `Zones.ExtraMonsterZones`、`Zones.SpellZones`、`Zones.PendulumZones`、`Zones.FieldZone`
 * 回合与场面：`Duel.Turn`、`Duel.Player`（0＝自己）、`Duel.Phase` 与
@@ -184,6 +191,45 @@ class ScriptGenerationError(RuntimeError):
     """生成或编译出牌脚本失败。"""
 
 
+#: 提示词里的枚举值一律**从源码树读**（编译器看到的那份），别手写：
+#: 真机上栽过——模型按美式拼写写 `CardPosition.FaceUpDefense`，而枚举里是英式 `FaceUpDefence`
+#: → CS0117 连着两轮同一个错（2026-10-10，卡组 #107）。
+_ENUM_NAMES = ("CardPosition", "CardLocation", "CardRace", "CardAttribute", "CardType", "DuelPhase", "ExecutorType")
+
+
+def read_enums(source_dir: Path, names: Sequence[str] = _ENUM_NAMES) -> Dict[str, List[str]]:
+    """扫源码树里的枚举定义，返回 ``{枚举名: [成员…]}``（读不到的枚举就不出现在结果里）。
+
+    只扫两处：`YGOSharp.OCGWrapper.Enums/*.cs`（卡的本质属性）与 `Game/AI/*.cs`
+    （`ExecutorType` 这类 WindBot 自己的枚举）。
+    """
+
+    found: Dict[str, List[str]] = {}
+    roots = [Path(source_dir) / "YGOSharp.OCGWrapper.Enums", Path(source_dir) / "Game" / "AI"]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.cs")):
+            try:
+                text = path.read_text(encoding="utf-8-sig", errors="replace")
+            except OSError:
+                continue
+            for name in names:
+                if name in found:
+                    continue
+                match = re.search(rf"enum\s+{re.escape(name)}\b[^{{]*\{{(.*?)\}}", text, re.S)
+                if match is None:
+                    continue
+                members: List[str] = []
+                for line in match.group(1).splitlines():
+                    code = line.split("//")[0].split("=")[0].strip().rstrip(",")
+                    if re.fullmatch(r"[A-Za-z_]\w*", code) and code not in members:
+                        members.append(code)
+                if members:
+                    found[name] = members
+    return found
+
+
 #: 编译报错 → "该提醒模型什么"的对照表。**只有实测栽过的才写进来**，每条都注明真机现象。
 #: 为什么要这张表：把 msbuild 的原文整段丢回去，模型经常照着原样再写一遍
 #: （真机上 `FindAll`、`IsYiJieCard` 各连着两轮报同一个错）；点出"错在哪个用法、该换成什么"
@@ -213,12 +259,20 @@ _COMPILE_HINTS: Tuple[Tuple[str, str], ...] = (
     ),
     (
         "CS1503",
-        "传参类型不对：`AI.SelectCard(...)` 只接**卡号(int)**、**`ClientCard`** 或 **`IList<ClientCard>`**；"
-        "`AI.SelectPlace(...)` 接 `Zones.` 常量；别把列表/型号混着传。",
+        "传参类型不对：`AI.SelectCard(卡1, 卡2)` 这种**两张卡并列**的写法会报“参数 1/2 无法从 ClientCard 转换为 int”"
+        "——那个重载只收卡号。多张卡装进 `List<ClientCard>` 再传（`AI.SelectCard(list)`），"
+        "单张卡直接 `AI.SelectCard(卡)`；`AI.SelectPlace(...)` 只收 `Zones.` 常量或一个格子号。",
+    ),
+    (
+        "CS0019",
+        "把枚举当数值比了（例如 `c.Attribute == CardAttribute.Light`）：`Attribute`/`Race` 是数值字段，"
+        "判断一律用 `c.HasAttribute(...)` / `c.HasRace(...)` / `c.HasType(...)`。",
     ),
     (
         "CS0117",
-        "用了不存在的枚举成员：只用速查表里列出的那些值。",
+        "用了不存在的枚举成员：照速查表里「枚举成员（从源码树读的）」那一段抄。"
+        "最容易错的是守备——是**英式 `Defence`**（`CardPosition.FaceUpDefence` / `FaceDownDefence`），"
+        "写成美式 `Defense` 就是 CS0117（真机上卡过两轮）。",
     ),
 )
 
@@ -412,6 +466,9 @@ class DeckScriptGenerator:
         self._build_timeout = build_timeout
         self._dotnet = dotnet
         self._logger = logger or logging.getLogger(__name__)
+        self._enums: Optional[Dict[str, List[str]]] = None
+        """从源码树读来的枚举成员（第一次用到时才读，见 :func:`read_enums`）。"""
+
         self._retry_batches: List[int] = []
         """下一次编译失败时只重问哪几批处理函数（由 :meth:`generate` 按报错行号填）。"""
 
@@ -887,6 +944,27 @@ class DeckScriptGenerator:
             return found
         raise ScriptGenerationError(f"这一批（{len(batch)} 张卡）{BATCH_ATTEMPTS} 次都没写成：{error}")
 
+    def _cheatsheet(self, style_name: str) -> str:
+        """API 速查表 = 固定那份 + **从源码树读来的枚举成员**。
+
+        枚举读得到就附在末尾（模型照抄就不会拼错）；读不到（源码树里没有那两处）就只用固定那份，
+        不影响生成，只是少了"真值兜底"。
+        """
+
+        base = API_CHEATSHEET.replace("{style_name}", style_name)
+        if self._enums is None:
+            self._enums = read_enums(self._source_dir)
+        if not self._enums:
+            return base
+        lines = [
+            "",
+            "### 枚举成员（**从源码树读的，拼写就按这些抄**）",
+            "（上面速查表里的枚举值以这一段为准；这一段就是编译器看到的定义）",
+        ]
+        for name, members in self._enums.items():
+            lines.append(f"* `{name}`：{' '.join(members)}")
+        return base + "\n".join(lines) + "\n"
+
     def _build_handler_prompt(
         self,
         request: DeckScriptRequest,
@@ -986,7 +1064,7 @@ class DeckScriptGenerator:
             ]
         if previous_error.strip():
             lines += ["", "上一次这一批没通过，原因如下（含报错处的代码原文），请修正后重新输出整批函数：", previous_error.strip()[:4000]]
-        lines += ["", "可用的 API（只用这些）：", API_CHEATSHEET.replace("{style_name}", style_name)]
+        lines += ["", "可用的 API（只用这些）：", self._cheatsheet(style_name)]
         return "\n".join(lines)
 
     # ---------------------------------------------------------------- 解析模型输出
