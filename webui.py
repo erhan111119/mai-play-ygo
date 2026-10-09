@@ -210,7 +210,15 @@ def _read_deck_rows(db_path: Path) -> List[Dict[str, Any]]:
 
 
 def _read_ydk_summary(path: Path) -> Dict[str, Any]:
-    """读一份 .ydk，返回分区计数与卡号列表（不查卡名，卡名交给卡牌库可选补充）。"""
+    """读一份 .ydk，返回分区计数与卡号列表（不查卡名，卡名交给卡牌库可选补充）。
+
+    分区按**标记行**切：``#main`` / ``#extra`` / ``!side`` 三种写法都见过
+    （不同工具的首字符是 ``#`` 还是 ``!`` 不一定），所以去掉前导的 ``#`` / ``!`` 之后按名字认。
+
+    ⚠ 这里踩过一次：``!side`` 的判断写在"以 ``#`` 开头即注释"那一支**里面**——它不以 ``#`` 开头，
+    于是永远认不出来，副卡组的卡全被算进额外卡组。面板上就是「额外卡组 30 张 / 副卡组 0 张」，
+    两个区混在一起（用户报的"额外卡组和副卡组应该分开"）。
+    """
 
     summary: Dict[str, Any] = {"main": [], "extra": [], "side": [], "error": ""}
     try:
@@ -221,13 +229,12 @@ def _read_ydk_summary(path: Path) -> Dict[str, Any]:
     zone = "main"
     for raw_line in text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("#"):
-            if line.startswith("!side"):
-                zone = "side"
-            elif line.startswith("!extra"):
-                zone = "extra"
-            elif not line.startswith("#main") and line.startswith("#extra"):
-                zone = "extra"
+        if not line:
+            continue
+        if line[0] in "#!":
+            marker = line.lstrip("#!").strip().lower()
+            if marker in ("main", "extra", "side"):
+                zone = marker
             continue
         if line.isdigit():
             summary[zone].append(line)

@@ -124,7 +124,8 @@ _CARD_LINE = re.compile(r"^\d+$")
 def parse_ydk_cards(path: Path) -> Tuple[Set[int], Set[int]]:
     """读出一个 ``.ydk`` 文件里的主卡组与额外卡组卡 ID 集合。
 
-    额外卡组以 ``#extra`` 之后的内容为准；文件缺失或读不动时返回两个空集合。
+    分区按标记行切（``#main`` / ``#extra`` / ``!side``，首字符是 ``#`` 还是 ``!`` 不一定）；
+    文件缺失或读不动时返回两个空集合。
     """
 
     main: Set[int] = set()
@@ -140,12 +141,20 @@ def parse_ydk_cards(path: Path) -> Tuple[Set[int], Set[int]]:
             continue
         lowered = stripped.lower()
         if lowered.startswith("#") or lowered.startswith("!"):
-            if "extra" in lowered:
+            # ⚠ `side` 要单独认出来：副卡组的卡既不属于主卡组也不属于额外卡组
+            # （WindBot 自己的 `Deck.Load` 也把它们单独收进 SideCards，整局用不上）。
+            # 原来只说"不是 main/extra 就保持原区"，副卡组的卡于是被算进了额外卡组——
+            # 拿这份集合去比"哪份自带卡表最像"会偏（自带卡表里副卡组普遍有 5~15 张）。
+            if "side" in lowered:
+                section = "side"
+            elif "extra" in lowered:
                 section = "extra"
             elif "main" in lowered:
                 section = "main"
             continue
         if not _CARD_LINE.match(stripped):
+            continue
+        if section == "side":
             continue
         card_id = int(stripped)
         if section == "extra":

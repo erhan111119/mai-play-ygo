@@ -537,6 +537,39 @@ def _make_tree(root: Path) -> tuple:
     return source, windbot
 
 
+def test_deck_detail_splits_main_extra_and_side() -> None:
+    """卡组详情要把主卡组 / 额外卡组 / 副卡组**分开**（用户报"额外和副卡组应该分开"）。
+
+    回归测试：分区判断原来把 `!side` 写在"以 `#` 开头即注释"那一支里面——`!side` 不以 `#` 开头，
+    永远认不出来，副卡组的卡全被算进额外卡组。真机上表现为「额外卡组 30 张 / 副卡组 0 张」
+    （那副牌其实是 主 54 / 额 15 / 副 15）。这里连 `!extra` 这类别的写法一起钉住。
+    """
+
+    webui = _load("webui")
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "分区测试.ydk"
+        # 三种标记写法都写一遍：#main / #extra / !side（用 chr(10) 拼行，少一层转义）
+        path.write_text(
+            chr(10).join(
+                ["#created by mai-play-ygo - 测试", "#main", "1", "2", "3",
+                 "#extra", "9", "9", "!side", "5", ""]
+            ),
+            encoding="utf-8",
+        )
+        summary = webui._read_ydk_summary(path)
+        assert {key: len(value) for key, value in summary.items() if key != "error"} == {
+            "main": 3, "extra": 2, "side": 1
+        }, summary
+
+        # 没有额外卡组标记的那种（老工具只写 #main + !side）：额外区应当是空的，不能把副卡组算进去
+        legacy = Path(directory) / "老格式.ydk"
+        legacy.write_text(chr(10).join(["#main", "1", "2", "!side", "5", "6", ""]), encoding="utf-8")
+        legacy_summary = webui._read_ydk_summary(legacy)
+        assert {key: len(value) for key, value in legacy_summary.items() if key != "error"} == {
+            "main": 2, "extra": 0, "side": 2
+        }, legacy_summary
+
+
 def test_deck_workspace_endpoint_lists_script_and_combo_archives() -> None:
     """训练台要先看见"这副牌已经有什么"：当前脚本、推演存档、最近的结论。
 
@@ -960,6 +993,7 @@ def main() -> int:
     tests = [
         test_deck_operations_go_through_the_plugin_and_need_confirmation,
         test_deck_settings_endpoint_writes_random_pool_and_ai_scope,
+        test_deck_detail_splits_main_extra_and_side,
         test_training_deck_choices_expose_the_script_that_actually_plays,
         test_deck_workspace_endpoint_lists_script_and_combo_archives,
         test_rooms_endpoint_lays_out_the_board_without_leaking_face_down_cards,

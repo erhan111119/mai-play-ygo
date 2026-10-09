@@ -21,7 +21,7 @@ if str(_PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_ROOT))
 
 from duel.builtin_decks import BUILTIN_DECK_NAMES, builtin_decks  # noqa: E402
-from duel.windbot_decks import WIND_BOT_DECK_NAMES  # noqa: E402
+from duel.windbot_decks import WIND_BOT_DECK_NAMES, parse_ydk_cards  # noqa: E402
 
 MAIN: List[int] = [89631139, 89631139, 89631139] + [100000000 + index for index in range(37)]
 EXTRA: List[int] = [100200001, 100200002, 100200002]
@@ -69,6 +69,28 @@ def test_builtin_decks_use_chinese_names() -> None:
             ("Kashtira", "怒刹帝利"),
         ], entries
         assert all(path.is_file() for _style, _name, path in entries)
+
+
+def test_side_deck_cards_are_not_counted_as_extra() -> None:
+    """比"哪份自带卡表最像"时，副卡组的卡不能算进额外卡组。
+
+    WindBot 自己的 `Deck.Load` 把副卡组单独收进 `SideCards`（整局用不上），
+    所以我们读卡表也要按它的口径来。原来标记行只认 `extra`/`main`、`!side` 落到"保持原区"，
+    于是副卡组的 5~15 张全被算进额外卡组——自带卡表里副卡组普遍非空，这份集合拿去比相似度会偏。
+    """
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "AI_Side.ydk"
+        # 用 chr(10) 拼行：源码里少一层转义，读起来也更清楚（主 2 / 额 2 / 副 3）
+        path.write_text(
+            chr(10).join(
+                ["#main", "60811211", "60811212", "#extra", "5001", "5002", "!side", "7001", "7002", "7003", ""]
+            ),
+            encoding="utf-8",
+        )
+        main, extra = parse_ydk_cards(path)
+    assert main == {60811211, 60811212}, main
+    assert extra == {5001, 5002}, f"副卡组的卡不该出现在额外卡组里：{extra}"
 
 
 def test_missing_deck_file_is_skipped() -> None:
