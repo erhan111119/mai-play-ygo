@@ -81,8 +81,11 @@ def test_declared_capabilities_cover_code_usage() -> None:
         used.add("maisaka.context.append")
     if "self.ctx.maisaka.trigger_proactive(" in source:
         used.add("maisaka.proactive.trigger")
-    if "self.ctx.llm.generate" in source:
+    if "self.ctx.llm.generate(" in source:
         used.add("llm.generate")
+    # 联网检索 agent（2026-10-09）：带工具调用的模型出口，同样是能力白名单里的一项
+    if "self.ctx.llm.generate_with_tools(" in source:
+        used.add("llm.generate_with_tools")
     if "self.ctx.chat.get_all_streams(" in source:
         used.add("chat.get_all_streams")
 
@@ -98,6 +101,8 @@ def test_no_capability_used_but_never_declared_by_hallucination() -> None:
     assert declared <= {
         "send.text",
         "llm.generate",
+        # 联网检索 agent（2026-10-09）：写脚本时给模型一个 web_search 工具
+        "llm.generate_with_tools",
         "maisaka.context.append",
         "maisaka.proactive.trigger",
         "chat.get_all_streams",
@@ -158,8 +163,9 @@ def test_config_model_builds_and_matches_toml() -> None:
     # 1.5.0 起 `llm.decision_timeout_ms` 默认 4000（决策层推荐用 2 秒档的关思考模型）。
     # 同日起 1.4.0：`llm.decision_model` 默认改成空串（跟宿主的 utils 任务走）——
     # 出厂默认写一个厂商模型名，在别的机器上一上来就会"未找到名为 xxx 的模型"。
-    # 1.6.0 起 `[llm]` 多一个 search_model（写脚本前联网查资料用；默认留空＝不联网）。
-    assert defaults.plugin.config_version == "1.6.0"
+    # 1.6.0 起 `[llm]` 多一个 search_model（写脚本前联网查资料用；默认留空＝不联网）；
+    # 1.7.0 起再加 search_rounds（>0 时给写作模型一个 web_search 工具，自己多轮检索）。
+    assert defaults.plugin.config_version == "1.7.0"
 
     with (_PLUGIN_ROOT / "config.toml.example").open("rb") as handle:
         toml_data = tomllib.load(handle)

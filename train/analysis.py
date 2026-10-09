@@ -433,6 +433,11 @@ class ResearchResult:
 
     text: str = ""
     model: str = ""
+    queries: List[str] = field(default_factory=list)
+    """实际发出去的检索词（agent 循环那条路的产物；单次问那只模型时是空的）。"""
+
+    transcript: str = ""
+    """整段对话（检索词 + 每轮拿到什么），存档用——出问题时能看出"它到底查了什么"。"""
 
 
 _RESEARCH_SYSTEM = """你在为「游戏王」的一副卡组做资料搜集，读者是准备给它写自动出牌脚本的人。
@@ -510,6 +515,229 @@ async def research_archetype(
     if logger is not None:
         logger.info("联网资料已取回：%s 字（模型 %s）", len(text), model or "宿主默认")
     return ResearchResult(text=text, model=model)
+
+
+# ---------------------------------------------------------------------------
+# 联网检索 agent（给写脚本的人配一个 web_search 工具）
+# ---------------------------------------------------------------------------
+
+#: 给研究模型暴露的工具定义（OpenAI function-calling 形状；宿主直接透给 provider）。
+SEARCH_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": (
+            "联网搜索：查游戏王卡组的 combo / 展开路线 / 卡牌用法与裁定 / 教程。"
+            "输入一句具体的查询语句（中文或日文都行，卡名越具体越好）。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "要搜的查询语句，例如「码丽丝 先手 combo 展开」"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+#: agent 研究默认最多查几次。每次检索本机实测 7~12 秒，写脚本总共也就几分钟，给得起。
+SEARCH_ROUNDS_DEFAULT = 4
+
+#: 每次检索回给模型的字符上限（太长会把后面的对话挤出上下文）。
+SEARCH_RESULT_CHARS = 1800
+
+#: 附在资料后面的「检索原文」总量上限（写脚本的提示词要装得下）。
+RAW_RESULTS_CHARS = 4000
+
+#: 单次 `web_search` 允许联网模型写多长（一次检索的要点，不需要长）。
+SEARCH_ANSWER_TOKENS = 800
+
+_SEARCH_AGENT_SYSTEM = """你在为「游戏王」的一副卡组做资料搜集，读者是准备给它写自动出牌脚本的人。
+你有一个联网检索工具 `web_search`，**要主动用它多查几次**，把下面的问题查清楚：
+
+1. 这套牌现实里的**典型展开路线**（先手/后手各一条，写清"起手有哪几张 → 终场是什么"）；
+2. **卡的用法时机**：哪些是启动点、哪些要留着应对、同一张卡的多条效果哪个优先；
+3. **常见失误**：打得不好的人通常错在哪一步；
+4. 这套牌怕什么（手坑/除去/特定压制）、怎么躲。
+
+怎么查（重要）：
+* 卡组名可能只是社区译名或群友自取的名字——**按卡组名查不到就改用卡名**，一张一张查
+  "这张卡怎么用、和谁配合"；
+* 查到系列/字段名之后，再用"系列名 + combo / 展开 / 先手"接着查；
+* 每轮只查一件具体的事，**不要**把"XX 卡组的 combo 和教程和裁定"这种大杂烩丢进一次搜索；
+* 查完一轮就看看还缺什么，缺什么再查什么；不缺了就收手。
+
+收尾要求：
+* 查够之后**不要再调用工具**，直接输出资料正文；
+* **检索结果就是资料**：整理时必须写检索回来的事实（可以合并同类、可以改写得更清楚），
+  不要用记忆里的东西补充或替换它；也不要在正文里写"未经联网核对""仅供参考"这类免责声明；
+* 只写卡表里**实际有的卡**有关的战术；资料与卡文冲突的地方以卡表为准，并在那条后面标一句"（与卡文冲突）"；
+* 确实没查到的部分才写"没查到"，**不要用记忆里的旧信息填空**；
+* 输出纯文本条目（每条 `- ` 开头），最后单独一段列来源（站点名/标题即可）。"""
+
+
+async def research_with_search(
+    generate_with_tools: Callable[..., Any],
+    search: Callable[[str], Any],
+    *,
+    deck_name: str,
+    digest: str,
+    model: str,
+    card_names: Sequence[str] = (),
+    max_rounds: int = SEARCH_ROUNDS_DEFAULT,
+    extra_prompt: str = "",
+    logger: Optional[logging.Logger] = None,
+) -> ResearchResult:
+    """让模型**自己决定查什么**（带 `web_search` 工具的 agent 循环），最后产出资料。
+
+    与 :func:`research_archetype`（单次问一只联网模型）的区别：那只模型只有一次机会，
+    问什么由我们拼好；这一条给它一个检索工具，它可以"先搜卡组名 → 发现是某个系列 →
+    再搜系列 combo → 再搜某张关键卡的用法"。生僻卡组/社区译名这种情况差别很大。
+
+    工具调用**由调用方执行**（`search` 回调）：本机没有可直接调用的搜索 API，
+    搜索后端就是配置里那只联网模型（`llm.search_model`）——工具语义仍然是
+    "输入查询语句、拿回检索结果"。
+
+    Args:
+        generate_with_tools: 协程 ``(messages, model, max_tokens, tools) -> dict``，
+            返回值里带 ``tool_calls``（宿主 `cap.llm.generate_with_tools` 的形状）。
+        search: 协程 ``(query) -> str``：真正去检索，返回给模型看的文本；失败时应抛异常
+            （这里会把它变成一条"检索失败"的工具结果，让模型换个词再试，而不是整个任务失败）。
+        deck_name / digest / card_names: 同 :func:`research_archetype`。
+        model: 跑这个 agent 的模型（建议用写作那只不思考的：单轮 1~2 秒，四轮也就几秒）。
+        max_rounds: 最多让它查几轮（每轮可以带多个 tool_call，全部都会执行）。
+
+    Raises:
+        AnalysisError: 第一轮模型调用就失败、或模型自始至终没给正文。
+    """
+
+    extra = str(extra_prompt or "").strip()
+    extra_block = f"\n\n作者特别想弄清楚的问题：\n{extra[:1000]}" if extra else ""
+    names = [str(name).strip() for name in card_names if str(name).strip()]
+    names_block = ""
+    if names:
+        shown = names[:14]
+        names_block = "\n（这套牌的主要卡片：" + "、".join(shown) + ("…）" if len(names) > len(shown) else "）")
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": _SEARCH_AGENT_SYSTEM},
+        {
+            "role": "user",
+            "content": (
+                f"{digest}{extra_block}\n\n"
+                f"请用 web_search 查明「{deck_name}」这套牌怎么打{names_block}，"
+                f"然后按上面的要求整理成资料。"
+            ),
+        },
+    ]
+    queries: List[str] = []
+    transcript: List[str] = []
+    # 每次检索的**原始结果**：整理稿可能被模型写歪（实测真的会：整篇按记忆写、还声明"未经联网核对"），
+    # 所以原文要单独留一份，跟着资料一起给写手
+    raw_parts: List[str] = []
+    rounds = max(1, int(max_rounds))
+    text = ""
+    for round_index in range(1, rounds + 1):
+        last = round_index == rounds
+        tools = [] if last else [SEARCH_TOOL]
+        if last:
+            # 最后一轮收口：不许再查，直接把资料写出来（不然它可能一直查到额度用完）
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "检索次数用完了。现在不要再调用工具，直接把已经查到的内容整理成资料输出。",
+                }
+            )
+        try:
+            payload = await generate_with_tools(messages, model, RESEARCH_MAX_TOKENS, tools)
+        except Exception as exc:  # noqa: BLE001  第一轮就挂＝这次联网没戏；后面几轮挂＝拿已有的收口
+            if round_index == 1:
+                raise AnalysisError(_with_hint(f"联网检索失败：{exc}")) from exc
+            transcript.append(f"[第 {round_index} 轮调用失败] {exc}")
+            break
+        calls = payload.get("tool_calls") or []
+        content = str(payload.get("response") or "").strip()
+        if not calls:
+            text = content
+            break
+        assistant_calls: List[Dict[str, Any]] = []
+        for call in calls:
+            function = call.get("function") or {}
+            args = function.get("arguments")
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    args = {"query": args}
+            query = str((args or {}).get("query") or "").strip()
+            assistant_calls.append(
+                {
+                    "id": str(call.get("id") or f"call_{len(assistant_calls) + 1}"),
+                    "type": "function",
+                    "function": {
+                        "name": str(function.get("name") or "web_search"),
+                        "arguments": json.dumps({"query": query}, ensure_ascii=False),
+                    },
+                }
+            )
+        messages.append({"role": "assistant", "content": content, "tool_calls": assistant_calls})
+        for call in assistant_calls:
+            query = str(json.loads(call["function"]["arguments"]).get("query") or "")
+            queries.append(query)
+            try:
+                result = str(await search(query)).strip()
+                failed = False
+            except Exception as exc:  # noqa: BLE001  单次检索失败不该掐掉整轮研究
+                result = f"检索失败：{exc}"
+                failed = True
+            if len(result) > SEARCH_RESULT_CHARS:
+                result = result[:SEARCH_RESULT_CHARS] + "…（结果过长已截断）"
+            transcript.append(f"[{query}] {'失败' if failed else f'{len(result)} 字'}")
+            if not failed:
+                # 原始结果单独留一份：模型整理时可能会"不认"检索到的东西
+                # （本机实测：它写了 2184 字资料，开头却声明"未经过本次联网核对"，全靠记忆写的），
+                # 那份资料一旦被它自己写歪，检索到的事实就全丢了——所以原文要跟着一起给写手
+                raw_parts.append(f"- 查询「{query}」：\n{result}")
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "name": "web_search",
+                    "content": result or "（这次检索没有任何结果）",
+                }
+            )
+        if last:
+            text = content
+    if not text:
+        # 轮数用尽还在查：再要一次正文（此时已经不许调工具，模型没理由继续查）
+        messages.append({"role": "user", "content": "请直接输出资料正文，不要再调用工具。"})
+        try:
+            payload = await generate_with_tools(messages, model, RESEARCH_MAX_TOKENS, [])
+            text = str(payload.get("response") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            raise AnalysisError(_with_hint(f"联网检索收尾失败：{exc}")) from exc
+    if not text:
+        raise AnalysisError(
+            _with_hint("联网检索跑完了但模型没给正文（额度可能被思考吃光，或这只模型不擅长工具调用）")
+        )
+    if logger is not None:
+        logger.info(
+            "联网检索完成：查了 %s 次（%s），资料 %s 字",
+            len(queries),
+            "、".join(queries[:6]) or "没查到东西",
+            len(text),
+        )
+    raw_block = ""
+    if raw_parts:
+        joined = "\n".join(raw_parts)
+        if len(joined) > RAW_RESULTS_CHARS:
+            joined = joined[:RAW_RESULTS_CHARS] + "\n…（原始结果过长已截断）"
+        raw_block = "\n\n【web_search 的原始结果（未经模型改写）】\n" + joined
+    return ResearchResult(
+        text=text + raw_block,
+        model=model,
+        queries=queries,
+        transcript="\n".join(transcript),
+    )
 
 
 # ---------------------------------------------------------------------------

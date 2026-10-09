@@ -480,6 +480,178 @@ def test_empty_research_reply_is_an_error() -> None:
         raise AssertionError("空回复应该抛 AnalysisError")
 
 
+def _tool_call(call_id: str, query: str) -> Dict[str, Any]:
+    """造一个宿主形状的 tool_call（`generate_with_tools` 返回里的那一截）。"""
+
+    return {
+        "id": call_id,
+        "function": {"name": "web_search", "arguments": {"query": query}},
+        "extra_content": {"tool_call_source": "response"},
+    }
+
+
+def test_search_agent_loops_until_it_has_enough() -> None:
+    """检索 agent：模型自己决定查什么、查几次，最后一轮收口拿正文。
+
+    这条锁住三件事：①工具定义真的传下去了（`tools` 非空才算"给了联网工具"）；
+    ②检索词按顺序回灌给模型（工具结果里的原文要能被模型看见）；③模型不再调工具时立刻收手。
+    """
+
+    analysis = _load("train.analysis")
+    turns: List[Dict[str, Any]] = []
+    searched: List[str] = []
+
+    async def fake_generate_with_tools(messages: Any, model: str, max_tokens: int, tools: Any) -> Dict[str, Any]:
+        turns.append({"model": model, "tools": list(tools), "last": messages[-1], "count": len(messages)})
+        if len(turns) == 1:
+            return {"success": True, "response": "", "tool_calls": [_tool_call("c1", "码丽丝 先手 combo")]}
+        if len(turns) == 2:
+            return {"success": True, "response": "", "tool_calls": [_tool_call("c2", "码丽丝 白兔 效果")]}
+        return {"success": True, "response": "- 先手做白兔检索\n- 龙王压场", "tool_calls": []}
+
+    async def fake_search(query: str) -> str:
+        searched.append(query)
+        return f"检索结果：{query} 的要点……"
+
+    result = asyncio.run(
+        analysis.research_with_search(
+            fake_generate_with_tools,
+            fake_search,
+            deck_name="码丽丝",
+            digest="# 卡组：码丽丝\n- 100 白兔｜效果：检索。",
+            model="deepseek-flash",
+            card_names=["白兔"],
+            max_rounds=4,
+            logger=None,
+        )
+    )
+    assert len(turns) == 3, f"应该查两轮、第三轮收口，实际 {len(turns)} 轮"
+    assert turns[0]["tools"] and turns[0]["tools"][0]["function"]["name"] == "web_search", "第一轮就要给工具"
+    assert turns[2]["tools"], "还没到轮数上限，工具不该被提前收回"
+    assert len(turns) == 3, f"模型不再调工具时就该收手（上限 4 轮，实际 {len(turns)} 轮）"
+    assert searched == ["码丽丝 先手 combo", "码丽丝 白兔 效果"], searched
+    assert result.queries == searched, result.queries
+    # 第二轮的消息里要能看到"第一轮查到了什么"（工具结果回灌）
+    assert "检索结果：码丽丝 先手 combo" in json.dumps(turns[1]["last"], ensure_ascii=False)
+    assert "先手做白兔检索" in result.text
+    assert "码丽丝 先手 combo" in result.transcript
+
+
+def test_search_agent_survives_a_failed_query_and_stops_at_the_round_cap() -> None:
+    """单次检索失败只记一条"检索失败"，且轮数用尽时必须收口（不能让写脚本永远挂着）。"""
+
+    analysis = _load("train.analysis")
+    rounds: List[int] = []
+
+    async def always_calls_tools(messages: Any, model: str, max_tokens: int, tools: Any) -> Dict[str, Any]:
+        rounds.append(len(tools))
+        if not tools:
+            return {"success": True, "response": "（收口正文）没查到可用资料。", "tool_calls": []}
+        return {"success": True, "response": "", "tool_calls": [_tool_call(f"c{len(rounds)}", "随便查点")]}
+
+    async def broken_search(query: str) -> str:
+        raise RuntimeError("搜索 provider 欠费")
+
+    result = asyncio.run(
+        analysis.research_with_search(
+            always_calls_tools,
+            broken_search,
+            deck_name="x",
+            digest="d",
+            model="",
+            max_rounds=2,
+            logger=None,
+        )
+    )
+    assert rounds == [1, 0], f"两轮：第一轮给工具、第二轮收口，实际 {rounds}"
+    assert result.text.startswith("（收口正文）"), result.text
+    assert "失败" in result.transcript, result.transcript
+
+
+async def _runner_uses_the_search_agent_only_when_the_host_offers_tools() -> None:
+    """runner 的两条路：有 `generate_with_tools` 就走 agent（用写作模型跑）、没有就退回单次问联网模型。"""
+
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        store = _load("train.store").TrainingStore(tmp / "training.db")
+        deck_path = tmp / "测试牌.ydk"
+        _write_deck(deck_path, [101, 102])
+        params = {"deck_id": 0, "deck_name": "测试牌", "deck_file": str(deck_path)}
+        calls: List[str] = []
+
+        async def fake_tools(messages: Any, model: str, max_tokens: int, tools: Any) -> Dict[str, Any]:
+            calls.append(f"tools:{model}")
+            return {"success": True, "response": "- 资料正文", "tool_calls": []}
+
+        async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+            calls.append(f"single:{model}")
+            return "- 单次资料正文"
+
+        runner = _make_runner(tmp, store, generate=fake_generate)
+        runner.set_search_model("联网搜索")
+        runner.set_tools_generate(fake_tools)
+        assert "资料正文" in await runner._derive_research_for(params)
+        # agent 那一路跑的是**写作模型**（`test-model`），联网由 web_search 背后的联网模型负责
+        assert calls == ["tools:test-model"], calls
+
+        # 宿主没给工具出口（旧宿主）→ 退回单次问那只联网模型
+        calls.clear()
+        runner.set_tools_generate(None)
+        assert "单次资料正文" in await runner._derive_research_for(params)
+        assert calls == ["single:联网搜索"], calls
+
+        # 关掉检索轮数（0）→ 也走单次那条路
+        calls.clear()
+        runner.set_tools_generate(fake_tools)
+        runner.set_search_rounds(0)
+        await runner._derive_research_for(params)
+        assert calls == ["single:联网搜索"], calls
+
+        # 完全不联网（search_model 空）→ 一次模型调用都不该发生，且要**清掉**上一次的检索记录
+        # （留着会让面板显示"这一版查了 6 次"，其实一次没查——实测被自己误导过）
+        calls.clear()
+        runner._research_queries = ["上一版的查询"]
+        runner.set_search_model("")
+        assert await runner._derive_research_for(params) == ""
+        assert calls == [], calls
+        assert runner._research_queries == [], runner._research_queries
+
+
+def test_search_agent_keeps_the_raw_results_even_if_the_summary_talks_past_them() -> None:
+    """模型"不认"检索结果时，原文也必须留住（本机真实翻车现场）。
+
+    真机现象：agent 查了 6 次、拿到了真 combo（"睡鼠单卡可展开达成双 LINK5+红心+防火龙+07"），
+    但它写出来的 2184 字资料开头是"以下内容基于我对该系列的既有知识整理，**未经过本次联网核对**"
+    ——全按记忆写。要是资料只取它那段正文，检索到的事实就白丢了，所以原文必须跟着一起给写手。
+    """
+
+    analysis = _load("train.analysis")
+
+    async def fake_generate_with_tools(messages: Any, model: str, max_tokens: int, tools: Any) -> Dict[str, Any]:
+        if tools:
+            return {"success": True, "response": "", "tool_calls": [_tool_call("c1", "码丽丝 睡鼠 单卡 combo")]}
+        return {"success": True, "response": "（按记忆写的资料，未经过联网核对）", "tool_calls": []}
+
+    async def fake_search(query: str) -> str:
+        del query
+        return "- 码丽丝<兵卒>睡鼠单卡可展开达成双 LINK5+红心+防火龙+07，并抽4丢1。"
+
+    result = asyncio.run(
+        analysis.research_with_search(
+            fake_generate_with_tools,
+            fake_search,
+            deck_name="码丽丝",
+            digest="d",
+            model="deepseek-flash",
+            max_rounds=2,
+            logger=None,
+        )
+    )
+    assert "未经过联网核对" in result.text, result.text[:200]
+    assert "【web_search 的原始结果（未经模型改写）】" in result.text, "检索原文必须附在资料里"
+    assert "睡鼠单卡可展开达成双 LINK5" in result.text, result.text[-300:]
+
+
 def test_deck_digest_and_combo_check_catch_cards_outside_the_deck() -> None:
     """模型提到的卡必须真在卡表里：不在的从结构化字段里剔掉，并留下 warning。"""
 
@@ -1512,6 +1684,10 @@ def main() -> int:
         test_combo_keeps_the_main_lines_when_the_notes_round_fails,
         _combo_derivation_archives_the_guide,
         _research_goes_to_the_search_model_and_never_blocks_the_run,
+        test_search_agent_loops_until_it_has_enough,
+        test_search_agent_keeps_the_raw_results_even_if_the_summary_talks_past_them,
+        test_search_agent_survives_a_failed_query_and_stops_at_the_round_cap,
+        _runner_uses_the_search_agent_only_when_the_host_offers_tools,
         _script_tokens_and_iteration_prompts_come_from_config,
         _write_script_record_says_how_much_it_wrote,
         _unknown_deck_is_refused_before_a_record_exists,

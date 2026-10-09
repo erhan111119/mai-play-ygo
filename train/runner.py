@@ -31,8 +31,11 @@ from .analysis import (
     AnalysisError,
     build_deck_digest,
     deck_card_ids,
+    SEARCH_ANSWER_TOKENS,
+    SEARCH_ROUNDS_DEFAULT,
     derive_combo,
     research_archetype,
+    research_with_search,
     summarise_run,
     tail_lines,
 )
@@ -161,6 +164,13 @@ class TrainingRunner:
         self._search_model = ""
         #: 写脚本时每次模型调用的输出上限；同样由插件按配置推过来（见 `set_script_max_tokens`）。
         self._script_max_tokens = DEFAULT_SCRIPT_MAX_TOKENS
+        #: 跑检索 agent 用哪只模型（＝写作那只）；由插件推（`set_training_model`）。
+        #: 联网检索最多几轮；0＝不用工具、退化成"单次问一只联网模型"。
+        self._search_rounds = SEARCH_ROUNDS_DEFAULT
+        #: 带工具调用的模型回调；宿主没这个能力时保持 None（自动退回单次问那只联网模型）。
+        self._tools_generate: Optional[Callable[..., Any]] = None
+        #: 这一次实际发出去的检索词（面板/日志用）。
+        self._research_queries: List[str] = []
         #: 最近一次联网查资料失败的原因（空串＝没失败过）。它只用于在面板/日志上**如实说明**
         #: "这一轮没联网"，不是错误状态机——下次调用会覆盖它。
         self._research_error = ""
@@ -698,6 +708,9 @@ class TrainingRunner:
             "research_model": str(getattr(self, "_search_model", "") or ""),
             "research_chars": len(research),
             "research_error": str(getattr(self, "_research_error", "") or ""),
+            # 检索 agent 那一路：最多几轮、实际查了什么（复盘时要看"资料是怎么来的"）
+            "research_rounds": int(getattr(self, "_search_rounds", 0) or 0),
+            "research_queries": list(getattr(self, "_research_queries", []) or []),
         }
         self.store.finish(run.run_id, STATUS_DONE, summary=summary)
         if self.logger is not None:
@@ -740,40 +753,90 @@ class TrainingRunner:
     async def _derive_research_for(self, params: Dict[str, Any]) -> str:
         """联网查一遍这副牌怎么打，存档并返回正文（没配联网模型就返回空串）。
 
+        两条路，按宿主与配置自动选：
+
+        * **带工具的研究 agent**（`llm.search_rounds > 0` 且宿主给了
+          `generate_with_tools`）：给写作模型一个 `web_search` 工具，让它自己决定查什么
+          （先查卡组名 → 查到系列再查 combo → 再查关键卡），检索由 `_web_search` 执行。
+        * **单次问一只联网模型**（旧口径）：一次机会，问句由插件拼好。
+
         **失败不抛**：联网资料是"锦上添花"——搜索 provider 挂了、欠费了都不该把整次写脚本拖没。
         但也**不许悄悄失败**：失败原因会原样回到调用方记进 summary/日志，面板上看得见。
         """
 
         model = str(getattr(self, "_search_model", "") or "")
         if not model:
+            # 不联网时把上一次的检索记录清掉：留着会让面板显示"这一版查了 6 次"，
+            # 而其实一次都没查（实测就是这么被自己误导的）
+            self._research_queries = []
             if self.logger is not None:
                 self.logger.info("没配联网资料模型（llm.search_model），这一轮脚本只按卡文与 combo 推演写")
             return ""
+        rounds = int(getattr(self, "_search_rounds", 0) or 0)
+        tools_generate = getattr(self, "_tools_generate", None)
+        names = sorted(self._known_names(params))
         try:
-            result = await research_archetype(
-                self._generate,
-                deck_name=str(params["deck_name"]),
-                digest=self._deck_digest(params),
-                model=model,
-                # 卡组名常常只是社区译名/群友自取的名字，按它问只会得到"没查到"；
-                # 把卡名一起递过去，模型才能改按卡名逐张查（异解那副就是这么救回来的）
-                card_names=sorted(self._known_names(params)),
-                extra_prompt=str(params.get("extra_prompt") or ""),
-                logger=self.logger,
-            )
+            if rounds > 0 and tools_generate is not None:
+                result = await research_with_search(
+                    tools_generate,
+                    self._web_search,
+                    deck_name=str(params["deck_name"]),
+                    digest=self._deck_digest(params),
+                    # 跑检索 agent 的是**写作那只模型**：单轮 1~2 秒，四轮也就几秒；
+                    # 而"联网"这件事由 `_web_search` 背后的联网模型完成（工具语义）
+                    model=str(self._model_name()),
+                    card_names=names,
+                    max_rounds=rounds,
+                    extra_prompt=str(params.get("extra_prompt") or ""),
+                    logger=self.logger,
+                )
+            else:
+                result = await research_archetype(
+                    self._generate,
+                    deck_name=str(params["deck_name"]),
+                    digest=self._deck_digest(params),
+                    model=model,
+                    # 卡组名常常只是社区译名/群友自取的名字，按它问只会得到"没查到"；
+                    # 把卡名一起递过去，模型才能改按卡名逐张查（异解那副就是这么救回来的）
+                    card_names=names,
+                    extra_prompt=str(params.get("extra_prompt") or ""),
+                    logger=self.logger,
+                )
         except Exception as exc:  # noqa: BLE001  联网那一路的问题只记不抛，理由见上
             self._research_error = f"{exc}"
             if self.logger is not None:
                 self.logger.warning("联网查资料失败（这一轮不联网继续写）：%s", exc)
             return ""
         self._research_error = ""
+        self._research_queries = list(result.queries)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         deck_id = int(params.get("deck_id") or 0)
         path = self.research_dir / f"{stamp}-{deck_id}-{_safe_stem(str(params['deck_name']))}.txt"
-        path.write_text(result.text, encoding="utf-8")
+        # 存档里把"查了什么"也写上：资料不对时，第一件要看的不是资料本身，而是检索词
+        header = ""
+        if result.queries:
+            header = "【这次实际查了什么】\n" + "\n".join(f"- {q}" for q in result.queries) + "\n\n"
+        path.write_text(header + result.text, encoding="utf-8")
         if self.logger is not None:
             self.logger.info("联网资料已存档：%s", path)
         return result.text
+
+    async def _web_search(self, query: str) -> str:
+        """`web_search` 工具的实现：把查询交给配置里那只联网模型，拿回要点。
+
+        为什么不是"真的搜索 API"：本机（以及大多数部署）没有可直接调用的搜索接口，
+        但有一只**带检索的聊天模型**——那就把"检索"这件事外包给它，工具语义不变
+        （输入查询语句、拿回结果）。缺了 `search_model` 时 `_derive_research_for` 根本不会走到这里。
+        """
+
+        model = str(getattr(self, "_search_model", "") or "")
+        prompt = (
+            "请联网检索下面的问题，把查到的**事实**列出来（每条一行，卡名要写全）。\n"
+            "查不到就回「没查到」，不要用记忆里的旧信息填空。\n"
+            "最多 8 条，别写开场白和总结。\n\n"
+            f"要查的：{query}"
+        )
+        return await self._generate(prompt, model, SEARCH_ANSWER_TOKENS)
 
     def _load_latest_combo(self, deck_id: int, deck_name: str) -> str:
         """取这副牌最近一份 combo 推演（没有就空串：脚本退化成"只按卡文写"）。"""
@@ -1221,6 +1284,20 @@ class TrainingRunner:
         """配置热更新后由插件把"联网查资料用哪只模型"推给 runner（空串＝不联网）。"""
 
         self._search_model = str(model or "")
+
+    def set_search_rounds(self, value: Any) -> None:
+        """配置热更新后由插件把"检索 agent 最多查几轮"推给 runner（0＝不用工具）。"""
+
+        try:
+            rounds = int(value)
+        except (TypeError, ValueError):
+            rounds = SEARCH_ROUNDS_DEFAULT
+        self._search_rounds = max(0, rounds)
+
+    def set_tools_generate(self, callback: Optional[Callable[..., Any]]) -> None:
+        """插件把"带工具调用的模型出口"推过来；宿主不支持时传 None（自动退回单次问）。"""
+
+        self._tools_generate = callback
 
     def set_script_max_tokens(self, value: Any) -> None:
         """配置热更新后由插件把"写脚本每次调用的输出上限"推给 runner。

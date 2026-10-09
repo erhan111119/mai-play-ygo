@@ -164,7 +164,7 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=False, description="是否启用插件")
-    config_version: str = Field(default="1.6.0", description="配置版本")
+    config_version: str = Field(default="1.7.0", description="配置版本")
     # 版本号提升是有意的：1.2.0 起新增 `[llm]`（三个用途的模型与超时）、`[training]`（训练功能）、
     # `[webui]`（插件自带面板）三节，并把 `duel.brain_model` / `duel.brain_timeout_ms`
     # 移成 `llm.decision_model` / `llm.decision_timeout_ms`（老键会被静默忽略）。
@@ -174,7 +174,8 @@ class PluginSectionConfig(PluginConfigBase):
     # `deepseek-flash`）单次约 2 秒，2500（Python 侧 2100）会让它卡在边缘；快模型不受影响（那只是个上限）。
     # 1.4.0 起 `llm.decision_model` 的默认值从 `deepseek-chat` 改成空串（跟宿主的 utils 任务走）：
     # 把一个厂商模型名当出厂默认，在别的机器上那个名字不存在，决策层一上来就必然失败。
-    # 1.6.0 起 `[llm]` 再多一个 `search_model`（写脚本前联网查资料用，留空＝不联网）。
+    # 1.6.0 起 `[llm]` 再多一个 `search_model`（写脚本前联网查资料用，留空＝不联网）；
+    # 1.7.0 起再加一个 `search_rounds`：>0 时给写作模型一个 web_search 工具，让它自己多轮检索。
 
 
 class PathsConfig(PluginConfigBase):
@@ -357,9 +358,9 @@ class LlmConfig(PluginConfigBase):
         default="",
         description=(
             "【AI 决策】用哪只模型。**必须是不思考的那种**（模型条目里 thinking = disabled）。"
-            "实测对手回合的等待预算一共只有 15 秒，一次会思考的答复要 13 秒；"
-            "本机实测 `deepseek-flash`（thinking = disabled）单次约 2.0~2.2 秒、零思考 token、答复就是干净的序号——"
-            "所以这一档的等待上限也配成 4000ms（2500 只适合 0.6~0.9 秒的模型）。"
+            "对手回合的等待预算一共只有 15 秒，一次会思考的答复能花掉 13 秒；"
+            "关掉思考之后通常是 1~2 秒档、答复就是干净的序号——"
+            "所以这一档的等待上限默认 4000ms（2500 只适合 0.6~0.9 秒的模型）。"
             "⚠ 换模型要同时看两件事：模型名，以及 `model_config.toml` 里那条"
             "`extra_params = {thinking = {type = \"disabled\"}}`——思考型模型会把额度全花在"
             "思考上、`response` 是空串（拉高额度解不了）。换完用 `tools/brain_model_probe.py` 量一遍"
@@ -369,7 +370,7 @@ class LlmConfig(PluginConfigBase):
         default=4000,
         description=(
             "【AI 决策】WindBot 等答复的上限（毫秒，默认 4000）。"
-            "⚠ 这个上限要跟所选模型配：2 秒档的模型（本机的 `deepseek-flash`）需要 4000；"
+            "⚠ 这个上限要跟所选模型配：1~2 秒档的模型需要 4000；"
             "2500 只适合 0.6~0.9 秒档的模型。"
             "Python 侧的等模型上限会自动取「这个值再减 400 毫秒」，好让超时由 Python 先发现并记账。"
             "实测模型答复 0.6~0.9 秒，所以 2500 是「够用且不会拖住对局」的余量；"
@@ -402,9 +403,9 @@ class LlmConfig(PluginConfigBase):
             "【写脚本·联网资料】用哪只**能联网检索**的模型（宿主 `config/model_config.toml` 里的"
             "**模型名称**，不是模型标识符）。写脚本/迭代时先用它查一遍「这套牌现实里怎么打」，"
             "把资料喂给 `training_model` 那只写手（资料存在 `train/research/`，卡文仍是唯一依据）。"
-            "本机可填 `联网搜索`（DMX 的 qwen3-max-search，实测单次 7~12 秒）；"
-            "⚠ DeepSeek 官方 API **没有**联网版（deepseek-chat / deepseek-flash 都是纯生成），"
-            "所以这里必须另挂一只带检索的模型。留空＝不联网，脚本照旧只按卡文与 combo 推演写"
+            "⚠ **不是每只模型都能联网**：很多厂商的官方 API 只有纯生成（DeepSeek 官方就没有联网版），"
+            "所以这里通常要另挂一只带检索的模型；填之前先拿一句\"最近一个月有什么新公告\"试它一下，"
+            "答得出当月的才叫能联网。留空＝不联网，脚本照旧只按卡文与 combo 推演写"
         ),
     )
     training_timeout_ms: int = Field(
@@ -415,6 +416,17 @@ class LlmConfig(PluginConfigBase):
             "实测原文是 `[E_TIMEOUT] 请求 cap.call 超时 (30000ms)`），写比它大没有意义。"
             "插件把上限设在 25 秒，是为了让失败由插件先发现，并在记录里写清"
             "「是模型太慢」以及该换哪只模型；训练任务是后台任务，失败一条不影响对局"
+        ),
+    )
+    search_rounds: int = Field(
+        default=4,
+        description=(
+            "【写脚本·联网检索】最多让模型自己查几次（默认 4；0＝不用工具，退回「问一次那只联网模型」）。"
+            "填了 `search_model` 之后：`>0` 时给写作模型一个 `web_search` 工具，它自己决定查什么"
+            "（先查卡组名 → 查到系列再查 combo → 再查关键卡用法），每次检索由 `search_model` 那只联网模型执行；"
+            "资料存 `train/research/`（连「实际查了什么」一起存）。"
+            "每次检索要等那只模型回话（几秒到十几秒），4 轮约半分钟——写脚本本来就要几分钟，"
+            "这个开销换的是 **生僻卡组/社区译名也查得动**（只问一次容易被「没查到」劝退）"
         ),
     )
     training_script_max_tokens: int = Field(
@@ -652,8 +664,8 @@ class DuelConfig(PluginConfigBase):
             "【阻抗决策层】是否让模型决定「这一张无效卡该指向对面哪只怪」。**默认开**。"
             "风险最低的一半：它只在「脚本本来就要交这张无效卡」的前提下改目标，不会让脚本少交一张牌；"
             "模型在这里有真信息优势（脚本只认卡号，模型认识卡文）。"
-            "实测：链路与模型都验过（本机 `deepseek-flash` 关思考约 2 秒、答复干净、"
-            "零思考 token），一局只问十次左右，等待挤得进对手回合的 15 秒预算。"
+            "链路与模型都验过（关掉思考后单次约 1~2 秒、答复干净、零思考 token），"
+            "一局只问十次左右，等待挤得进对手回合的 15 秒预算。"
             "关掉＝完全按出牌脚本自己的判据选目标（改动前的老口径）"
         ),
     )
@@ -1045,6 +1057,33 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             raise RuntimeError(f"模型请求被拒绝：{result}")
         return str(result.get("response") or "").strip()
 
+    async def _training_generate_with_tools(
+        self, messages: Any, model: str, max_tokens: int, tools: Any
+    ) -> Dict[str, Any]:
+        """带工具调用的模型出口（联网检索 agent 用）。
+
+        宿主的能力是 `llm.generate_with_tools`：把工具定义透给 provider，**工具由插件自己执行**
+        （见 `TrainingRunner._web_search`——搜索后端就是配置里那只联网模型）。
+        返回的是宿主的原始 dict（里面有 `tool_calls`），调用方负责拼下一轮 messages。
+
+        ⚠ 这只在**写脚本那一步**用：对局决策那条路一次工具调用都不要加（对手回合只有 15 秒）。
+        """
+
+        llm = self.config.llm
+        result = await asyncio.wait_for(
+            self.ctx.llm.generate_with_tools(
+                prompt=messages,
+                tools=list(tools),
+                model=model.strip(),
+                temperature=0.2,
+                max_tokens=int(max_tokens),
+            ),
+            timeout=max(float(llm.training_timeout_ms) / 1000.0, 1.0),
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError(f"带工具的模型调用返回了意外结构：{result!r}")
+        return result
+
     def _restart_train_runner(self) -> None:
         """（重）建训练功能那一层：记录库 + 执行器。
 
@@ -1065,6 +1104,7 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
                 # 没必要重建执行器
                 current.set_script_max_tokens(self.config.llm.training_script_max_tokens)
                 current.set_search_model(self.config.llm.search_model)
+                current.set_search_rounds(self.config.llm.search_rounds)
                 if self._logger is not None:
                     self._logger.debug("训练功能的配置没动到执行器，保留正在跑的任务")
                 return
@@ -1097,12 +1137,17 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
         self._train_runner.set_training_model(self.config.llm.training_model)
         self._train_runner.set_script_max_tokens(self.config.llm.training_script_max_tokens)
         self._train_runner.set_search_model(self.config.llm.search_model)
+        self._train_runner.set_search_rounds(self.config.llm.search_rounds)
+        # 带工具调用的出口（联网检索 agent 用）：宿主没这个能力时 runner 自己退回"单次问联网模型"
+        self._train_runner.set_tools_generate(self._training_generate_with_tools)
         self._logger.info(
-            "训练功能已就绪：工作目录 %s｜训练模型 %s｜写脚本额度 %s token/批｜联网资料 %s｜单次擂台上限 %s 局",
+            "训练功能已就绪：工作目录 %s｜训练模型 %s｜写脚本额度 %s token/批｜联网资料 %s（最多 %s 轮检索）｜"
+            "单次擂台上限 %s 局",
             workspace,
             self.config.llm.training_model.strip() or "（跟宿主 utils 任务）",
             self.config.llm.training_script_max_tokens,
             self.config.llm.search_model.strip() or "（关：写脚本不联网）",
+            self.config.llm.search_rounds,
             self.config.training.max_duels_per_run,
         )
 

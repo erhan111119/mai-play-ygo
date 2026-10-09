@@ -11,7 +11,7 @@
 [plugin]
 # 插件：插件基础配置。
 enabled = false  # 是否启用插件（复制成 config.toml 后改成 true）
-config_version = "1.6.0"  # 配置版本（1.6.0 起 [llm] 多一个 search_model：写脚本前联网查资料；1.5.0 起 decision_timeout_ms 默认 4000，配 2 秒档的决策模型；1.4.0 起 decision_model 默认留空＝跟 utils 任务走；1.3.0 起 [llm] 多一个 training_script_max_tokens）
+config_version = "1.7.0"  # 配置版本（1.7.0 起 [llm] 多一个 search_rounds：给写作模型一个 web_search 工具、自己多轮检索；1.6.0 起 [llm] 多一个 search_model：写脚本前联网查资料；1.5.0 起 decision_timeout_ms 默认 4000，配 2 秒档的决策模型；1.4.0 起 decision_model 默认留空＝跟 utils 任务走；1.3.0 起 [llm] 多一个 training_script_max_tokens）
 
 [paths]
 # 运行环境：两个虚拟客户端与数据文件的位置（默认都在插件自带的 clients/ 里）
@@ -58,13 +58,14 @@ taunt_lines = []  # 挑衅台词池（集合，一条一句）；留空用内置
 # 三个用途各管一件事，谁都不用别人的模型。
 summary_model = ""  # 【对局总结】把机读复述写成一段人话；这活儿对智力要求低，哪只都行（留空＝跟 utils 走）
 summary_timeout_ms = 60000  # 【对局总结】等模型的上限（毫秒）。总结额度是 16384 token，思考型模型会先想一大段，给短了会稳定超时（群里看起来就是"没有 AI 总结"）
-decision_model = ""  # 【AI 决策】阻抗决策层用哪只。**必须是不思考的那种**：对手回合的等待预算只有 15 秒，会思考的答复光"想"就超时。留空＝跟 utils 走；本机实测 `deepseek-flash`（模型条目里 thinking = disabled）单次约 2.0~2.2 秒、零思考 token、答复就是干净的序号
-decision_timeout_ms = 4000  # 【AI 决策】WindBot 等答复的上限（毫秒）；Python 侧自动取这个值再减 400，好让超时由插件先发现并记账。⚠ 要跟所选模型配：本机的 `deepseek-flash` 单次约 2 秒，2500 会让它卡在边缘（原来那档 2500 是配 0.6~0.9 秒的 `deepseek-chat` 用的）
+decision_model = ""  # 【AI 决策】阻抗决策层用哪只。**必须是不思考的那种**：对手回合的等待预算只有 15 秒，会思考的答复光"想"就超时。留空＝跟 utils 走。选好后量一次单次耗时（tools/brain_model_probe.py），再按它配下面的超时
+decision_timeout_ms = 4000  # 【AI 决策】WindBot 等答复的上限（毫秒）；Python 侧自动取这个值再减 400，好让超时由插件先发现并记账。⚠ 要跟所选模型配：1~2 秒档的模型配 4000ms，0.6~0.9 秒档的 2500ms 就够（配小了会在边缘反复超时）
 decision_style = "aggressive"  # 决策档位：conservative / normal / aggressive（也认 保守/平常/激进）；只改提示词，不用重编译 exe
-training_model = ""  # 【训练功能】读卡文推 combo、写脚本、复盘、写结论用哪只。⚠ 要填**不思考**的（本机用 `deepseek-flash`，即模型条目里 thinking = disabled 的那条）：宿主对插件的单次模型调用有 30 秒硬超时（cap.call），会思考的模型（本机的 `ds`/`deepseekV4.1flash`）光"想"就超时；留空＝跟 utils 走
+training_model = ""  # 【训练功能】读卡文推 combo、写脚本、复盘、写结论用哪只。⚠ 要填**不思考**的（在 model_config.toml 里把 thinking 关掉）：宿主对插件的单次模型调用有 30 秒硬超时（cap.call），会思考的模型光"想"就超时；留空＝跟 utils 走
 training_timeout_ms = 25000  # 【训练功能】单次等模型的上限（毫秒）。**给不大**：宿主那侧 30 秒就断（cap.call），给 120000 也无效；给 25 秒是为了让失败由插件先发现，并在记录里说清"是模型太慢、该换哪只"
 training_script_max_tokens = 4096  # 【写脚本】一次让模型写多少 token（默认 4096）。脚本是分批写的（每批 8 张卡的处理函数、一次调用一批），所以这个数决定"一批能写多细"，不是整份脚本的长度上限（总长＝批数 × 每批）。想更细可以调大，但**别超 8000**：宿主对插件单次调用有 30 秒硬超时，写不完整批白写
-search_model = ""  # 【写脚本·联网资料】用哪只**能联网检索**的模型（同样填宿主 model_config.toml 里的 `name`，不是 model_identifier）。写脚本/迭代时先用它查一遍"这套牌现实里怎么打"，把资料喂给 training_model 那只写手（资料存 train/research/，**卡文仍是唯一依据**）。⚠ DeepSeek 官方 API **没有**联网版（deepseek-chat / deepseek-flash / deepseek-reasoner 都是纯生成，"联网"只在 DeepSeek App 里），要用就得另挂一只带检索的——本机挂的是 DMX 的 `联网搜索`（qwen3-max-search，实测单次 7~12 秒；DMX 目录里的 `Tencent-Search` / `jina-deepsearch-v1` / `perplexity-*` **不是 chat 模型**，填了会在调用时 404）。留空＝不联网，脚本照旧只按卡文与 combo 推演写
+search_rounds = 4  # 【写脚本·联网检索】最多让模型自己查几次（默认 4；0＝不用工具、退回「问一次那只联网模型」）。填了 search_model 之后：>0 时写作模型会拿到一个 web_search 工具，自己决定查什么（先查卡组名 → 查到系列再查 combo → 再查关键卡用法），每次检索交给 search_model 那只模型执行；资料与「实际查了什么」都存 train/research/
+search_model = ""  # 【写脚本·联网资料】用哪只**能联网检索**的模型（同样填宿主 model_config.toml 里的 `name`，不是 model_identifier）。写脚本/迭代时先用它查资料，把资料喂给 training_model 那只写手（资料存 train/research/，**卡文仍是唯一依据**）。⚠ **不是每只模型都能联网**：很多厂商的官方 API 只有纯生成（DeepSeek 官方就没有联网版），要另挂一只带检索的模型；选的时候先用一句"最近一个月有什么新公告"试一下，答得出当月的才叫能联网。留空＝不联网，脚本照旧只按卡文与 combo 推演写
 
 [wiki]
 # 百科检索：查卡 / 发卡图
