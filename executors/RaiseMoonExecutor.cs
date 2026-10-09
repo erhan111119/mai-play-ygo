@@ -908,9 +908,9 @@ namespace WindBot.Game.AI.Decks
             // 那张卡的卡文是"①：这张卡从场上送去墓地的场合发动。从卡组把 1 只守备力 1500 以下的
             // 怪兽加入手卡"（`c78010363.lua`），**炸掉＝白送对面一次检索**（同时我们付了
             // 额外卡组 1 只「阿不思」名怪兽当费用）。群友的原话："他上来炸我黑森林"。
-            // 现在交给**共享挑选器**（`DefaultExecutor.PickEnemyRemovalTarget` →
-            // `Game/AI/EnemyTargeting.cs`，打分口径与卡文出处写在那里）：这是通用层的问题、
-            // 不只这副牌，所以实现在那个文件里，这里只负责"把提问交给它"。
+            // 现在交给**基类的共享挑选器**（`DefaultExecutor.PickEnemyRemovalTarget`，
+            // 打分口径与卡文出处写在那里）：这是通用层的问题，不只这副牌，所以实现在基类里、
+            // 这里只负责"把提问交给它"。
             if (min >= 1
                 && (hint == HintMsg.Destroy || hint == HintMsg.ReturnToHand
                     || hint == HintMsg.Remove || hint == HintMsg.ToDeck))

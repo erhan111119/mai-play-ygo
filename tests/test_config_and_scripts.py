@@ -823,7 +823,7 @@ def test_script_generator_says_exe_is_locked_instead_of_dumping_msbuild() -> Non
         ]
     )
     try:
-        scriptgen.DeckScriptGenerator._raise_if_exe_locked(output)
+        scriptgen.DeckScriptGenerator.raise_if_exe_locked(output)
     except scriptgen.ScriptGenerationError as exc:
         assert "等这局打完" in str(exc), exc
         assert "MSB3026" in str(exc), exc
@@ -831,7 +831,7 @@ def test_script_generator_says_exe_is_locked_instead_of_dumping_msbuild() -> Non
         raise AssertionError("exe 被占用时应该抛 ScriptGenerationError")
 
     # 别的编译错误（真的写错了代码）不该被翻译成"有人在打"
-    scriptgen.DeckScriptGenerator._raise_if_exe_locked(
+    scriptgen.DeckScriptGenerator.raise_if_exe_locked(
         "Decks/Gen1Executor.cs(9,26): error CS0117: 没有这个成员"
     )
 

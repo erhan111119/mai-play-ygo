@@ -28,19 +28,27 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 _PLUGIN_ROOT = Path(__file__).resolve().parent.parent
-_ARCHIVE_DIR = _PLUGIN_ROOT / "train" / "windbot"
+# 留档目录就是仓库里的 `executors/`（README §2 说的"十份执行器"就在那儿；
+# 原来指向 `train/windbot/`，而那个目录根本没建过——`--sync` 一跑就 FileNotFoundError，
+# 等于这个工具长期是坏的，13 个执行器全没被哈希跟踪）
+_ARCHIVE_DIR = _PLUGIN_ROOT / "executors"
 _MANIFEST = _ARCHIVE_DIR / "sources.json"
 
 #: 留档的文件（相对 WindBot 源码树）。改执行器只改源码树，然后用 --sync 刷新这里。
 FILES: Tuple[str, ...] = (
-    "Game/AI/Decks/RaiseMoonExecutor.cs",
+    "Game/AI/EnemyTargeting.cs",
+    "Game/AI/Decks/KashtiraExecutor.cs",
+    "Game/AI/Decks/KezmoYixiangmingExecutor.cs",
     "Game/AI/Decks/KillerTuneExecutor.cs",
+    "Game/AI/MaiBotBrain.cs",
+    "Game/AI/NegateDecision.cs",
+    "Game/AI/Decks/RaiseMoonExecutor.cs",
     "Game/AI/Decks/SkyStrikerShopExecutor.cs",
-    "Game/AI/Decks/WitchcraftShopExecutor.cs",
+    "Game/AI/Decks/TearlamentsExecutor.cs",
     "Game/AI/Decks/ToonShopExecutor.cs",
     "Game/AI/Decks/TraptrixRagnaraikaExecutor.cs",
-    "Game/AI/Decks/PlanAwareExecutor.cs",
-    "Game/AI/MaiBotBrain.cs",
+    "Game/AI/Decks/WitchcraftShopExecutor.cs",
+    "Game/AI/Decks/YaoshengExecutor.cs",
 )
 
 

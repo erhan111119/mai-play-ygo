@@ -26,6 +26,7 @@ import subprocess
 import sys
 import time
 
+from . import patchwork
 from .analysis import (
     SUMMARY_MAX_TOKENS,
     AnalysisError,
@@ -39,7 +40,14 @@ from .analysis import (
     summarise_run,
     tail_lines,
 )
+from .review_material import (
+    SOURCE_CHARS,
+    decision_log_slice,
+    parse_host_log,
+    script_digest,
+)
 from .scriptgen import (
+    build_windbot,
     DeckScriptGenerator,
     DeckScriptRequest,
     ScriptGenerationError,
@@ -112,6 +120,7 @@ class TrainingRunner:
         card_db: Callable[[], Any],
         active_rooms: Callable[[], int],
         logger: Optional[logging.Logger] = None,
+        host_log_dir: Optional[Path] = None,
         max_duels: int = 60,
         windbot_dirs: Optional[Callable[[], Tuple[Optional[Path], Optional[Path]]]] = None,
         record_script: Optional[Callable[[int, str], None]] = None,
@@ -126,6 +135,8 @@ class TrainingRunner:
                 超时由它自己执行。
             card_db: 返回**当前**的 CardDatabase（配置热更新会换掉实例，所以要用回调取）。
             active_rooms: 返回当前进行中的房间数（擂台要据此拒绝启动）。
+            host_log_dir: 宿主日志目录（`logs/`）。复盘要从里面切出那一局的 WindBot 决策日志；
+                不传就按插件目录推（`<宿主>/logs`），推不出来时复盘少一段材料而已。
             max_duels: 一次擂台最多多少局。
             windbot_dirs: 返回 ``(WindBot 源码树, WindBot 运行目录)``，写脚本时要用；
                 没配源码树就返回 None（那时"写脚本"会明确报错，不做假成功）。
@@ -141,6 +152,7 @@ class TrainingRunner:
         self._generate = generate
         self._card_db = card_db
         self._active_rooms = active_rooms
+        self._host_log_dir = Path(host_log_dir) if host_log_dir is not None else None
         self.logger = logger
         self.max_duels = max(2, int(max_duels))
         self._windbot_dirs = windbot_dirs or (lambda: (None, None))
@@ -490,6 +502,9 @@ class TrainingRunner:
             }
             if str(params.get("extra_prompt") or "").strip():
                 resolved["extra_prompt"] = str(params["extra_prompt"]).strip()[:2000]
+            # 面板上勾了"落地补丁"才写源码树；默认只看不改（看/改分离）
+            if params.get("apply"):
+                resolved["apply"] = True
             return [], f"{KIND_TITLES[kind]}：{deck['name']}（最近 {latest} 局）", resolved
 
         if kind == KIND_ARENA:
@@ -1012,32 +1027,121 @@ class TrainingRunner:
             },
         )
 
+    def _script_source(self, style: str) -> Tuple[str, str]:
+        """找到这副牌**当前在用的出牌脚本源码**，返回 ``(来源说明, 正文)``（找不到给空串）。
+
+        优先级：WindBot 源码树（部署的那份，也是补丁要改的那份）→ 插件留档 `executors/`。
+        按 `[Deck("<style>"` 匹配而不是按文件名：生成的脚本（`Gen103Executor.cs`）与手写的
+        （`KezmoYixiangmingExecutor.cs`）都是这个形状，而类名不一定等于 style。
+        """
+
+        name = str(style or "").strip()
+        if not name:
+            return "", ""
+        needle = f'[Deck("{name}"'
+        candidates: List[Tuple[str, Path]] = []
+        source_dir, _windbot_dir = self._windbot_dirs()
+        if source_dir:
+            candidates.append(("源码树", Path(source_dir) / "Game" / "AI" / "Decks"))
+        candidates.append(("插件留档", Path(self.plugin_root) / "executors"))
+        for label, folder in candidates:
+            if not folder.is_dir():
+                continue
+            direct = folder / f"{name}Executor.cs"
+            if direct.is_file():
+                return f"{label} {direct}", direct.read_text(encoding="utf-8-sig", errors="replace")
+            for path in sorted(folder.glob("*Executor.cs")):
+                try:
+                    text = path.read_text(encoding="utf-8-sig", errors="replace")
+                except OSError:
+                    continue
+                if needle in text:
+                    return f"{label} {path}", text
+        return "", ""
+
+    def _decision_log_material(self, records: Sequence[Any]) -> str:
+        """把**最近一局**的 WindBot 决策日志切出来（宿主日志里存着，`duel.bot_debug=true` 时才有）。
+
+        为什么只取一局：一段决策日志就能有上千行，多局拼起来会把材料挤爆；而"主线断在哪一步"
+        通常一局就看得出来。找不到就返回空串——素材少一段不影响复盘，但要如实说明。
+        """
+
+        newest = records[0] if records else None
+        if newest is None:
+            return ""
+        summary = dict(getattr(newest, "summary", {}) or {})
+        started = getattr(newest, "started_at", 0) or 0
+        if not isinstance(started, (int, float)) or started <= 0:
+            return ""
+        duration = summary.get("duration_seconds") or 0
+        if not isinstance(duration, (int, float)) or duration <= 0:
+            duration = 600.0
+        log_dir = self._host_log_dir or Path(self.plugin_root).parents[1] / "logs"
+        if not log_dir.is_dir():
+            return ""
+        # ⚠ **对局记录是"打完那一刻"建的**（`started_at`/`created_at`/`finished_at` 三个
+        # 时间戳实测完全一样，都是结束时间），所以窗口要往**前**推 `duration_seconds`，
+        # 而不是往后——算反了的话切出来的是"打完之后的下一局"，实测只切到 2 行。
+        recorded_at = float(started)
+        end_ts = recorded_at + 10.0
+        start_ts = recorded_at - float(duration) - 15.0
+        windows = [
+            path
+            for path in sorted(log_dir.glob("app_*.log.jsonl"), key=lambda item: item.stat().st_mtime)
+            if path.stat().st_mtime >= start_ts - 60.0
+        ]
+        if not windows:
+            windows = sorted(log_dir.glob("app_*.log.jsonl"), key=lambda item: item.stat().st_mtime)[-1:]
+        entries: List[Tuple[float, str]] = []
+        for path in windows:
+            try:
+                entries += parse_host_log(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+        text = decision_log_slice(entries, start=start_ts - 5.0, end=end_ts + 10.0)
+        if text and self.logger is not None:
+            self.logger.info("复盘材料：切到 %s 行的决策日志（第 1 局）", len(text.splitlines()))
+        return text
+
     async def _run_review(self, run: TrainingRun, params: Dict[str, Any]) -> None:
-        """复盘优化：读这副牌**最近打过的几局**，让模型指出具体该改哪里。
+        """复盘优化：读这副牌**最近打过的几局**，让模型指出具体该改哪里；可选地落地补丁。
 
-        素材是插件自己在每局结束时写下的记录（`kind=duel`）——那里面有记录器活着看到的
-        回合数、双方动作数、召唤/特召/发动/盖放/攻击、伤害、用过的卡。**不用录像**：
-        `.yrp` 只有玩家的应答、没有内核的提问，逐动作复盘做不出来（`tools/analyze_replay.py`
-        的模块头写着这条限制）。
+        材料有三层（2026-10-09 补了后两层——那次真机排查证明光有统计说不出"该改哪一行"）：
 
-        产出是一份"改哪儿"的清单，**不动任何文件**：改脚本是「编写脚本」那一步的事，
-        让复盘自己去改代码就等于把"看"和"改"混在一起，出了问题说不清是哪一步坏的。
+        1. **对局记录**：插件在每局结束时写的统计（回合数、双方动作数、用过的卡、落位）；
+           **不用录像**：`.yrp` 只有玩家的应答、没有内核的提问，逐动作复盘做不出来；
+        2. **当前脚本的结构摘要 + 源码**：规则注册顺序（＝优先级）、`OnSelectCard` 已处理了哪些
+           `HintMsg`、每个规则函数的签名，以及源码片段——"缺分支 / 顺序不对"在这一层可见；
+        3. **最近一局的 WindBot 决策日志**：内核问了什么、脚本选了谁（`activate effect` /
+           `become target` / `move to`）。`duel.bot_debug = true` 时它已经写在宿主日志里。
+
+        产出照旧是一份"改哪儿"的清单（**看与改仍然分开**），但现在会要求模型给**可落地的补丁**
+        （`<<<PATCH … PATCH>>>`）。补丁只有在你勾了"落地并编译"时才写进源码树：
+        全有或全无、先备份、**有房间在打就不编译**（正在跑的 WindBot 会锁住 exe）。
         """
 
         deck_id = int(params.get("deck_id") or 0)
         latest = int(params.get("latest") or 3)
+        apply_patch = bool(params.get("apply"))
         records = self._recent_duels(deck_id, latest)
         if not records:
             raise TrainingError(
                 f"还没有「{params['deck_name']}」的对局记录：先在群里跟它打几局（每局打完会自动记下来），再来复盘"
             )
         material = "\n\n".join(_duel_brief(index + 1, record) for index, record in enumerate(records))
+        source_label, source_text = self._script_source(str(params.get("style") or ""))
+        digest = script_digest(source_text) if source_text else ""
+        log_material = self._decision_log_material(records)
         prompt = _REVIEW_PROMPT.format(
             deck=params["deck_name"],
             style=params.get("style") or "（未设置）",
             count=len(records),
             material=material[:12000],
             extra=str(params.get("extra_prompt") or "").strip()[:1500],
+            source_note=_review_source_note(source_label, source_text, log_material),
+            digest=digest[:DIGEST_LIMIT] or "（拿不到脚本源码：先配好 paths.windbot_src_dir 再来复盘）",
+            source_excerpt=source_text[:SOURCE_CHARS] or "（同上）",
+            decision_log=log_material[:LOG_LIMIT] or "（这一局没有决策日志：把 duel.bot_debug 打开，下一局复盘就有了）",
         )
         try:
             text = await self._generate(prompt, str(self._model_name()), SUMMARY_MAX_TOKENS)
@@ -1056,6 +1160,17 @@ class TrainingRunner:
             f"# 依据：最近 {len(records)} 局房间对局记录\n\n"
         )
         path.write_text(head + answer + "\n", encoding="utf-8")
+
+        # 补丁：先解析（不落地），只有勾了"落地并编译"才写进源码树。
+        patch_set = patchwork.parse_patches(answer)
+        applied = patchwork.ApplyResult()
+        build_ok = False
+        build_tail = ""
+        if apply_patch:
+            applied, build_ok, build_tail = await self._apply_review_patches(patch_set)
+        elif patch_set.patches:
+            applied.error = ""  # 没勾"落地"：解析到了但按用户意思不写文件
+
         # 任务日志也要写：面板的「详情」读的就是它。不写的话复盘看着"（没有输出）"，
         # 而用户真正想看的**依据**（这几局的事实）也就无从查起。
         write_run_log(
@@ -1063,14 +1178,25 @@ class TrainingRunner:
             [
                 f"# 复盘优化：{params['deck_name']}（脚本 {params.get('style') or '未设置'}）",
                 f"# 依据：最近 {len(records)} 局房间对局记录（每局打完由插件自动记录）",
+                f"# 脚本源码：{source_label or '（没找到）'}｜决策日志：{len(log_material.splitlines())} 行"
+                f"｜补丁：{len(patch_set.patches)} 个（{'已落地' if applied.ok else '未落地'}）",
                 f"# 存档：{path}",
                 "",
                 "================ 这几局的事实（记录器在对局里活着看到的） ================",
                 material,
                 "",
+                "================ 脚本结构摘要 ================",
+                digest or "（没拿到源码）",
+                "",
+                "================ 最近一局的决策日志 ================",
+                log_material or "（没有：duel.bot_debug 关着或这一局没写进宿主日志）",
+                "",
                 "================ 模型的复盘结论 ================",
                 answer,
                 "",
+                "================ 补丁与落地结果 ================",
+                patch_set.preview_for_log() if hasattr(patch_set, "preview_for_log") else "",
+                _patch_report(patch_set, applied, build_ok, build_tail),
             ],
         )
         self.store.finish(
@@ -1083,10 +1209,80 @@ class TrainingRunner:
                 "conclusion": answer[:4000],
                 "review_path": str(path),
                 "log_path": str(run.log_path),
+                "script_source": source_label,
+                "script_chars": len(source_text),
+                "digest_chars": len(digest),
+                "log_lines": len(log_material.splitlines()),
+                "patches": [patch.describe() for patch in patch_set.patches],
+                "patch_problems": list(patch_set.problems),
+                "applied": applied.applied,
+                "apply_error": applied.error,
+                "backups": list(applied.backups),
+                "build_ok": build_ok,
+                "build_tail": build_tail[-1200:],
+                "apply_requested": apply_patch,
             },
         )
         if self.logger is not None:
-            self.logger.info("复盘优化已存档：%s（依据 %s 局，过程写进 %s）", path, len(records), run.log_path)
+            self.logger.info(
+                "复盘优化已存档：%s（依据 %s 局；补丁 %s 个，落地 %s 个%s）",
+                path,
+                len(records),
+                len(patch_set.patches),
+                applied.applied,
+                f"，编译{'通过' if build_ok else '没通过'}" if applied.ok else "",
+            )
+
+    async def _apply_review_patches(
+        self, patch_set: patchwork.PatchSet
+    ) -> Tuple[patchwork.ApplyResult, bool, str]:
+        """落地补丁并（在安全时）编译源码树。
+
+        **有房间在打就不编译**：正在跑的 WindBot 会把 `bin/Release/WindBot.exe` 锁住，
+        编译必定失败（而且会让正在打的那一局看到一堆噪声）。补丁照样写进源码树，
+        在记录里说清"没编译"——下次写脚本/编译时自然生效。
+
+        Returns:
+            tuple: ``(落地结果, 是否编译通过, 编译输出尾部)``。
+        """
+
+        try:
+            source_dir, _windbot_dir = self._require_windbot_tree()
+        except TrainingError as exc:
+            result = patchwork.ApplyResult()
+            result.error = f"没配 WindBot 源码树，补丁没法落地：{exc}"
+            return result, False, ""
+        if patch_set.problems:
+            result = patchwork.ApplyResult()
+            result.error = "补丁格式有问题，整批没有落地：" + "；".join(patch_set.problems)
+            return result, False, ""
+        if not patch_set.patches:
+            result = patchwork.ApplyResult()
+            result.error = "模型这次没有给出可落地的补丁"
+            return result, False, ""
+
+        # 写文件是同步 IO（不大，但别占着事件循环）
+        result = await asyncio.to_thread(patchwork.apply_patches, patch_set, source_dir)
+        if result.error or not result.ok:
+            return result, False, ""
+        if self._active_rooms() > 0:
+            return result, False, "有房间正在打，按规矩没有编译（补丁已写进源码树，下次编译时生效）"
+        try:
+            ok, output = await build_windbot(source_dir, dotnet=self._dotnet())
+        except Exception as exc:  # noqa: BLE001  编译失败要如实写进记录，不能让复盘整条失败
+            return result, False, f"编译出错：{exc}"
+        tail = "\n".join(line for line in output.splitlines() if "error" in line.lower())[-1200:] or output[-800:]
+        if not ok:
+            # 编译不过：把刚写进去的补丁**回滚**（否则源码树停在编译不过的状态，
+            # 下一局连 exe 都编不出来——比"没改"更糟）
+            rollback = await asyncio.to_thread(patchwork.restore_backups, result.backups)
+            result.error = f"编译没通过，已把补丁回滚（{rollback}）"
+        return result, ok, tail
+
+    def _dotnet(self) -> str:
+        """dotnet 命令（配置里可覆盖；默认 `dotnet`）。"""
+
+        return str(getattr(self, "_dotnet_command", "dotnet") or "dotnet")
 
     def _recent_duels(self, deck_id: int, latest: int) -> List[Any]:
         """这副牌最近的房间对局记录（新的在前）。"""
@@ -1420,24 +1616,105 @@ _ITERATE_PROMPT = """你在主持「游戏王出牌脚本」的自动迭代：�
 6. 中文小标题 + 短句，不要长篇大论；不要编造卡号与卡文。
 """
 
-_REVIEW_PROMPT = """你在帮一副游戏王卡组做复盘。下面是它最近打过的对局记录（记录器在对局里
-实时看到的：回合、双方动作数、召唤/特召/发动/盖放/攻击、伤害、双方用过的卡）。
+def _review_source_note(source_label: str, source_text: str, log_material: str) -> str:
+    """材料来源的一句话说明（缺哪样就说缺哪样，不含糊）。"""
+
+    parts = []
+    parts.append(f"脚本源码来自{source_label}" if source_label else "**没找到脚本源码**（补丁落地需要它）")
+    if source_text:
+        parts.append(f"{len(source_text)} 字")
+    parts.append(f"决策日志 {len(log_material.splitlines())} 行" if log_material else "**这一局没有决策日志**")
+    return "；".join(parts)
+
+
+def _patch_report(
+    patch_set: "patchwork.PatchSet",
+    applied: "patchwork.ApplyResult",
+    build_ok: bool,
+    build_tail: str,
+) -> str:
+    """补丁与落地结果的报告（写进任务日志，面板「详情」直接看）。"""
+
+    lines: List[str] = []
+    if patch_set.problems:
+        lines.append("解析阶段的问题：")
+        lines += [f"  - {item}" for item in patch_set.problems]
+    if patch_set.patches:
+        lines.append(f"解析到 {len(patch_set.patches)} 个补丁：")
+        lines += [f"  {index}. {patch.describe()}" for index, patch in enumerate(patch_set.patches, start=1)]
+    if applied.ok:
+        lines.append(f"已落地 {applied.applied} 处；备份：{'、'.join(applied.backups)}")
+        lines.append(f"编译：{'通过' if build_ok else '没通过'}")
+    elif applied.error:
+        lines.append(f"没有落地：{applied.error}")
+    else:
+        lines.append("没有落地（没勾「落地并编译」）")
+    if build_tail:
+        lines.append("编译输出尾部：")
+        lines.append(build_tail)
+    return "\n".join(lines)
+
+
+#: 复盘提示词里"结构摘要 / 决策日志"两段的长度上限（材料总长要装得下模型的窗口，
+#: 而且宿主对插件的单次调用有 30 秒硬超时——输入越长同一只模型回得越慢）。
+DIGEST_LIMIT = 6000
+LOG_LIMIT = 7000
+
+
+_REVIEW_PROMPT = """你在帮一副游戏王卡组做复盘。你手上有四样东西：
+
+**A. 对局统计**（记录器在对局里实时看到的：回合、双方动作数、召唤/特召/发动/盖放/攻击、伤害、用过的卡）
+**B. 这副牌当前出牌脚本的"结构摘要"**（规则注册顺序就是优先级；`OnSelectCard` 处理了哪些 `HintMsg`；
+   每个规则函数的签名）——**缺分支、顺序不对，都在这里看得出来**
+**C. 脚本源码片段**（要写补丁就得照着它抄原文）
+**D. 最近那一局的 WindBot 决策日志**（内核问了什么、脚本选了谁：`activate effect` / `become target` /
+   `move to`）——**"某张卡没发、某个选择选错"在这里看得出来**
 
 这副牌：{deck}
 它当前的出牌脚本：{style}
-依据：最近 {count} 局房间对局记录
+依据：最近 {count} 局房间对局记录（{source_note}）
 {extra}
 
 要求：
-1. **只根据上面的事实说话**，不要猜没写出来的东西；
-2. 指出**具体**问题：例如"第 2 回合有 3 张手牌却只盖了 1 张""整局没发动过 XX""对手只剩 800 血
-   时没有进战阶"；说不清就别写；
-3. 每条问题要给出**可执行**的改法：改哪张卡的规则、加什么前提、优先做哪一步；
+1. **只根据上面的事实说话**，不要猜没写出来的东西；统计、摘要、日志三边对不上时以日志为准；
+2. 指出**具体**问题，要点名到"哪个函数 / 哪个分支 / 哪一步"，例如
+   "`OnSelectCard` 里没有 `case HintMsg.Target`，所以「X」的效果取了 A 而不是 B（日志第 N 行）"、
+   "「X」的通召被排在链接段之后，实测第 2 回合先出了 Y"；说不清就别写；
+3. 每条问题后面给**可落地的补丁**（格式见下面"补丁怎么写"），一个补丁解决一件事；
 4. 最后给一句"下一版脚本的重点"，不超过 30 字；
 5. 输出用中文小标题 + 短句，不要长篇大论。
 
-对局记录：
+补丁怎么写（**格式必须一字不差**，写不对整批不会落地）：
+* 用 `<<<PATCH` 开头、`PATCH>>>` 结尾，中间四段：`文件:` / `原因:` / `原文:` / `改成:`；
+* `文件:` 只写文件名（例如 `{style}Executor.cs`），只认 `Game/AI/Decks/` 下的 .cs；
+* `原文:` 必须是**源码里连续、一字不差**的一段（含缩进），而且**在全文件里只出现一次**——
+  抄不准或者有第二处相同，补丁会被整批拒绝；
+* `改成:` 是你替换后的那段；只改这一处，别的保持不动；
+* 一次最多 6 个补丁。拿不准的地方宁可不给补丁，也不要写"大概是这样"。
+
+示例（注意标记与字段名）：
+<<<PATCH
+文件: {style}Executor.cs
+原因: OnSelectCard 缺 Target 分支，取对象时按默认偏好挑了别张
+原文:
+                case HintMsg.Equip:
+改成:
+                case HintMsg.Target:
+                    return PickPreferred(cards, min, max, new[] {{ CardId.Lacrimosa4, CardId.Demonsmith }});
+                case HintMsg.Equip:
+PATCH>>>
+
+================ A. 对局统计 ================
 {material}
+
+================ B. 脚本结构摘要 ================
+{digest}
+
+================ C. 脚本源码（截断） ================
+{source_excerpt}
+
+================ D. 最近一局的决策日志（截断） ================
+{decision_log}
 """
 
 

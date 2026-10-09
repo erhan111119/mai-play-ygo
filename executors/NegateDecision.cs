@@ -20,7 +20,7 @@ namespace WindBot.Game.AI
     public static class NegateDecision
     {
         /// <summary>
-        /// 阻抗卡表（我方"无效/阻断对方"的手段）——**只有这一层用它**：决定"要不要问模型"。 
+        /// 阻抗卡表（我方"无效/阻断对方"的手段）——**只有这一层用它**：决定"要不要问模型"。
         ///
         /// ⚠ **不要按规则类型判**（别写成"凡是 Activate 规则都问"）：那正是 2026-10-07 之前
         /// 逐步问 AI 的老口径，钩子包裹全部 `ExecutorType.Activate`，于是模型在**展开**的每一步

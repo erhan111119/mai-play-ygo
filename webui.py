@@ -2466,6 +2466,10 @@ function renderExtraFields(active){
   }
   if (kind === "review") {
     html += `<label class="field"><span>复盘最近几局</span><input id="c-latest" type="number" value="3" min="1" max="20"></label>`;
+    // 复盘现在会读到"脚本结构摘要 + 那一局的决策日志"，并且可以要求它给出**可落地补丁**。
+    // 勾上＝把补丁写进源码树并编译（全有或全无、先备份；有房间在打就不编译）。
+    html += `<label class="field" title="把模型给的补丁写进 WindBot 源码树并编译；有房间在打时只写不编译"><span>落地补丁</span>
+      <input id="c-apply" type="checkbox"></label>`;
   }
   // 直接放进那一行（外层 .crow2 已经是 flex，这里再套一层会让宽度规则失效）
   box.innerHTML = html;
@@ -2513,7 +2517,11 @@ async function sendTask(){
   if (kind === "arena") payload.duels = num("c-duels") ?? 60;
   if (kind === "iterate") { payload.rounds = num("c-rounds") ?? 2; payload.duels = num("c-duels") ?? 20; }
   if (kind === "write_script") payload.rounds = num("c-rounds") ?? 5;
-  if (kind === "review") payload.latest = num("c-latest") ?? 3;
+  if (kind === "review") {
+    payload.latest = num("c-latest") ?? 3;
+    const applyBox = $("c-apply");
+    if (applyBox && applyBox.checked) payload.apply = true;
+  }
 
   const d = await postApi("/api/training/start", payload);
   if (!d.ok) { toast(d.error || "起不来", "err"); return; }

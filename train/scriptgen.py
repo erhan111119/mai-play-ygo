@@ -240,6 +240,44 @@ def _compile_hint(output: str) -> str:
     )
 
 
+async def build_windbot(
+    source_dir: Path,
+    *,
+    dotnet: str = "dotnet",
+    timeout: float = BUILD_TIMEOUT_SECONDS,
+) -> Tuple[bool, str]:
+    """编译 WindBot 源码树，返回 ``(是否成功, 输出)``。
+
+    写脚本那条链与「复盘改脚本」那条链都用它（原来这份逻辑只在 `DeckScriptGenerator._build` 里，
+    复盘要落地补丁就得再写一遍——重复的实现迟早会漂）。
+    """
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            dotnet,
+            "build",
+            "WindBot.csproj",
+            "-c",
+            "Release",
+            "--nologo",
+            cwd=str(source_dir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError as exc:
+        raise ScriptGenerationError(f"找不到 {dotnet} 命令（要装 .NET SDK 才能编译脚本）") from exc
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise ScriptGenerationError(f"编译超时（{timeout:.0f} 秒）") from exc
+    output = stdout.decode("utf-8", errors="replace")
+    if process.returncode != 0:
+        DeckScriptGenerator.raise_if_exe_locked(output)
+    return process.returncode == 0, output
+
+
 @dataclass(frozen=True)
 class CardInfo:
     """提示词里描述一张卡所需的信息。"""
@@ -1081,35 +1119,14 @@ class DeckScriptGenerator:
         )
 
     async def _build(self) -> Tuple[bool, str]:
-        """调用 dotnet 编译源码树，返回 ``(是否成功, 输出)``。"""
+        """调用 dotnet 编译源码树，返回 ``(是否成功, 输出)``（实现在 :func:`build_windbot`）。"""
 
-        try:
-            process = await asyncio.create_subprocess_exec(
-                self._dotnet,
-                "build",
-                "WindBot.csproj",
-                "-c",
-                "Release",
-                "--nologo",
-                cwd=str(self._source_dir),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-        except FileNotFoundError as exc:
-            raise ScriptGenerationError(f"找不到 {self._dotnet} 命令（要装 .NET SDK 才能编译脚本）") from exc
-        try:
-            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=self._build_timeout)
-        except asyncio.TimeoutError as exc:
-            process.kill()
-            await process.wait()
-            raise ScriptGenerationError(f"编译超时（{self._build_timeout:.0f} 秒）") from exc
-        output = stdout.decode("utf-8", errors="replace")
-        if process.returncode != 0:
-            self._raise_if_exe_locked(output)
-        return process.returncode == 0, output
+        return await build_windbot(
+            self._source_dir, dotnet=self._dotnet, timeout=self._build_timeout
+        )
 
     @staticmethod
-    def _raise_if_exe_locked(output: str) -> None:
+    def raise_if_exe_locked(output: str) -> None:
         """把"exe 被占用"这种编译失败翻译成一句人话。
 
         实测（2026-10-08）：有人正在跟机器人打的时候跑「写脚本」，`dotnet build` 会在

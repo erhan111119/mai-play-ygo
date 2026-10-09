@@ -1,0 +1,18 @@
+{
+  "source": "D:\\Game\\ygopro-duel\\windbot-src",
+  "files": {
+    "Game/AI/EnemyTargeting.cs": "55f53b9935ce1d3ac5ca32c7cb1fd28664c041c49c5034b82a99ac1141d91555",
+    "Game/AI/Decks/KashtiraExecutor.cs": "545484efcd790db54fa253d4e7f658f0e6f8e358375230a6ed653d9f55ffb321",
+    "Game/AI/Decks/KezmoYixiangmingExecutor.cs": "5bde0d35ab4ebb6b35c9302262fa1ca0f536152e90e3ce2b5b298d867abd26f7",
+    "Game/AI/Decks/KillerTuneExecutor.cs": "0706736c1c939eba5dd2836021f02dbeeafbd44f852e3f8db2faa303a3734ab8",
+    "Game/AI/MaiBotBrain.cs": "7385962227d9c4ca37d2f24c141fc2255c84386fcfabf379e28b7406a150bf87",
+    "Game/AI/NegateDecision.cs": "879e8733ab04b79170dba5bf388d8a0ca31e8c036692c8c403de5ecacd138aa1",
+    "Game/AI/Decks/RaiseMoonExecutor.cs": "dc46159f30e17920a1917649003c7322c1a30498f91074d4a8184c36be524fa6",
+    "Game/AI/Decks/SkyStrikerShopExecutor.cs": "6404d9bc044b3ee55ceee2028d06ba5ec7d2b6c4f8c85b3eb612d2fe08861bed",
+    "Game/AI/Decks/TearlamentsExecutor.cs": "f9fba48d8f04e153fe2b27c144868caf762be9711ff726f38fb5685c603839af",
+    "Game/AI/Decks/ToonShopExecutor.cs": "55a545fcb7b496d0a9dadee23ddb6da851d9252c3b60db2cdd825cc820780dd8",
+    "Game/AI/Decks/TraptrixRagnaraikaExecutor.cs": "13e612cd5736d615fc379de1fd22a742e745b341ba038c64bdb8449f2877ff97",
+    "Game/AI/Decks/WitchcraftShopExecutor.cs": "54b104d187cc7d26a77f8df4f23ef3a7e8c1f961f8ac465177772d6fc530ef7b",
+    "Game/AI/Decks/YaoshengExecutor.cs": "a739a4e3160dcfe3207fea345553da1c7f9454a59c00c404582f0d68e19ba4db"
+  }
+}

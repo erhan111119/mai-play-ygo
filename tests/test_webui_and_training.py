@@ -652,6 +652,386 @@ def test_search_agent_keeps_the_raw_results_even_if_the_summary_talks_past_them(
     assert "睡鼠单卡可展开达成双 LINK5" in result.text, result.text[-300:]
 
 
+def test_script_digest_shows_order_missing_hints_and_rule_names() -> None:
+    """脚本结构摘要必须把"排查时要看的"排在前面：注册顺序、HintMsg 分支、函数名。
+
+    这条是照 2026-10-09 那次真机排查定的：当时要定位"缺一个 `HintMsg.Target` 分支"和
+    "某条闸门因为 desc=-1 成了死代码"，全靠这三样。**头部说明排在最后**——它上千字，
+    放前面会把前两样挤出预算（第一版就这么写坏了）。
+    """
+
+    review = _load("train.review_material")
+    source = (
+        "/// <summary>\n"
+        + "".join(f"/// 头部说明第 {index} 行：一大段设计意图……\n" for index in range(1, 41))
+        + "/// </summary>\n"
+        "/// </summary>\n"
+        "[Deck(\"Demo\", \"AI_Demo\")]\n"
+        "public class DemoExecutor : DoEverythingExecutor\n"
+        "{\n"
+        "    public new class CardId\n"
+        "    {\n"
+        "        public const int Alpha = 111;   // 甲卡\n"
+        "    }\n"
+        "    public DemoExecutor(GameAI ai, Duel duel) : base(ai, duel)\n"
+        "    {\n"
+        "        AddExecutor(ExecutorType.SummonOrSet, CardId.Alpha, SummonAlpha);\n"
+        "        Executors.Insert(0, new CardExecutor(ExecutorType.GoToBattlePhase, -1, Lethal));\n"
+        "    }\n"
+        "    public override IList<ClientCard> OnSelectCard(IList<ClientCard> cards, int min, int max, int hint, bool cancelable)\n"
+        "    {\n"
+        "        switch (hint)\n"
+        "        {\n"
+        "            case HintMsg.Discard:\n"
+        "                return PickDiscard(cards);\n"
+        "            case HintMsg.Equip:\n"
+        "                return PickEquip(cards);\n"
+        "        }\n"
+        "        return null;\n"
+        "    }\n"
+        "    private bool SummonAlpha() { return true; }\n"
+        "    private bool Lethal() { return false; }\n"
+        "}\n"
+    )
+    digest = review.script_digest(source)
+    for needle in (
+        "AddExecutor(ExecutorType.SummonOrSet, CardId.Alpha, SummonAlpha);",
+        "Executors.Insert(0, new CardExecutor(ExecutorType.GoToBattlePhase, -1, Lethal));",
+        "HintMsg.Discard",
+        "HintMsg.Equip",
+        "OnSelectCard()",
+        "SummonAlpha()",
+        "Alpha = 111",
+        "[Deck(\"Demo\"",
+    ):
+        assert needle in digest, f"摘要里缺 {needle}"
+    # 头部说明排在结构之后（预算被挤时先丢的是它）
+    assert digest.index("注册顺序") < digest.index("头部说明")
+    # 预算很小时：前面几段照旧，最后一段（头部说明）**部分截断**并写清少列了几项。
+    # 不整段丢：整段丢了模型只能回"这里被截断、无法判断"——真机上就这么吐槽过一次。
+    small = review.script_digest(source, max_chars=700)
+    assert "AddExecutor(ExecutorType.SummonOrSet" in small, "规则顺序在预算紧张时也不能丢"
+    assert "HintMsg.Discard" in small, "HintMsg 分支同理"
+    assert "预算所限只列前" in small and "未列出" in small, small[-200:]
+
+
+def test_decision_log_slice_keeps_actions_inside_the_window_only() -> None:
+    """决策日志切片：只留这一局时间窗内的"动作行"，噪声（手牌 dump、血量、洗牌）丢掉。"""
+
+    review = _load("train.review_material")
+    raw = "\n".join(
+        [
+            json.dumps({"timestamp": "2026-10-09T11:52:00.000000Z", "event": "[WindBot] [26-10-09 19:52:00] 执行器：AI_Demo"}),
+            json.dumps({"timestamp": "2026-10-09T11:52:01.000000Z", "event": "[WindBot] [26-10-09 19:52:01] (0 's 甲卡 activate effect from MonsterZone)"}),
+            json.dumps({"timestamp": "2026-10-09T11:52:01.500000Z", "event": "[WindBot] [26-10-09 19:52:01] *********Bot Hand*********"}),
+            json.dumps({"timestamp": "2026-10-09T11:52:02.000000Z", "event": "[WindBot] [26-10-09 19:52:02] (0 got damage , LifePoint left = 7000)"}),
+            json.dumps({"timestamp": "2026-10-09T11:52:03.000000Z", "event": "[WindBot] [26-10-09 19:52:03] (Grave 's 乙卡 become target)"}),
+            json.dumps({"timestamp": "2026-10-09T12:30:00.000000Z", "event": "[WindBot] [26-10-09 20:30:00] (0 's 丙卡 activate effect from SpellZone)"}),
+        ]
+    )
+    entries = review.parse_host_log(raw)
+    # 解析阶段只做"能不能读"，窗口与过滤在切片那一步
+    assert len(entries) == 6, entries
+    text = review.decision_log_slice(entries, start=entries[0][0] - 1, end=entries[0][0] + 5)
+    assert "执行器：AI_Demo" in text
+    assert "甲卡 activate effect" in text
+    assert "乙卡 become target" in text
+    assert "Bot Hand" not in text and "LifePoint" not in text
+    assert "丙卡" not in text, "时间窗外的行不该出现"
+
+
+def test_patch_parsing_and_all_or_nothing_apply() -> None:
+    """补丁：解析格式 → 校验（原文必须恰好一处）→ 全有或全无地落地（带备份）。
+
+    这条守的是最危险的一步（复盘会改源码树的 C#）：宁可整批不落地并说清原因，
+    也不能只改一半；编译不过时还要能回滚。
+    """
+
+    patchwork = _load("train.patchwork")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        decks = root / "Game" / "AI" / "Decks"
+        decks.mkdir(parents=True)
+        target = decks / "DemoExecutor.cs"
+        original = "class Demo\n{\n    private bool A() { return false; }\n}\n"
+        target.write_text(original, encoding="utf-8")
+
+        answer = (
+            "## 具体问题\n- 甲卡的条件写反了\n\n"
+            "<<<PATCH\n"
+            "文件: DemoExecutor.cs\n"
+            "原因: 甲卡的条件写反了\n"
+            "原文:\n"
+            "    private bool A() { return false; }\n"
+            "改成:\n"
+            "    private bool A() { return true; }\n"
+            "PATCH>>>\n"
+        )
+        patch_set = patchwork.parse_patches(answer)
+        assert patch_set.ok, patch_set.problems
+        assert patch_set.patches[0].file == "DemoExecutor.cs"
+
+        result = patchwork.apply_patches(patch_set, root)
+        assert result.ok, result.error
+        assert result.applied == 1 and result.backups
+        assert "return true" in target.read_text(encoding="utf-8")
+        assert "return false" in Path(result.backups[0]).read_text(encoding="utf-8")
+
+        # 原文在文件里出现两次 → 整批不落地（不猜改哪一处）
+        twice = decks / "TwiceExecutor.cs"
+        twice.write_text("x = 1;\nx = 1;\n", encoding="utf-8")
+        bad = patchwork.parse_patches(
+            "<<<PATCH\n文件: TwiceExecutor.cs\n原因: 试试\n原文:\nx = 1;\n改成:\nx = 2;\nPATCH>>>"
+        )
+        assert bad.ok
+        failed = patchwork.apply_patches(bad, root)
+        assert not failed.ok and "出现 2 次" in failed.error, failed.error
+        assert twice.read_text(encoding="utf-8") == "x = 1;\nx = 1;\n"
+
+        # 原文抄不准 → 拒绝，并指出是哪一条
+        wrong = patchwork.parse_patches(
+            "<<<PATCH\n文件: DemoExecutor.cs\n原因: 抄错了\n原文:\n    private bool A() { return TRUE; }\n改成:\n    private bool A() { return false; }\nPATCH>>>"
+        )
+        failed2 = patchwork.apply_patches(wrong, root)
+        assert not failed2.ok and "一次都没出现" in failed2.error, failed2.error
+
+        # 想改到源码树外面 → 直接拒绝
+        outside = patchwork.parse_patches(
+            "<<<PATCH\n文件: ../../../evil.cs\n原因: 越界\n原文:\nx\n改成:\ny\nPATCH>>>"
+        )
+        assert outside.ok
+        assert not patchwork.apply_patches(outside, root).ok
+
+
+async def _review_feeds_the_script_digest_and_that_duel_log() -> None:
+    """复盘材料新增两样：脚本结构摘要 + 那一局的决策日志（没勾"落地"时**不动任何文件**）。"""
+
+    store_module = _load("train.store")
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        store = store_module.TrainingStore(tmp / "training.db")
+
+        # 脚本源码放在"插件留档"那份里（源码树没配时的那条回退路）
+        plugin_root = tmp / "plugin"
+        (plugin_root / "executors").mkdir(parents=True)
+        script_path = plugin_root / "executors" / "DemoExecutor.cs"
+        script_path.write_text(
+            "\n".join(
+                [
+                    '[Deck("Demo", "AI_Demo")]',
+                    "public class DemoExecutor : DoEverythingExecutor",
+                    "{",
+                    "    public DemoExecutor(GameAI ai, Duel duel) : base(ai, duel)",
+                    "    {",
+                    "        AddExecutor(ExecutorType.Activate, CardId.Alpha, AlphaRule);",
+                    "    }",
+                    "    private bool AlphaRule() { return true; }",
+                    "}",
+                ]
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        # 一局对局记录（复盘读它）+ 一份含这一局决策行的宿主日志
+        duel = store.create("duel", "房间对局：测试牌", {"deck_id": 7, "deck_name": "测试牌"}, tmp / "duel.log")
+        store.finish(
+            duel.run_id,
+            "done",
+            summary={
+                "self_seat": 0,
+                "winner_is_self": False,
+                "turns": 3,
+                "duration_seconds": 120,
+                "players": {"0": {"name": "憨憨", "normal_summons": 1, "sp_summons": 3,
+                                  "effects": 8, "attacks": 0, "damage_taken": 9200}},
+                "top_cards": ["「甲卡」x2"],
+            },
+        )
+        started = time.time()
+        host_logs = tmp / "logs"
+        host_logs.mkdir()
+
+        def _stamp(offset: float) -> str:
+            import datetime as _dt
+
+            moment = _dt.datetime.fromtimestamp(started + offset, _dt.timezone.utc)
+            return moment.isoformat().replace("+00:00", "Z")
+
+        (host_logs / "app_test.log.jsonl").write_text(
+            "\n".join(
+                [
+                    json.dumps({"timestamp": _stamp(1), "event": "[WindBot] [x] (0 's 甲卡 activate effect from Hand)"}),
+                    json.dumps({"timestamp": _stamp(2), "event": "[WindBot] [x] (0 's 甲卡 from Hand move to SpellZone)"}),
+                    json.dumps({"timestamp": _stamp(9999), "event": "[WindBot] [x] (0 's 别局的卡 activate effect from Hand)"}),
+                ]
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        prompts: List[str] = []
+
+        async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+            del model, max_tokens
+            prompts.append(prompt)
+            return "\n".join(
+                [
+                    "## 具体问题",
+                    "- 甲卡的条件写反了",
+                    "",
+                    "<<<PATCH",
+                    "文件: DemoExecutor.cs",
+                    "原因: 甲卡条件写反",
+                    "原文:",
+                    "    private bool AlphaRule() { return true; }",
+                    "改成:",
+                    "    private bool AlphaRule() { return false; }",
+                    "PATCH>>>",
+                ]
+            )
+
+        runner = _make_runner(tmp, store, generate=fake_generate)
+        # _make_runner 把 plugin_root 指到 tmp/plugin；把源码树关掉，走"插件留档"那条回退路
+        runner._windbot_dirs = lambda: (None, None)  # type: ignore[method-assign]
+        run = store.create(
+            "review", "复盘优化：测试牌", {"deck_id": 7, "deck_name": "测试牌"}, tmp / "review.log"
+        )
+        await runner._run_review(
+            run,
+            {"deck_id": 7, "deck_name": "测试牌", "style": "Demo", "latest": 1},
+        )
+        prompt = prompts[0]
+        assert "脚本结构摘要" in prompt, "提示词里没有结构摘要那一段"
+        assert "AddExecutor(ExecutorType.Activate, CardId.Alpha, AlphaRule);" in prompt, "摘要没带规则顺序"
+        assert "甲卡 activate effect" in prompt, "这一局的决策日志没进材料"
+        assert "别局的卡" not in prompt, "时间窗外的日志不该进材料"
+        assert "补丁怎么写" in prompt and "<<<PATCH" in prompt, "提示词里没教补丁格式"
+
+        saved = store.get(run.run_id)
+        assert saved is not None and saved.status == store_module.STATUS_DONE, saved and saved.error
+        assert saved.summary["patches"], saved.summary
+        assert not saved.summary["applied"], "没勾「落地」就不该写文件"
+        assert saved.summary["apply_requested"] is False
+        assert "return true" in script_path.read_text(encoding="utf-8"), "脚本必须原样不动"
+        log_text = (tmp / "review.log").read_text(encoding="utf-8")
+        assert "脚本结构摘要" in log_text and "补丁与落地结果" in log_text, log_text[-400:]
+
+
+async def _review_apply_writes_backup_and_rolls_back_when_build_fails() -> None:
+    """勾了"落地并编译"：写源码树（带备份）→ 编译；**编译不过就回滚**，别把树留在编不过的状态。
+
+    三条分支都要锁住：
+    1. 编译成功 → 文件变了、备份在、summary 记 applied/build_ok；
+    2. 编译失败 → 文件**回到改前**、错误里写明"已回滚"；
+    3. 有房间在打 → 补丁照样写（用户要的），但**不编译**并说明原因（正在跑的 WindBot 锁着 exe）。
+    """
+
+    store_module = _load("train.store")
+    runner_module = _load("train.runner")
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        store = store_module.TrainingStore(tmp / "training.db")
+        source = tmp / "windbot-src"
+        decks = source / "Game" / "AI" / "Decks"
+        decks.mkdir(parents=True)
+        (source / "WindBot.csproj").write_text("<Project />", encoding="utf-8")
+        target = decks / "DemoExecutor.cs"
+        original = "\n".join(
+            [
+                '[Deck("Demo", "AI_Demo")]',
+                "public class DemoExecutor : DoEverythingExecutor",
+                "{",
+                "    private bool AlphaRule() { return true; }",
+                "}",
+            ]
+        ) + "\n"
+        target.write_text(original, encoding="utf-8")
+
+        duel = store.create("duel", "房间对局：测试牌", {"deck_id": 7, "deck_name": "测试牌"}, tmp / "duel.log")
+        store.finish(
+            duel.run_id,
+            "done",
+            summary={"self_seat": 0, "winner_is_self": False, "turns": 3, "duration_seconds": 60,
+                     "players": {"0": {"name": "憨憨", "sp_summons": 1}}},
+        )
+
+        answer = "\n".join(
+            [
+                "<<<PATCH",
+                "文件: DemoExecutor.cs",
+                "原因: 条件写反",
+                "原文:",
+                "    private bool AlphaRule() { return true; }",
+                "改成:",
+                "    private bool AlphaRule() { return false; }",
+                "PATCH>>>",
+            ]
+        )
+
+        async def fake_generate(prompt: str, model: str, max_tokens: int) -> str:
+            del prompt, model, max_tokens
+            return answer
+
+        calls: List[str] = []
+
+        async def ok_build(source_dir: Path, **kwargs: Any) -> Tuple[bool, str]:
+            calls.append("build")
+            return True, "Build succeeded"
+
+        async def bad_build(source_dir: Path, **kwargs: Any) -> Tuple[bool, str]:
+            calls.append("build")
+            return False, "DemoExecutor.cs(4,42): error CS1061: 故意失败"
+
+        original_build = runner_module.build_windbot
+        try:
+            # 1) 落地 + 编译成功
+            runner_module.build_windbot = ok_build  # type: ignore[attr-defined]
+            runner = _make_runner(tmp, store, generate=fake_generate)
+            runner._windbot_dirs = lambda: (source, tmp / "windbot")  # type: ignore[method-assign]
+            run = store.create("review", "复盘优化：测试牌", {"deck_id": 7, "deck_name": "测试牌", "apply": True}, tmp / "r1.log")
+            await runner._run_review(
+                run,
+                {"deck_id": 7, "deck_name": "测试牌", "style": "Demo", "latest": 1, "apply": True},
+            )
+            saved = store.get(run.run_id)
+            assert saved.summary["applied"] == 1, saved.summary
+            assert saved.summary["build_ok"] is True, saved.summary
+            assert "return false" in target.read_text(encoding="utf-8")
+            backup = saved.summary["backups"][0]
+            assert "return true" in Path(backup).read_text(encoding="utf-8"), "备份要留改前那份"
+
+            # 2) 编译失败 → 回滚
+            target.write_text(original, encoding="utf-8")
+            runner_module.build_windbot = bad_build  # type: ignore[attr-defined]
+            runner2 = _make_runner(tmp, store, generate=fake_generate)
+            runner2._windbot_dirs = lambda: (source, tmp / "windbot")  # type: ignore[method-assign]
+            run2 = store.create("review", "复盘优化：测试牌", {"deck_id": 7, "deck_name": "测试牌", "apply": True}, tmp / "r2.log")
+            await runner2._run_review(
+                run2,
+                {"deck_id": 7, "deck_name": "测试牌", "style": "Demo", "latest": 1, "apply": True},
+            )
+            saved2 = store.get(run2.run_id)
+            assert "已把补丁回滚" in saved2.summary["apply_error"], saved2.summary["apply_error"]
+            assert target.read_text(encoding="utf-8") == original, "编译不过必须回到改前"
+
+            # 3) 有房间在打 → 写文件但不编译
+            target.write_text(original, encoding="utf-8")
+            calls.clear()
+            runner_module.build_windbot = ok_build  # type: ignore[attr-defined]
+            runner3 = _make_runner(tmp, store, generate=fake_generate, rooms=1)
+            runner3._windbot_dirs = lambda: (source, tmp / "windbot")  # type: ignore[method-assign]
+            run3 = store.create("review", "复盘优化：测试牌", {"deck_id": 7, "deck_name": "测试牌", "apply": True}, tmp / "r3.log")
+            await runner3._run_review(
+                run3,
+                {"deck_id": 7, "deck_name": "测试牌", "style": "Demo", "latest": 1, "apply": True},
+            )
+            saved3 = store.get(run3.run_id)
+            assert saved3.summary["applied"] == 1, saved3.summary
+            assert calls == [], "有房间在打时不该去编译"
+            assert "没有编译" in saved3.summary["build_tail"], saved3.summary["build_tail"]
+        finally:
+            runner_module.build_windbot = original_build  # type: ignore[attr-defined]
+
+
 def test_deck_digest_and_combo_check_catch_cards_outside_the_deck() -> None:
     """模型提到的卡必须真在卡表里：不在的从结构化字段里剔掉，并留下 warning。"""
 
@@ -843,6 +1223,7 @@ def _make_runner(tmp: Path, store: Any, *, generate: Any = None, rooms: int = 0)
         active_rooms=lambda: rooms,
         logger=None,
         max_duels=60,
+        host_log_dir=tmp / "logs",
     )
     runner.set_training_model("test-model")
     return runner
@@ -1685,6 +2066,11 @@ def main() -> int:
         _combo_derivation_archives_the_guide,
         _research_goes_to_the_search_model_and_never_blocks_the_run,
         test_search_agent_loops_until_it_has_enough,
+        test_script_digest_shows_order_missing_hints_and_rule_names,
+        test_decision_log_slice_keeps_actions_inside_the_window_only,
+        test_patch_parsing_and_all_or_nothing_apply,
+        _review_feeds_the_script_digest_and_that_duel_log,
+        _review_apply_writes_backup_and_rolls_back_when_build_fails,
         test_search_agent_keeps_the_raw_results_even_if_the_summary_talks_past_them,
         test_search_agent_survives_a_failed_query_and_stops_at_the_round_cap,
         _runner_uses_the_search_agent_only_when_the_host_offers_tools,

@@ -1084,6 +1084,19 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             raise RuntimeError(f"带工具的模型调用返回了意外结构：{result!r}")
         return result
 
+    def _host_log_dir(self) -> Optional[Path]:
+        """宿主日志目录（`<宿主>/logs`）：复盘切决策日志用。
+
+        数据目录是 `<宿主>/data/plugins/mai-play-ygo`，往上数三级才是宿主根；
+        数不出来（测试里的临时目录）就给 None——复盘少一段材料，不影响别的。
+        """
+
+        data_dir = Path(self.ctx.paths.data_dir)
+        parts = data_dir.parents
+        if len(parts) < 3:
+            return None
+        return parts[2] / "logs"
+
     def _restart_train_runner(self) -> None:
         """（重）建训练功能那一层：记录库 + 执行器。
 
@@ -1133,6 +1146,8 @@ class MaiPlayYgo(YugiohWikiTools, MaiBotPlugin):
             max_duels=int(self.config.training.max_duels_per_run),
             windbot_dirs=self._windbot_dirs_for_training,
             record_script=self._record_generated_script,
+            # 复盘要切"那一局的 WindBot 决策日志"——它在宿主日志目录里（duel.bot_debug 打开时才有）
+            host_log_dir=self._host_log_dir(),
         )
         self._train_runner.set_training_model(self.config.llm.training_model)
         self._train_runner.set_script_max_tokens(self.config.llm.training_script_max_tokens)
